@@ -1,1 +1,5 @@
-# Python“¿¿µ«Âµ• 
+opencv-python
+mediapipe
+pyqt5
+pyaudio
+requests
