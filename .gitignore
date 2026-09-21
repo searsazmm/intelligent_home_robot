@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# 环境变量与密钥（不要提交）
+.env
+.env.local
+*.key
+*.pem
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
+# 前端（如果 frontend_C 用 Node）
+node_modules/
+dist/
+build/
+*.log
