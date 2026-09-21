@@ -1,0 +1,9 @@
+opencv-python==4.13.0.90
+PyQt5==5.15.10
+requests==2.32.3
+
+# 以下两项需确认版本后再锁定，不要留着裸包名提交
+# mediapipe  —— 新版已移除 mediapipe.solutions，若模块A用 face_mesh 算 ear 必须锁旧版
+# pyaudio    —— Windows 上 pip 直装常编译失败，见 README 安装说明
+mediapipe
+pyaudio

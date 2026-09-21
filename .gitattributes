@@ -1,0 +1,30 @@
+# 自动识别文本文件，仓库内统一以 LF 存储，避免 Windows/Mac 组员换行符互相打架
+* text=auto
+
+# 明确声明为文本
+*.py    text
+*.md    text
+*.txt   text
+*.json  text
+*.yml   text
+*.yaml  text
+*.csv   text
+*.toml  text
+
+# 明确声明为二进制，禁止任何换行符转换（模型、图片、音视频）
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.bmp   binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.pt    binary
+*.pth   binary
+*.onnx  binary
+*.pkl   binary
+*.h5    binary
+*.mp4   binary
+*.avi   binary
+*.wav   binary
+*.mp3   binary

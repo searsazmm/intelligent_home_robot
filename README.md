@@ -1,8 +1,10 @@
-# intelligent_home_robot
+# 居家陪伴机器人
+
+## Django 后端（原型）
 
 Django 5.2 项目（Python 3.10）。
 
-## 运行
+### 运行
 
 ```bash
 cd C:\projects\intelligent_home_robot
@@ -10,7 +12,7 @@ python manage.py migrate      # 初始化数据库（默认 SQLite）
 python manage.py runserver    # 启动开发服务器 http://127.0.0.1:8000
 ```
 
-## 结构
+### 结构
 
 ```
 intelligent_home_robot/
@@ -22,7 +24,7 @@ intelligent_home_robot/
 │   └── __init__.py
 ```
 
-## 常用命令
+### 常用命令
 
 ```bash
 python manage.py startapp <app名>   # 新建应用
