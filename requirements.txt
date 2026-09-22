@@ -1,9 +1,12 @@
-opencv-python==4.13.0.90
+# 统一只装 contrib 版（mediapipe 依赖它，且为 opencv-python 超集），
+# 避免两个包互相覆盖 cv2 导致版本混乱（2026-09-22 实测踩坑）
+opencv-contrib-python==4.13.0.90
 PyQt5==5.15.10
 requests==2.32.3
 
 # 以下两项需确认版本后再锁定，不要留着裸包名提交
-# mediapipe  —— 新版已移除 mediapipe.solutions，若模块A用 face_mesh 算 ear 必须锁旧版
-# pyaudio    —— Windows 上 pip 直装常编译失败，见 README 安装说明
-mediapipe
+# mediapipe  —— 0.10.14 已在模块A实测可用（2026-09-22）；注意其依赖会连带安装
+#              opencv-contrib-python，实际 import 的 cv2 版本以 contrib 为准
+# pyaudio    —— Windows 上 pip 直装常编译失败，见 README 安装说明（模块B用）
+mediapipe==0.10.14
 pyaudio

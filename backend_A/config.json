@@ -1,0 +1,32 @@
+{
+  "camera_index": 0,
+  "camera_fallback_index": 1,
+  "use_dshow": true,
+  "target_fps": 15,
+  "csv_dir": "data",
+  "draw_mesh": true,
+
+  "socket_enabled": true,
+  "socket_host": "127.0.0.1",
+  "socket_port": 8000,
+
+  "calib_frames": 25,
+
+  "rppg_enabled": true,
+  "rppg_hr_window": 8.0,
+  "rppg_rr_window": 20.0,
+
+  "ear_closed": 0.15,
+  "ear_open": 0.20,
+  "ear_tired": 0.18,
+  "blink_rate_tired": 25,
+  "blink_rate_window_sec": 60,
+
+  "sad_curvature": 0.015,
+
+  "gaze_still_sec": 3.0,
+  "gaze_still_th": 0.02,
+
+  "pitch_scale": 180,
+  "yaw_scale": 180
+}
