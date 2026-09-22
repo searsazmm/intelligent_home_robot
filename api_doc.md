@@ -1,8 +1,10 @@
-版本：V1.0 日期：2026-09-18
+版本：V1.1（草案，⚠️ 变更处待全员确认） 日期：2026-09-22（V1.0：2026-09-18）
 
 ## 1. 文档概述
 
 本系统分为三大功能模块：视觉后端 A、业务后端 B、桌面前端 C。模块通信逻辑：A→B、B→C，A 与 C 无直接通信。所有模块基于本地 TCP Socket 实现数据交互，统一本地地址 `127.0.0.1`。本文档为系统唯一官方接口规范，所有代码开发、数据传输均以此文档为准。
+
+> **V1.1 变更（2026-09-22，草案待确认）**：① `emo_feature` 枚举细化为 `normal / tired / sad / blank`（原为 normal/low/tired）；② 新增 §3.4 离线 CSV 文件规范（固定表头与列序）；③ 明确无人脸帧处理——Socket 照发心跳、CSV 跳行；④ 数值字段统一保留 2 位小数。
 
 ## 2. 全局通用规范
 
@@ -33,13 +35,30 @@
 | pitch       | float    | 头部俯仰角度                       |
 | yaw         | float    | 头部左右偏转角度                   |
 | roll        | float    | 头部倾斜旋转角度                   |
-| emo_feature | string   | 视觉基础特征（normal /low/tired）  |
+| emo_feature | string   | 单帧视觉标签，枚举：normal / tired / sad / blank ⚠️V1.1 变更 |
 
 ### 3.3 接口约束
 
 1. 无人脸场景：`has_face=false`，其余字段填充默认值，不中断 Socket 连接。
 2. 模块 A 仅负责视觉特征采集，不做最终用户状态判定。
 3. 每条 JSON 数据末尾必须携带 `\n` 分隔符。
+4. 数值字段一律保留 2 位小数；`emo_feature` 只允许小写英文标签，禁止中文与大小写变体。⚠️V1.1 变更
+5. 无人脸帧不写入离线 CSV 文件（Socket 心跳照常发送，见 §3.4）。⚠️V1.1 变更
+
+### 3.4 离线 CSV 调试文件规范 ⚠️V1.1 新增
+
+模块 A 离线模式下输出 CSV，供模块 B 在 `offline_mode=True` 下并行开发：
+
+- 表头（列序固定，禁止增删改动）：
+
+```
+timestamp,has_face,ear,blink_cnt,pitch,yaw,roll,emo_feature
+```
+
+- 列与 §3.2 JSON 字段一一对应；同一帧数据 Socket 与 CSV 必须出自同一套计算代码，内容一致。
+- 编码 UTF-8（无 BOM），换行 `\n`，一行一帧（建议 15fps）。
+- `has_face` 写小写 `true/false`；`emo_feature` 只允许 `normal/tired/sad/blank`；数值保留 2 位小数。
+- 无人脸帧跳过不写；A 交付 B 的样例文件必须覆盖全部 4 种标签。
 
 ## 4. B→C 模块接口（业务后端 → 前端界面）
 
