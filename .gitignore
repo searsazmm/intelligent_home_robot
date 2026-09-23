@@ -41,3 +41,4 @@ build/
 # 后端A采集数据（只保留交付 B 的 4 标签样例）
 backend_A/data/*
 !backend_A/data/vis_data_20260922_154601.csv
+backend_A/baseline.json

@@ -6,6 +6,7 @@
   "csv_dir": "data",
   "draw_mesh": true,
   "low_light_th": 45,
+  "csv_retention_days": 7,
 
   "socket_enabled": true,
   "socket_host": "127.0.0.1",

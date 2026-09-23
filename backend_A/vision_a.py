@@ -22,6 +22,7 @@ import csv
 import json
 import math
 import socket
+import sys
 import threading
 import time
 from collections import deque
@@ -56,6 +57,20 @@ def load_config(path: Path) -> dict:
         return json.load(f)
 
 
+def clean_old_csv(csv_dir: Path, retention_days: float) -> int:
+    """A11：清理超过保留期的采集 CSV（按文件修改时间），返回删除数。"""
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    for p in csv_dir.glob("*.csv"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _d(a, b) -> float:
     """两个归一化关键点的欧氏距离。"""
     return math.hypot(a.x - b.x, a.y - b.y)
@@ -88,14 +103,25 @@ def head_angles(lm, cfg: dict):
 
 
 class Calibrator:
-    """个人基线标定：启动后采前 N 个有效帧的 pitch/yaw/roll/嘴角弧度取均值，
+    """个人基线标定（A8 持久化）：启动后采前 N 个有效帧的 pitch/yaw/roll/嘴角弧度取均值，
     之后所有输出都是相对基线的偏移量（解决 pitch 数值整体偏大的标定问题）。
-    按 'c' 键可随时重新标定。"""
+    - 首次标定完成写入 baseline.json，之后启动直接加载，跳过标定流程；
+    - 'c' 键手动重标定并覆盖保存；
+    - 加载的历史基线若与当前姿态持续失配（连续 EXTREME_FRAMES 帧极端偏移），自动重采
+      ——仅当次会话生效、不落盘，防止跌倒等异常姿态被固化为新基线（持久化须人工按 'c'）。"""
 
-    def __init__(self, n: int = 25):
+    EXTREME_DEG = 30.0    # 偏移超过此值视为"极端"（正常头部活动很少）
+    EXTREME_FRAMES = 90   # 15fps 下约 6 秒连续极端才触发
+
+    def __init__(self, n: int = 25, path: Path | None = None):
         self.n = n
+        self.path = path
         self._buf = []
         self.baseline = None   # (pitch, yaw, roll, curvature)
+        self._loaded = False   # 当前基线是否来自文件（自动重标只针对这种"可能过期"的基线）
+        self._auto = False     # 本次标定是否为自动触发（自动触发的结果不落盘）
+        self._auto_done = 0    # 自动重标次数（每次运行限 1 次，防抖）
+        self._extreme_run = 0
 
     def feeding(self) -> bool:
         return self.baseline is None
@@ -106,16 +132,62 @@ class Calibrator:
     def recalibrate(self):
         self._buf = []
         self.baseline = None
+        self._extreme_run = 0
+        self._auto = False
+
+    def load(self) -> bool:
+        """从 baseline.json 加载历史基线，成功返回 True。"""
+        if self.path is None or not self.path.exists():
+            return False
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            vals = [float(x) for x in data["baseline"]]
+            if len(vals) == 4:
+                self.baseline = tuple(vals)
+                self._loaded = True
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return False
+
+    def save(self) -> None:
+        if self.path is None or self.baseline is None:
+            return
+        try:
+            self.path.write_text(json.dumps({
+                "baseline": [round(v, 3) for v in self.baseline],
+                "frames": self.n,
+                "saved_at": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            }, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError as e:
+            print(f"[A] ⚠️ 基线保存失败：{e}")
 
     def update(self, pitch, yaw, roll, curvature):
         """返回 (pitch, yaw, roll, curvature_delta)；标定中返回 None。"""
         if self.baseline is not None:
-            return (round(pitch - self.baseline[0], 2), round(yaw - self.baseline[1], 2),
-                    round(roll - self.baseline[2], 2), curvature - self.baseline[3])
+            d = (round(pitch - self.baseline[0], 2), round(yaw - self.baseline[1], 2),
+                 round(roll - self.baseline[2], 2), curvature - self.baseline[3])
+            # 自动重标：仅针对"从文件加载的旧基线"，pitch 与 roll 同时连续极端偏移
+            # （人低头看手机等正常姿态不会同时 roll 极端，跌倒姿态不允许被固化成基线）
+            if (self._loaded and self._auto_done < 1
+                    and abs(d[0]) > self.EXTREME_DEG and abs(d[2]) > self.EXTREME_DEG):
+                self._extreme_run += 1
+                if self._extreme_run >= self.EXTREME_FRAMES:
+                    print("[A] 加载的基线与当前姿态持续失配，自动重新标定（仅本次运行生效）")
+                    self.recalibrate()
+                    self._auto = True
+                    self._auto_done += 1
+                    return None
+            else:
+                self._extreme_run = 0
+            return d
         self._buf.append((pitch, yaw, roll, curvature))
         if len(self._buf) >= self.n:
             self.baseline = tuple(sum(col) / len(col) for col in zip(*self._buf))
             print("[A] 基线标定完成：pitch={:.2f} yaw={:.2f} roll={:.2f}".format(*self.baseline[:3]))
+            if not self._auto:
+                self.save()   # 自动重标的结果不落盘，'c' 键人工确认后才覆盖
+            self._auto = False
         return None
 
 
@@ -245,11 +317,65 @@ def main():
 
     cfg = load_config(Path(args.config))
     labeler = Labeler(cfg)
-    calibrator = Calibrator(cfg.get("calib_frames", 25))
+    calibrator = Calibrator(cfg.get("calib_frames", 25), BASE_DIR / "baseline.json")
+    if calibrator.load():
+        print("[A] 已加载历史基线（'c' 键可重标定）")
     rppg = Rppg(cfg.get("rppg_hr_window", 8.0), cfg.get("rppg_rr_window", 20.0)) if cfg.get("rppg_enabled", True) else None
 
     csv_dir = BASE_DIR / cfg["csv_dir"]
     csv_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- A11：过期采集文件清理 ----
+    retention_days = float(cfg.get("csv_retention_days", 7))
+    if retention_days > 0:
+        n_clean = clean_old_csv(csv_dir, retention_days)
+        if n_clean:
+            print(f"[A] 已清理 {n_clean} 个过期采集文件（保留 {retention_days:g} 天）")
+
+    # ---- A9：启动自检（致命项失败打印原因并以非 0 退出；可降级项记入 degraded）----
+    degraded = []
+    try:
+        _probe = csv_dir / ".write_probe"
+        _probe.write_text("ok", encoding="utf-8")
+        _probe.unlink()
+    except OSError as e:
+        print(f"[A] ❌ 自检失败：data 目录不可写（{e}），无法输出 CSV")
+        sys.exit(1)
+    try:
+        face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+            min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    except Exception as e:
+        print(f"[A] ❌ 自检失败：FaceMesh 模型加载失败（{e}）")
+        sys.exit(1)
+    try:
+        cap = open_camera(cfg, args.camera)
+    except RuntimeError as e:
+        print(f"[A] ❌ 自检失败：{e}")
+        sys.exit(1)
+    sock = None
+    if cfg.get("socket_enabled", True) and not args.no_socket:
+        host = cfg.get("socket_host", "127.0.0.1")
+        port = int(cfg.get("socket_port", 8000))
+        try:
+            _p = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            _p.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _p.bind((host, port))
+            _p.close()
+            sock = SocketServer(host, port)
+        except OSError:
+            degraded.append(f"端口 {port} 被占用，仅 CSV 输出")
+    ok, sample = cap.read()   # 照度采样（信息项，不单独判定失败）
+    if ok:
+        lum = float(cv2.flip(sample, 1).mean())
+        th = float(cfg.get("low_light_th", 45.0))
+        if lum < th:
+            degraded.append(f"启动照度偏低（均值 {lum:.0f} < {th:.0f}，人脸检测易失效）")
+    if degraded:
+        print(f"[A] 自检通过（降级：{'；'.join(degraded)}）")
+    else:
+        print("[A] 自检通过")
+
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
     csv_path = csv_dir / f"vis_data_{stamp}.csv"
     wave_path = csv_dir / f"pulse_wave_{stamp}.csv"
@@ -261,16 +387,6 @@ def main():
     wave_writer.writerow(WAVE_HEADER)
     print(f"[A] CSV 输出：{csv_path}")
     print(f"[A] 波形 CSV：{wave_path}")
-
-    sock = None
-    if cfg.get("socket_enabled", True) and not args.no_socket:
-        sock = SocketServer(cfg.get("socket_host", "127.0.0.1"), cfg.get("socket_port", 8000))
-
-    face_mesh = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False, max_num_faces=1, refine_landmarks=True,
-        min_detection_confidence=0.5, min_tracking_confidence=0.5)
-
-    cap = open_camera(cfg, args.camera)
     delay = max(1, int(1000 / cfg["target_fps"]))
     low_light_th = float(cfg.get("low_light_th", 45.0))   # 画面均值低于此值视为照度不足
     low_light = False
