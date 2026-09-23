@@ -12,6 +12,7 @@ python vision_a.py --seconds 10   # 采 10 秒自动退出（自测）
 python vision_a.py --no-window    # 后台采数，不开窗口
 python vision_a.py --no-socket    # 只写 CSV，不起 Socket
 python vision_a.py --camera 1     # 指定摄像头编号（默认 0，失败自动回退 1）
+python sim_b.py                   # 另开终端：模拟 B 连 8000 收流并按 api_doc §3 逐条校验
 ```
 
 依赖：`opencv-contrib-python==4.13.0.90`、`mediapipe==0.10.14`（见根目录 requirements.txt）。
