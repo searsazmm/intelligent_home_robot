@@ -1,0 +1,13 @@
+# 后端 B 依赖清单
+#
+# 运行期：零第三方依赖。全部使用 Python 标准库
+#   socket / threading / json / csv / logging / argparse / dataclasses
+# 所以 `python main.py` 在装好 Python 3.8+ 的机器上可以直接跑，不用 pip install。
+# 这是刻意的选择：后端 B 要在联调现场快速起停，少一个装包失败的可能就少一个坑。
+#
+# 下面只登记开发/测试期用得到的可选依赖。
+# 安装：pip install -r requirements.txt
+
+# 运行单元测试（tests/）需要；不装也能跑：
+#   python tests/test_core.py      ← 用的是标准库 unittest，无第三方依赖
+pytest==8.3.4

@@ -24,6 +24,10 @@ staticfiles/
 # 日志
 *.log
 
+# 后端 B 运行时生成的历史对话记录（接口格式见 backend_B/README.md）
+# 每个组员跑一次就多一份自己的对话数据，提交上来只会互相冲突
+backend_B/data/history.csv
+
 # IDE
 .idea/
 .vscode/
