@@ -42,6 +42,8 @@ python sim_b.py                   # 另开终端：模拟 B 连 8000 收流并�
 
 所有阈值集中在 `config.json`。个体差异大时优先调：`ear_tired`（疲劳）、`sad_curvature`（难过）、
 `gaze_still_th`（发呆判定灵敏度）、`pitch_scale/yaw_scale`（头姿灵敏度）。
+`low_light_th` 为照度自检阈值（画面均值 0–255，默认 45）：低于阈值时控制台与预览窗口告警
+"has_face=false 可能是光线问题而非无人"，供 B 侧区分"黑屋/离开/掉线"参考。
 
 ## 给 B 交付样例前的检查项
 

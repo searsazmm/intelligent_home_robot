@@ -272,6 +272,9 @@ def main():
 
     cap = open_camera(cfg, args.camera)
     delay = max(1, int(1000 / cfg["target_fps"]))
+    low_light_th = float(cfg.get("low_light_th", 45.0))   # 画面均值低于此值视为照度不足
+    low_light = False
+    low_light_cnt = 0
     label_stat = {"normal": 0, "tired": 0, "sad": 0, "blank": 0}
     total, with_face, no_face = 0, 0, 0
 
@@ -290,6 +293,18 @@ def main():
                 break
             total += 1
             frame = cv2.flip(frame, 1)  # 镜像，自拍视角
+
+            # 照度自检：黑屋/拉窗帘时 FaceMesh 检不出人脸，B 会把"太暗"误判成"无人"
+            lum = float(frame.mean())
+            is_low = lum < low_light_th
+            if is_low:
+                low_light_cnt += 1
+            if is_low and not low_light:
+                print(f"[A] ⚠️ 照度不足：画面均值 {lum:.0f} < {low_light_th:.0f}，"
+                      f"人脸检测可能失效（has_face=false 可能是光线问题而非无人）")
+            elif not is_low and low_light:
+                print(f"[A] 照度恢复：均值 {lum:.0f}")
+            low_light = is_low
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = face_mesh.process(rgb)
             now = time.monotonic() - _t0
@@ -348,8 +363,11 @@ def main():
                 if rppg is not None:
                     rppg.reset()   # 人脸丢失清空 rPPG 缓冲，避免假波形
 
+            if low_light:
+                overlay.append("LOW LIGHT (add lamp)")
+
             for i, text in enumerate(overlay):
-                color = (0, 0, 255) if text.startswith("NO FACE") else (0, 255, 0)
+                color = (0, 0, 255) if text.startswith(("NO FACE", "LOW LIGHT")) else (0, 255, 0)
                 cv2.putText(frame, text, (10, 30 + 28 * i),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
@@ -380,6 +398,7 @@ def main():
     print(f"总帧数 {total} | 有人脸 {with_face}（已写 CSV）| 无人脸 {no_face}（已跳过）")
     print(f"标签分布：{label_stat}")
     print(f"累计眨眼 {labeler.blink_cnt} 次")
+    print(f"低照度帧 {low_light_cnt}（画面均值 < {low_light_th:.0f}，期间人脸检测不可信）")
     print(f"CSV 文件：{csv_path}")
     print(f"波形 CSV：{wave_path}")
 

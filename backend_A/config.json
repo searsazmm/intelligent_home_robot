@@ -5,6 +5,7 @@
   "target_fps": 15,
   "csv_dir": "data",
   "draw_mesh": true,
+  "low_light_th": 45,
 
   "socket_enabled": true,
   "socket_host": "127.0.0.1",
