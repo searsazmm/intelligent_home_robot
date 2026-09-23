@@ -15,18 +15,36 @@ python vision_a.py --camera 1     # 指定摄像头编号（默认 0，失败自
 python sim_b.py                   # 另开终端：模拟 B 连 8000 收流并按 api_doc §3 逐条校验
 ```
 
-依赖：`opencv-contrib-python==4.13.0.90`、`mediapipe==0.10.14`（见根目录 requirements.txt）。
+依赖：`opencv-contrib-python==4.13.0.90`、`mediapipe==0.10.14`、`onnxruntime==1.23.2`（性别/年龄用，可选）（见根目录 requirements.txt）。
 
 ## 输出
 
 | 文件 | 内容 |
 |---|---|
 | `data/vis_data_时间戳.csv` | 协议数据：表头 `timestamp,has_face,ear,blink_cnt,pitch,yaw,roll,emo_feature`（api_doc §3.4，UTF-8 无 BOM，`\n` 换行，数值 2 位小数） |
-| `data/pulse_wave_时间戳.csv` | 实验数据：`timestamp,green,hr,rr,ibi_ms`（rPPG 波形与派生指标，未进协议） |
+| `data/pulse_wave_时间戳.csv` | 实验数据：`timestamp,r,g,b,a_lab,b_lab,hr,rr,ibi_ms,sqi`（rPPG 原始三通道/双颊 Lab 色值 + 派生指标 + 质量分，未进协议） |
 | TCP 127.0.0.1:8000 | 每帧一行 JSON + `\n`（字段同 CSV）；**无人脸帧照发心跳** `has_face=false`（api_doc §3.3）——B 靠心跳区分"没人"与"掉线"，B 断开自动等待重连 |
 
-**rPPG 成熟度（诚实标注）**：HR 为**参考级**（安静场景可用，动作多时误差大）；**RR 需 20 秒窗口才输出；IBI/RR 为实验性**——
-简单 FFT + 绿通道的质量极限，联调期可换 POS/CHROM 算法改进。全部输出禁止作为医疗结论（需求文档 §12.1 T3 红线）。
+**rPPG 成熟度（诚实标注）**：采用 **CHROM 色度法**（三通道抗运动伪影，优于裸绿通道）+ **SQI 质量门控**
+（SNR=带内/带外功率比 <1.5 时 HR/IBI 置灰 `--`；IBI 还要求间隔变异系数 CV≤0.3）。HR 为**参考级**（安静场景可用，
+动作多时误差大）；**RR 需 20 秒窗口才输出；IBI/RR 为实验性**。全部输出禁止作为医疗结论（需求文档 §12.1 T3 红线）。
+
+## 性别/年龄估计（P2 演示项，可选）
+
+`age_gender.py` 加载 `models/age_gender.onnx`（62x62 人脸输入，onnxruntime CPU ~3ms/次，1 秒节流），
+结果只进预览窗与控制台摘要，**协议与 CSV 均不变**。年龄为**预测**口径（MAE ±5-7 年），禁止当真实信息用。
+模型缺失或 `age_gender_enabled=false` 时自动禁用，不影响主流程（A9 降级语义）。
+
+模型一次性下载（已加入 .gitignore，8.5MB）：
+
+```bash
+# 国内直连（hf-mirror，facefusion/insightface 生态的 gender_age 转换版）
+curl -L -o backend_A/models/age_gender.onnx \
+  "https://hf-mirror.com/bluefoxcreation/gender_age/resolve/main/gender_age.onnx"
+```
+
+性别通道序已用 OpenCV 示例图 lena.jpg 实测校准（`age_gender.py` 注释）；换其他 ONNX 版本若性别反向，
+改 `infer()` 里 `gender_v[1]` 的索引即可。
 
 - 标签小写英文：`normal / tired / sad / blank`（api_doc §3.2 V1.1 枚举）。
 - **无人脸帧跳过 CSV 写入**，Socket 照常发心跳。

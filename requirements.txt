@@ -10,3 +10,6 @@ requests==2.32.3
 # pyaudio    —— Windows 上 pip 直装常编译失败，见 README 安装说明（模块B用）
 mediapipe==0.10.14
 pyaudio
+
+# 模块A P2：性别/年龄估计（backend_A/age_gender.py）CPU 推理
+onnxruntime==1.23.2

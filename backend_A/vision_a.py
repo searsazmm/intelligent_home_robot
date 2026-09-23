@@ -8,7 +8,8 @@
 
 标签枚举（小写英文，禁止改动）：normal / tired / sad / blank
 CSV 表头（列序固定，禁止改动）：timestamp,has_face,ear,blink_cnt,pitch,yaw,roll,emo_feature
-rPPG 波形单独写 data/pulse_wave_*.csv（hr/rr/ibi 尚未进协议，见需求文档 §12.4）
+rPPG 波形单独写 data/pulse_wave_*.csv（CHROM 色度法 + SQI 质量门控，hr/rr/ibi/sqi 尚未进协议）
+性别/年龄估计为 P2 附加项（age_gender.py，模型缺失自动禁用），只进预览窗，协议不变
 
 运行：
     python vision_a.py                # 开预览窗口，q 退出，c 重新基线标定
@@ -32,17 +33,19 @@ from pathlib import Path
 import cv2
 import mediapipe as mp
 
+from age_gender import AgeGender
 from rppg import Rppg
 
 BASE_DIR = Path(__file__).resolve().parent
 CSV_HEADER = ["timestamp", "has_face", "ear", "blink_cnt", "pitch", "yaw", "roll", "emo_feature"]
-WAVE_HEADER = ["timestamp", "green", "hr", "rr", "ibi_ms"]
+WAVE_HEADER = ["timestamp", "r", "g", "b", "a_lab", "b_lab", "hr", "rr", "ibi_ms", "sqi"]
 
 # FaceMesh 关键点索引（468 点 + refine 后的虹膜 468~477）
 L_EYE = dict(h1=33, h2=133, t1=159, b1=145, t2=158, b2=153)   # 左眼
 R_EYE = dict(h1=362, h2=263, t1=386, b1=374, t2=385, b2=380)  # 右眼
 NOSE_TIP, FACE_TOP, FACE_BOTTOM = 1, 10, 152
 CHEEK_L, CHEEK_R = 234, 454
+CHEEK_PT_L, CHEEK_PT_R = 50, 280   # 双颊中心（肤色 Lab a*/b* 时序采样点，需求文档 §12.5 #26）
 EYE_OUTER_L, EYE_OUTER_R = 33, 263
 IRIS_L = 468
 BROW_L, BROW_R = 105, 334
@@ -321,6 +324,8 @@ def main():
     if calibrator.load():
         print("[A] 已加载历史基线（'c' 键可重标定）")
     rppg = Rppg(cfg.get("rppg_hr_window", 8.0), cfg.get("rppg_rr_window", 20.0)) if cfg.get("rppg_enabled", True) else None
+    age_gender = AgeGender(BASE_DIR / "models" / "age_gender.onnx",
+                           enabled=cfg.get("age_gender_enabled", True))
 
     csv_dir = BASE_DIR / cfg["csv_dir"]
     csv_dir.mkdir(parents=True, exist_ok=True)
@@ -393,6 +398,7 @@ def main():
     low_light_cnt = 0
     label_stat = {"normal": 0, "tired": 0, "sad": 0, "blank": 0}
     total, with_face, no_face = 0, 0, 0
+    ag_last = -1.0   # 性别/年龄节流（1 秒一次，演示项不追帧率）
 
     def heartbeat(now: float) -> None:
         """无人脸/标定中的心跳帧（api_doc §3.3：不中断发包）。"""
@@ -432,21 +438,52 @@ def main():
                 face_h = _d(lm[FACE_TOP], lm[FACE_BOTTOM])
                 ear = round((eye_ratio(lm, L_EYE) + eye_ratio(lm, R_EYE)) / 2.0, 2)
 
-                # rPPG：前额 ROI 绿通道（与人脸检测同帧喂入，人脸丢失即清空）
+                # rPPG：前额 ROI 三通道均值（CHROM 色度法需要 R/G/B；人脸丢失即清空）
                 if rppg is not None:
                     x1 = int(max(0.0, lm[CHEEK_L].x + 0.15 * face_w) * frame.shape[1])
                     x2 = int(min(1.0, lm[CHEEK_R].x - 0.15 * face_w) * frame.shape[1])
                     y1 = int(max(0.0, lm[FACE_TOP].y + 0.05 * face_h) * frame.shape[0])
                     y2 = int(max(y1 + 1, (lm[BROW_L].y + lm[BROW_R].y) / 2.0 * frame.shape[0]))
-                    roi = frame[y1:y2, x1:x2, 1]  # 绿通道对血流最敏感
+                    roi = frame[y1:y2, x1:x2]
                     if roi.size > 0:
-                        rppg.update(now, float(roi.mean()))
-                        hr, rr, ibi = rppg.compute(now)
-                        wave_writer.writerow([round(now, 2), round(float(roi.mean()), 2),
+                        rm, gm, bm = (float(roi[..., 2].mean()), float(roi[..., 1].mean()),
+                                      float(roi[..., 0].mean()))   # OpenCV BGR → R/G/B
+                        rppg.update(now, rm, gm, bm)
+                        hr, rr, ibi, sqi = rppg.compute(now)
+                        # 双颊 Lab a*/b* 均值（肤色序列 §12.5 #26，随帧近零成本记录）
+                        a_lab = b_lab = ""
+                        patches = []
+                        for idx in (CHEEK_PT_L, CHEEK_PT_R):
+                            dx = 0.05 * face_w
+                            px1 = max(0, int((lm[idx].x - dx) * frame.shape[1]))
+                            px2 = min(frame.shape[1], int((lm[idx].x + dx) * frame.shape[1]))
+                            py1 = max(0, int((lm[idx].y - dx) * frame.shape[0]))
+                            py2 = min(frame.shape[0], int((lm[idx].y + dx) * frame.shape[0]))
+                            if px2 > px1 and py2 > py1:
+                                patches.append(frame[py1:py2, px1:px2])
+                        if patches:
+                            a_sum = b_sum = 0.0
+                            for patch in patches:
+                                lab = cv2.cvtColor(patch, cv2.COLOR_BGR2Lab)
+                                a_sum += float(lab[..., 1].mean())
+                                b_sum += float(lab[..., 2].mean())
+                            a_lab = round(a_sum / len(patches), 1)
+                            b_lab = round(b_sum / len(patches), 1)
+                        wave_writer.writerow([round(now, 2), round(rm, 2), round(gm, 2), round(bm, 2),
+                                              a_lab, b_lab,
                                               hr if hr is not None else "",
                                               rr if rr is not None else "",
-                                              "|".join(map(str, ibi))])
+                                              "|".join(map(str, ibi)),
+                                              "" if sqi is None else sqi])
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 1)
+
+                # 性别/年龄（P2）：节流 1s 推理一次，结果只进预览窗，协议不变
+                if age_gender.ok and now - ag_last >= 1.0:
+                    ag_last = now
+                    mx, my = 0.15 * face_w, 0.15 * face_h
+                    bbox = ((lm[CHEEK_L].x - mx) * frame.shape[1], (lm[FACE_TOP].y - my) * frame.shape[0],
+                            (lm[CHEEK_R].x + mx) * frame.shape[1], (lm[FACE_BOTTOM].y + my) * frame.shape[0])
+                    age_gender.infer(frame, bbox)
 
                 calib = calibrator.update(*head_angles(lm, cfg), mouth_curvature(lm, face_h))
                 if calib is None:
@@ -468,7 +505,10 @@ def main():
                                f"P={pitch:.1f} Y={yaw:.1f} R={roll:.1f}"]
                     if rppg is not None:
                         overlay.append(f"HR={rppg.hr if rppg.hr is not None else '--'}  "
-                                       f"RR={rppg.rr if rppg.rr is not None else '--'}")
+                                       f"RR={rppg.rr if rppg.rr is not None else '--'}  "
+                                       f"SQI={rppg.sqi if rppg.sqi is not None else '--'}")
+                    if age_gender.ok:
+                        overlay.append(f"AGE/GENDER: {age_gender.label()}")
                     if cfg.get("draw_mesh"):
                         mp.solutions.drawing_utils.draw_landmarks(
                             frame, res.multi_face_landmarks[0],
@@ -508,13 +548,17 @@ def main():
         face_mesh.close()
         if rppg is not None:
             print(f"[A] rPPG 末次结果：HR={rppg.hr} bpm | RR={rppg.rr} 次/分 | "
-                  f"最近 IBI(ms)={rppg.ibi_ms}")
+                  f"SQI={rppg.sqi} | 最近 IBI(ms)={rppg.ibi_ms}")
+        if age_gender.ok and age_gender.gender:
+            print(f"[A] 性别/年龄末次预测：{age_gender.gender}（置信度 {age_gender.conf}），{age_gender.age} 岁")
 
     print("\n[A] ===== 自测摘要 =====")
     print(f"总帧数 {total} | 有人脸 {with_face}（已写 CSV）| 无人脸 {no_face}（已跳过）")
     print(f"标签分布：{label_stat}")
     print(f"累计眨眼 {labeler.blink_cnt} 次")
     print(f"低照度帧 {low_light_cnt}（画面均值 < {low_light_th:.0f}，期间人脸检测不可信）")
+    if age_gender.ok and age_gender.gender:
+        print(f"性别/年龄（预测）：{age_gender.gender}/{age_gender.age} 岁")
     print(f"CSV 文件：{csv_path}")
     print(f"波形 CSV：{wave_path}")
 

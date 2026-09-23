@@ -42,3 +42,6 @@ build/
 backend_A/data/*
 !backend_A/data/vis_data_20260922_154601.csv
 backend_A/baseline.json
+
+# 模块A 模型权重（体积大，不进版本库，见 backend_A/README.md 下载说明）
+backend_A/models/
