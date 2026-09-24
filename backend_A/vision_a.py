@@ -8,7 +8,8 @@
 
 标签枚举（小写英文，禁止改动）：normal / tired / sad / blank
 CSV 表头（列序固定，禁止改动）：timestamp,has_face,ear,blink_cnt,pitch,yaw,roll,emo_feature
-rPPG 波形单独写 data/pulse_wave_*.csv（CHROM 色度法 + SQI 质量门控，hr/rr/ibi/sqi 尚未进协议）
+rPPG 波形单独写 data/pulse_wave_*.csv（CHROM 色度法 + SQI 质量门控，hr/rr/ibi/sqi/mouth_open 尚未进协议）
+多人脸时按包围盒面积锁定主脸（需求文档 §12.2 P2，max_faces 可配置）
 性别/年龄估计为 P2 附加项（age_gender.py，模型缺失自动禁用），只进预览窗，协议不变
 
 运行：
@@ -38,7 +39,7 @@ from rppg import Rppg
 
 BASE_DIR = Path(__file__).resolve().parent
 CSV_HEADER = ["timestamp", "has_face", "ear", "blink_cnt", "pitch", "yaw", "roll", "emo_feature"]
-WAVE_HEADER = ["timestamp", "r", "g", "b", "a_lab", "b_lab", "hr", "rr", "ibi_ms", "sqi"]
+WAVE_HEADER = ["timestamp", "r", "g", "b", "a_lab", "b_lab", "mouth_open", "hr", "rr", "ibi_ms", "sqi"]
 
 # FaceMesh 关键点索引（468 点 + refine 后的虹膜 468~477）
 L_EYE = dict(h1=33, h2=133, t1=159, b1=145, t2=158, b2=153)   # 左眼
@@ -77,6 +78,22 @@ def clean_old_csv(csv_dir: Path, retention_days: float) -> int:
 def _d(a, b) -> float:
     """两个归一化关键点的欧氏距离。"""
     return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def face_bbox_area(lm) -> float:
+    """人脸关键点包围盒面积（归一化坐标），多人脸时用于选主脸。"""
+    xs = [p.x for p in lm]
+    ys = [p.y for p in lm]
+    return (max(xs) - min(xs)) * (max(ys) - min(ys))
+
+
+def pick_primary_face(faces):
+    """多人脸锁定最大脸（需求文档 §12.2 P2）：访客/子女入镜时避免锁错人。
+    按文档口径逐帧取包围盒面积最大者；两脸面积接近交替时可能切换主脸，
+    切换期 rPPG 有 SQI 门控兜底置灰，标定/眨眼缓冲待现场观察再加固。"""
+    if len(faces) == 1:
+        return faces[0].landmark
+    return max(faces, key=lambda f: face_bbox_area(f.landmark)).landmark
 
 
 def eye_ratio(lm, eye: dict) -> float:
@@ -348,7 +365,8 @@ def main():
         sys.exit(1)
     try:
         face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False, max_num_faces=1, refine_landmarks=True,
+            static_image_mode=False, max_num_faces=max(1, int(cfg.get("max_faces", 3))),
+            refine_landmarks=True,
             min_detection_confidence=0.5, min_tracking_confidence=0.5)
     except Exception as e:
         print(f"[A] ❌ 自检失败：FaceMesh 模型加载失败（{e}）")
@@ -398,6 +416,7 @@ def main():
     low_light_cnt = 0
     label_stat = {"normal": 0, "tired": 0, "sad": 0, "blank": 0}
     total, with_face, no_face = 0, 0, 0
+    multi_face_cnt = 0
     ag_last = -1.0   # 性别/年龄节流（1 秒一次，演示项不追帧率）
 
     def heartbeat(now: float) -> None:
@@ -433,10 +452,14 @@ def main():
             overlay = ["NO FACE (skipped)"]
 
             if res.multi_face_landmarks:
-                lm = res.multi_face_landmarks[0].landmark
+                if len(res.multi_face_landmarks) > 1:
+                    multi_face_cnt += 1
+                lm = pick_primary_face(res.multi_face_landmarks)
                 face_w = _d(lm[CHEEK_L], lm[CHEEK_R])
                 face_h = _d(lm[FACE_TOP], lm[FACE_BOTTOM])
                 ear = round((eye_ratio(lm, L_EYE) + eye_ratio(lm, R_EYE)) / 2.0, 2)
+                # 口部开口度（唇 13/14 相对间距）：A 只出时序，B 做对话状态机（§12.2 P2）
+                mouth_open = abs(lm[LIP_UP].y - lm[LIP_DOWN].y) / face_h if face_h > 1e-6 else 0.0
 
                 # rPPG：前额 ROI 三通道均值（CHROM 色度法需要 R/G/B；人脸丢失即清空）
                 if rppg is not None:
@@ -470,7 +493,7 @@ def main():
                             a_lab = round(a_sum / len(patches), 1)
                             b_lab = round(b_sum / len(patches), 1)
                         wave_writer.writerow([round(now, 2), round(rm, 2), round(gm, 2), round(bm, 2),
-                                              a_lab, b_lab,
+                                              a_lab, b_lab, round(mouth_open, 3),
                                               hr if hr is not None else "",
                                               rr if rr is not None else "",
                                               "|".join(map(str, ibi)),
@@ -554,6 +577,7 @@ def main():
 
     print("\n[A] ===== 自测摘要 =====")
     print(f"总帧数 {total} | 有人脸 {with_face}（已写 CSV）| 无人脸 {no_face}（已跳过）")
+    print(f"多人脸帧 {multi_face_cnt}（已按包围盒面积锁定主脸）")
     print(f"标签分布：{label_stat}")
     print(f"累计眨眼 {labeler.blink_cnt} 次")
     print(f"低照度帧 {low_light_cnt}（画面均值 < {low_light_th:.0f}，期间人脸检测不可信）")

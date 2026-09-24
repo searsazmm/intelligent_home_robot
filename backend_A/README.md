@@ -22,7 +22,7 @@ python sim_b.py                   # 另开终端：模拟 B 连 8000 收流并�
 | 文件 | 内容 |
 |---|---|
 | `data/vis_data_时间戳.csv` | 协议数据：表头 `timestamp,has_face,ear,blink_cnt,pitch,yaw,roll,emo_feature`（api_doc §3.4，UTF-8 无 BOM，`\n` 换行，数值 2 位小数） |
-| `data/pulse_wave_时间戳.csv` | 实验数据：`timestamp,r,g,b,a_lab,b_lab,hr,rr,ibi_ms,sqi`（rPPG 原始三通道/双颊 Lab 色值 + 派生指标 + 质量分，未进协议） |
+| `data/pulse_wave_时间戳.csv` | 实验数据：`timestamp,r,g,b,a_lab,b_lab,mouth_open,hr,rr,ibi_ms,sqi`（rPPG 原始三通道/双颊 Lab 色值/口部开口度 + 派生指标 + 质量分，未进协议；`mouth_open` 为唇 13/14 开口度时序，供 B 对话状态机，协议字段见 api_doc §3.5 V1.2 草案） |
 | TCP 127.0.0.1:8000 | 每帧一行 JSON + `\n`（字段同 CSV）；**无人脸帧照发心跳** `has_face=false`（api_doc §3.3）——B 靠心跳区分"没人"与"掉线"，B 断开自动等待重连 |
 
 **rPPG 成熟度（诚实标注）**：采用 **CHROM 色度法**（三通道抗运动伪影，优于裸绿通道）+ **SQI 质量门控**
@@ -67,6 +67,8 @@ curl -L -o backend_A/models/age_gender.onnx \
 `low_light_th` 为照度自检阈值（画面均值 0–255，默认 45）：低于阈值时控制台与预览窗口告警
 "has_face=false 可能是光线问题而非无人"，供 B 侧区分"黑屋/离开/掉线"参考。
 `csv_retention_days` 为采集 CSV 保留天数（默认 7）：启动时自动清理过期文件，设 0 关闭清理。
+`max_faces` 为同时跟踪的人脸数上限（默认 3）：多人入镜时按包围盒面积锁定主脸（通常离镜头最近者），
+访客短暂入镜不会抢走主人指标；单脸场景 CPU 开销不变。
 
 ## 给 B 交付样例前的检查项
 
