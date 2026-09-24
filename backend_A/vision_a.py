@@ -498,6 +498,7 @@ def main():
                                               rr if rr is not None else "",
                                               "|".join(map(str, ibi)),
                                               "" if sqi is None else sqi])
+                        wave_file.flush()   # 逐行落盘：验证工具对表 + 崩溃不丢帧
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 1)
 
                 # 性别/年龄（P2）：节流 1s 推理一次，结果只进预览窗，协议不变

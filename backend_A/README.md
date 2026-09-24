@@ -29,6 +29,13 @@ python sim_b.py                   # 另开终端：模拟 B 连 8000 收流并�
 （SNR=带内/带外功率比 <1.5 时 HR/IBI 置灰 `--`；IBI 还要求间隔变异系数 CV≤0.3）。HR 为**参考级**（安静场景可用，
 动作多时误差大）；**RR 需 20 秒窗口才输出；IBI/RR 为实验性**。全部输出禁止作为医疗结论（需求文档 §12.1 T3 红线）。
 
+**rPPG 验证（Bland-Altman，手环对照）**：课程答辩的精度证据链，`validate_rppg.py` 两步——
+1) 戴手环安坐，终端 1 跑 `vision_a.py`，终端 2 跑 `python validate_rppg.py --record`，
+   每 ≥30 秒看一眼手环输入读数，采 8-10 个点按 q；
+2) `python validate_rppg.py --compare --sync data/rppg_sync_xxx.csv`（波形 CSV 自动取最新），
+   输出 bias / 95% LoA / MAE / Pearson r，逐点表存 `data/rppg_validation_*.csv` 供报告画散点图。
+结论口径只写"与手环读数一致性"（手环自身也有光电误差），不写精度绝对值。
+
 ## 性别/年龄估计（P2 演示项，可选）
 
 `age_gender.py` 加载 `models/age_gender.onnx`（62x62 人脸输入，onnxruntime CPU ~3ms/次，1 秒节流），
