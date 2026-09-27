@@ -83,13 +83,19 @@ def euler_from_matrix(m: list[float] | tuple[float, ...]) -> tuple[float, float,
 def normalize_angles(
     pitch_deg: float, yaw_deg: float, roll_deg: float
 ) -> tuple[float, float, float]:
-    """把角度规范到 [-90, 90]，并统一符号约定。
+    """把角度规范到 [-90, 90]。**不做符号翻转。**
 
-    MediaPipe 的变换矩阵解出的 pitch 符号与"低头为正"相反，
-    这里统一翻转，保证全系统只有一种约定。
+    :func:`euler_from_matrix` 解出的符号**已经**是"pitch 正值 = 低头"，
+    与 :mod:`shared.geometry` 的约定一致——真机标定实测：低头 pitch 为正、
+    抬头为负、平视接近 0。
+
+    这里原本有一个 ``-pitch_deg``，理由是"MediaPipe 的变换矩阵解出的 pitch
+    符号与'低头为正'相反"。**那个前提是错的**，它引入的翻转把抬头判成了低头：
+    ``is_bowed``（``pitch >= 25``）于是在抬头时才成立、真低头时反而不成立。
+    不要把这个负号加回去——除非你先用手边的摄像头重新测一遍低头/抬头的符号。
     """
     return (
-        _clamp_angle(-pitch_deg),
+        _clamp_angle(pitch_deg),
         _clamp_angle(yaw_deg),
         _clamp_angle(roll_deg),
     )

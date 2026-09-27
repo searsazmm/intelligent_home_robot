@@ -1,25 +1,45 @@
 """MediaPipe Tasks 后端——把像素变成 :class:`FrameFeatures`。
 
-⚠️⚠️ **本文件未在本机验证过。** ⚠️⚠️
-====================================
+真机标定记录（2026-09，Windows + 640×480 摄像头）
+================================================
 
-本机（开发机）**没有摄像头设备**，且 ``models/face_landmarker.task`` 模型文件
-并不随仓库提供，因此这条路径**从未真正跑起来过**。写在这里的实现是按
-MediaPipe 1.0.1 的实际 API 逐条核对过的（构造参数、返回结构、方法签名都
-用 ``inspect`` 验证过），但"API 对得上"不等于"逻辑对"。
+本文件曾长期带着"**未在本机验证过**"的警告——当时开发机没有摄像头。现在
+已在真机上跑通并逐项标定。**下面每条都是实测结论，不要再凭印象改回去。**
 
-**以下几处只能靠真机标定，在此之前不要用本后端的输出做任何验收指标：**
+已标定、可以信
+--------------
 
-1. **头姿符号约定**。``normalize_angles`` 会翻转 pitch 符号，那是针对
-   ``facial_transformation_matrixes`` 的约定翻转；``solvePnP`` 回退路径**没有**
-   同样的验证，yaw/roll 的正负很可能相反。真机上必须做一次对照实验：
-   向左歪头时 ``roll`` 应当为**正**（见 :mod:`shared.geometry` 的约定）。
-   若相反，就是这里要多一次符号修正。
-2. **画面质量阈值**（照度、模糊、眼镜）是经验值，未在真实居家光照下标定，
+* **pitch 符号（``facial_transformation_matrixes`` 路径）**：低头为正、
+  抬头为负、平视接近 0。实测低头 +17.5°、抬头 -9.5°、平视 -4.6°，
+  大角度时低头可达 +22°、抬头可达 -57°。
+  ⚠️ 这里**不需要**任何符号翻转——``normalize_angles`` 曾经翻过一次，
+  那个负号是错的，详见该函数的文档。
+* **人脸检出率**：正常光照、正常坐姿下 100%（62/62 帧）。
+* **roll 量级**：左右歪头实测 -30.4° / +40.8°，**够得到 R6 的 25° 阈值**，
+  R6 在真机上不是死规则。
+* **roll 的符号**与下文旧记录说的相反（向左歪为负），但
+  :mod:`shared.geometry` 全程用 ``abs()``，**不承重**，因此未做修正。
+
+仍未验证 / 已知有问题
+---------------------
+
+1. ⚠️ **``solvePnP`` 回退路径不可用**。强制走该路径实测：pitch **恒为
+   ±90°**（钳位饱和），685 帧无一例外——模型点用的是 Y 轴朝上的经典头部
+   模型，而 OpenCV 相机系 Y 轴朝下，两者差一个绕 X 轴的 180°。
+   该路径目前不会触发（真机上 ``facial_transformation_matrixes`` 一直都在，
+   实测 ``used_pnp_fallback = False``），但**别把它当成可用的退路**：
+   一旦 MediaPipe 不再返回矩阵，它会安静地把每一帧都变成俯仰 90°。
+2. **pitch 与 roll 的耦合**：纯歪头会把 pitch 一并抬到 +23°~+35°。因此
+   一个中等幅度的歪头（roll < 25°，不触发 ``is_tilted``）**可能**误触发
+   ``is_bowed``。目前 R1–R6 没有任何规则消费 ``bowed``，所以不产生误报，
+   但将来若要接入必须先在真机上解决这个耦合。
+3. **大角度姿态下人脸会丢失**：持续歪头/深低头时实测有 8~12 秒完全检不到
+   人脸。"歪倒 + 持续闭眼"这条 R6 判据要求的姿态，恰好是最容易丢脸的姿态。
+4. **画面质量阈值**（照度、模糊、眼镜）仍是经验值，未在真实居家光照下标定，
    摄像头分辨率/白平衡一变就要重标。见下方各常量的注释。
-3. **眼镜启发式**只有粗略的亮度对比，没有标注样本可验证。
-4. **视线估计**由虹膜关键点相对眼角的位置粗略换算，未经标定。
-5. **左右眼编号**（:data:`EYE_IDX_RIGHT` / :data:`EYE_IDX_LEFT`）遵循
+5. **眼镜启发式**只有粗略的亮度对比，没有标注样本可验证。
+6. **视线估计**由虹膜关键点相对眼角的位置粗略换算，未经标定。
+7. **左右眼编号**（:data:`EYE_IDX_RIGHT` / :data:`EYE_IDX_LEFT`）遵循
    MediaPipe 的编号习惯（33 为**本人右眼**外角）。真机上若发现左右颠倒，
    交换这两个常量即可，不影响后续融合。
 
@@ -33,6 +53,11 @@ MediaPipe 1.0.1 的实际 API 逐条核对过的（构造参数、返回结构�
   线程池，几分钟就能把进程拖死；本模块用一个带引用计数的模块级缓存
   强制这一点（:data:`_LANDMARKER_CACHE`）。
 * ``detect_for_video`` 的时间戳必须**严格单调递增**，重复即抛异常。
+* **人脸关键点不带 ``presence``**。Tasks API 的 ``NormalizedLandmark`` 有
+  这个字段但**恒为 ``None``**（那是姿态模型的量，人脸模型不填）。任何
+  "用 presence 判遮挡"的逻辑都必须把 ``None`` 与 ``0.0`` 分开处理——
+  把前者当成后者会让每一帧都判"严重遮挡"，A 在真实摄像头上一个可用窗口
+  都发不出来。详见 :meth:`MediaPipeFaceBackend._refine_quality`。
 * blendshape 必须**按名字**取，绝不能按下标——MediaPipe 的枚举顺序与
   Apple ARKit 文档顺序不一致，按索引取会在某次版本升级后静默错位。
 * VIDEO 模式是**非确定性**的：同一段视频两次跑出的系数会有差异。因此它
@@ -587,12 +612,30 @@ class MediaPipeFaceBackend(BaseFaceBackend):
         quality: FrameQuality,
     ) -> FrameQuality:
         """有人脸时：用关键点 presence 判遮挡，再跑一次眼镜启发式。"""
-        presence = [
-            float(getattr(landmarks[i], "presence", 1.0) or 0.0)
-            for i in KEY_LANDMARKS_FOR_OCCLUSION
-            if i < len(landmarks)
-        ]
-        avg = sum(presence) / len(presence) if presence else 1.0
+        # ``presence`` 在 Tasks API 的人脸关键点上**存在但恒为 ``None``**
+        # （那是姿态模型的字段，人脸模型不填）。必须把"没给"与"给了 0"分开：
+        # 原来写成 ``getattr(..., 1.0) or 0.0``，那个默认值 1.0 **永远轮不到**
+        # （字段存在，只是值为 None），而 ``None or 0.0`` 又把"不知道"翻译成了
+        # "完全不可见"——于是每一帧都判严重遮挡、每个窗口都不可用，
+        # 真实摄像头下 A **一个可用窗口都发不出来**（真机实测 81/81 帧 SEVERE）。
+        presence = []
+        for i in KEY_LANDMARKS_FOR_OCCLUSION:
+            if i >= len(landmarks):
+                continue
+            value = getattr(landmarks[i], "presence", None)
+            if value is not None:
+                presence.append(float(value))
+
+        if presence:
+            avg = sum(presence) / len(presence)
+        else:
+            # 拿不到输入就**不判遮挡**（fail-open）。判 SEVERE 会让整条链路
+            # 失效，判 NONE 只是退回"这件事做不了"——两害相权，取后者。
+            avg = 1.0
+            self._note(
+                "关键点未提供 presence（Tasks API 的已知行为，实测恒为 None），"
+                "遮挡判定不生效（fail-open）：无法用关键点判断面部是否被遮挡。"
+            )
 
         occlusion = Occlusion.NONE
         if avg < OCCLUSION_PRESENCE_SEVERE:
