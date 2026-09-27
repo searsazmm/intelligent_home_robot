@@ -1,0 +1,23 @@
+# 模块 A（视觉感知）· 运行依赖
+#
+# ⚠️ 不要加 opencv-python。
+#    它和 opencv-contrib-python 都会安装一个叫 `cv2` 的包。两个同时存在时，
+#    谁生效取决于安装顺序 —— 表现出来是"昨天还好好的"这一类极难排查的故障。
+#    只留 contrib 版本。
+#
+# ⚠️ 顶层 requirements.txt 里目前写的是 opencv-python，与本文件冲突。
+#    那是**团队共享文件**，未经全员确认不能单方面改（见 README「已知问题」）。
+
+# ---- 运行必需：合成源、CSV 回放、全部指标与聚合 ----
+numpy>=1.26
+
+# ---- 接真实摄像头/视频时才需要：像素 → 人脸关键点 ----
+# 用的是 MediaPipe **Tasks API**（mediapipe.tasks.python），不是旧版
+# Solutions API（mediapipe.solutions.face_mesh）。顶上那条"新版移除了
+# solutions"的担心针对的是后者，与本模块无关 —— 但锁个下限仍然值得。
+opencv-contrib-python>=4.10
+mediapipe>=1.0
+
+# ---- 刻意不装 ----
+# pyaudio   —— 模块 A 不碰音频。顶层 requirements.txt 里那条注释说
+#              "Windows 上 pip 直装常编译失败"是对的，但它与本模块无关。
