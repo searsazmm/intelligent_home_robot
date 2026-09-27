@@ -80,6 +80,7 @@ backend_B/
 │   └── ui_channel.py          对 C 的两个服务（8001 状态推送 / 8002 双向对话）
 ├── data/
 │   ├── sample_vision.csv      离线调试用的视觉数据（由 tools 脚本生成）
+│   ├── face_data.csv          简版视觉数据（timestamp,emotion,fatigue 三列）
 │   ├── sample_chat.csv        模拟 C 的自动对话脚本
 │   └── history.csv            历史对话记录（运行时生成，不进版本库）
 ├── tools/
@@ -87,7 +88,8 @@ backend_B/
 │   ├── mock_a_server.py       模拟模块 A（TCP 服务端），含断线演练开关
 │   └── mock_c_client.py       模拟模块 C（命令行），连 B 的两个端口
 └── tests/
-    └── test_core.py           48 个单元测试
+    ├── test_core.py           48 个单元测试
+    └── replay_script.py       CSV 回放脚本：假装自己是模块 A，把 face_data.csv 发给 B
 ```
 
 ---
@@ -208,6 +210,26 @@ timestamp,session_id,role,text,vision_state,text_emotion,emotion_score,intent
 
 历史文件损坏、缺列、数字格式不对，都不会抛异常影响主流程。
 
+### 4.6 回放 `face_data.csv`（`tests/replay_script.py`）
+
+和 `--offline` 的区别：`--offline` 是 B 自己读文件（根本不联网），
+本脚本是**真的走 Socket**，假装成模块 A 让 B 来连 —— 用来验证 A→B 这条链路本身。
+
+CSV 只有三列，脚本负责补成 api_doc §3.2 的完整报文：
+
+| CSV 列 | 报文字段 | 怎么来的 |
+| ------ | -------- | -------- |
+| `timestamp` | `timestamp` | 原样透传 |
+| `emotion` | `emo_feature` | 查表：happy→normal / tired→tired / sad→low |
+| `fatigue` | `ear` | 线性映射：0.0→0.35，1.0→0.10（疲劳度 >0.6 会跌破 B 的 EAR 阈值） |
+| — | `has_face` | `emotion` 为 `absent`/`none` 时 false |
+| — | `blink_cnt`/`pitch`/`yaw`/`roll` | 恒为 0（源数据里没有，**不编造**） |
+
+因为 `blink_cnt` 和头部姿态没有数据，B 的"眨眼频率""持续低头"两条疲劳判据不会被触发，
+tired 只会从 `emo_feature` 和 EAR 进来。要连那两条一起测，用 `sample_vision.csv`。
+
+固定每行间隔 0.05 秒（20fps），**不**按 CSV 里 timestamp 的差值走。
+
 ---
 
 ## 5. 命令行参数
@@ -257,6 +279,14 @@ cd backend_B && python main.py
 
 # 终端3：模拟 C
 cd backend_B && python tools/mock_c_client.py --auto
+```
+
+想用 `face_data.csv` 里的数据代替模拟 A，把终端 1 换成（**先起 B 还是先起它都行**，
+B 会自己退避重连）：
+
+```bash
+# 终端1：回放 face_data.csv，假装是模块 A
+cd backend_B && python tests/replay_script.py
 ```
 
 ### 排查问题
