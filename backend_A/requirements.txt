@@ -2,11 +2,12 @@
 #
 # ⚠️ 不要加 opencv-python。
 #    它和 opencv-contrib-python 都会安装一个叫 `cv2` 的包。两个同时存在时，
-#    谁生效取决于安装顺序 —— 表现出来是"昨天还好好的"这一类极难排查的故障。
-#    只留 contrib 版本。
+#    谁生效取决于安装顺序，而且卸载其中一个会删掉另一个的文件（共享目录）——
+#    表现出来是"昨天还好好的"这一类极难排查的故障。只留 contrib 版本。
 #
-# ⚠️ 顶层 requirements.txt 里目前写的是 opencv-python，与本文件冲突。
-#    那是**团队共享文件**，未经全员确认不能单方面改（见 README「已知问题」）。
+#    顶层 requirements.txt 已同步改成只留 contrib（2026-09-28），两边不再冲突。
+#    修 cv2 请用（单独 uninstall 再装回来是修不好的）：
+#        pip install --force-reinstall --no-deps opencv-contrib-python==4.13.0.92
 
 # ---- 运行必需：合成源、CSV 回放、全部指标与聚合 ----
 numpy>=1.26
@@ -14,9 +15,14 @@ numpy>=1.26
 # ---- 接真实摄像头/视频时才需要：像素 → 人脸关键点 ----
 # 用的是 MediaPipe **Tasks API**（mediapipe.tasks.python），不是旧版
 # Solutions API（mediapipe.solutions.face_mesh）。顶上那条"新版移除了
-# solutions"的担心针对的是后者，与本模块无关 —— 但锁个下限仍然值得。
-opencv-contrib-python>=4.10
-mediapipe>=1.0
+# solutions"的担心针对的是后者，与本模块无关。
+#
+# ⚠️ 锁死 0.10.35 而不是写 >=1.0。写 >=1.0 时 pip 会解析到 **1.0.1** ——
+#    那是跨大版本的另一套东西，wheel 标签（py3-none-win_amd64）都与已装的
+#    0.10.35 原生包不同形态。本机实测 0.10.35 可导入可用，
+#    Python 3.14 的兼容担心实际不存在。
+opencv-contrib-python==4.13.0.92
+mediapipe==0.10.35
 
 # ---- 刻意不装 ----
 # pyaudio   —— 模块 A 不碰音频。顶层 requirements.txt 里那条注释说

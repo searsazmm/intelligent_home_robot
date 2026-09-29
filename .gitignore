@@ -28,6 +28,10 @@ staticfiles/
 # 每个组员跑一次就多一份自己的对话数据，提交上来只会互相冲突
 backend_B/data/history.csv
 
+# 后端 B 的预合成语音缓存（语音输出，见 backend_B/README.md §4.8）
+# 由语音引擎按本机音色自动生成、换配置自动失效，机器之间不可复用
+backend_B/data/tts_cache/
+
 # IDE
 .idea/
 .vscode/
@@ -41,3 +45,11 @@ Thumbs.db
 node_modules/
 dist/
 build/
+
+# 语音模型（vosk 中文模型约 40MB，是下载来的二进制，不入库）
+# 位置：backend_B/models/<模型目录名>/
+backend_B/models/
+
+# Claude Code 的本地配置（.claude/settings.json 里的权限白名单是**本机**的、
+# 而且可能是从别的项目带过来的，对别人没有意义，不入库）
+.claude/
