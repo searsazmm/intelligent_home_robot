@@ -12,7 +12,8 @@ api_doc §3.3.2 明确写了"模块 A 仅负责视觉特征采集，不做最终
     pitch        float  头部俯仰
     yaw          float  头部左右偏转
     roll         float  头部倾斜
-    emo_feature  str    normal / low / tired
+    emo_feature  str    normal / tired / sad / blank（正式枚举，api_doc §3.2 V1.1）
+                        low（= sad 的兼容别名，A-包仍发这个值）
 
 输出：4 种状态字符串之一。
 
@@ -30,6 +31,23 @@ from dataclasses import dataclass, field
 from typing import Deque, Optional
 
 import config
+
+
+# ---------------------------------------------------------------------------
+# emo_feature 的两套取值（api_doc §3.2）
+# ---------------------------------------------------------------------------
+# 仓库里并存两套模块 A，出站报文格式一样但 emo_feature 枚举不一样：
+#
+#   A-包（backend_A/module_a_vision/）  normal / low   / tired
+#   A-单文件（backend_A/vision_a.py）   normal / tired / sad / blank
+#
+# api_doc V1.1 起把后者记为**正式枚举**，low 降为 sad 的兼容别名，
+# 并要求接收方同时接受两套。**别只认一套**：只认 low 会静默忽略 sad，
+# 于是老人难过时界面显示正常；只认 sad 则反过来漏掉 A-包。两边单测
+# 各自全绿，这种漏判在单侧测不出来。
+EMO_LOW_ALIASES = ("low", "sad")   # 同义：都判 STATE_SAD
+EMO_BLANK = "blank"                # 发呆/失神：双眼睁开但视线长时间无位移
+# tired / normal 两套同名，直接按字面量比较即可，不需要常量。
 
 
 @dataclass
@@ -239,6 +257,21 @@ class VisionStateEvaluator:
 
         latest_feature = face_samples[-1].emo_feature
 
+        # --- 1.5) 发呆/失神：A-单文件的 blank ---
+        # 判成 absent 而不是新加一种状态：C 端 absent 的显示标签本来就是
+        # 「走神/无人」（frontend_C/c_core/expressions.py），语义正好对上。
+        #
+        # ⚠️ 副作用（必须知道）：absent 是主动关怀「人回来了」那条边沿判定的
+        # 输入（core/proactive.py 的 _observe_state）。发呆被判成 absent 后恢复
+        # normal，会触发一次问候：
+        #   - 默认 PROACTIVE_GREETING_ABSENT = 60s，而 blank 只要静止 3s 就成立
+        #     → **默认配置下不会误触发**（要发呆满 60 秒才算"离开过"）；
+        #   - 但 --demo 把它降到 5s → **演示时会误触发**。
+        # 放在疲劳判定之前：blank 的成立条件是"双眼睁开且视线不动"，
+        # 与"困得睁不开眼"是互斥的两种情形，先判走神更贴近语义。
+        if latest_feature == EMO_BLANK:
+            return config.STATE_ABSENT, "A 端 emo_feature=blank（发呆/失神）", 0.6
+
         # --- 2) 疲劳：A 端特征 / EAR 持续偏低 / 眨眼过频 / 长时间低头 ---
         tired_reasons = []
 
@@ -259,9 +292,10 @@ class VisionStateEvaluator:
         if tired_reasons:
             return config.STATE_TIRED, "；".join(tired_reasons), min(0.5 + 0.15 * len(tired_reasons), 1.0)
 
-        # --- 3) 低落：A 端特征 low，或长时间频繁偏头（坐立不安的表现之一）---
-        if latest_feature == "low":
-            return config.STATE_SAD, "A 端 emo_feature=low", 0.7
+        # --- 3) 低落：A 端特征 low / sad（同义），或长时间频繁偏头（坐立不安的表现之一）---
+        # 理由串写实际收到的值，别写死 "low" —— 排查日志时能一眼看出是哪套 A 发的。
+        if latest_feature in EMO_LOW_ALIASES:
+            return config.STATE_SAD, f"A 端 emo_feature={latest_feature}", 0.7
 
         # --- 4) 正常 ---
         return config.STATE_NORMAL, "人脸在位且各项特征正常", 0.8

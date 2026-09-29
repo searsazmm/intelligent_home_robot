@@ -177,6 +177,75 @@ class TestVisionStateEvaluator(unittest.TestCase):
         state = feed_range(ev, 5.0, 12.0, feature="low")
         self.assertEqual(state.state, config.STATE_SAD)
 
+    # ------------------------------------------------------------------
+    # emo_feature 两套枚举（api_doc §3.2 V1.3）
+    #
+    # 仓库里并存两套模块 A，出站格式一样、emo_feature 取值不一样：
+    #   A-包       normal / low   / tired
+    #   A-单文件   normal / tired / sad / blank
+    # B 必须两套都认。这几条守住"接上另一套 A 之后不会静默漏判"。
+    # ------------------------------------------------------------------
+
+    def test_sad_from_upstream_sad(self):
+        """A-单文件发的正式值 sad 必须能判出低落（此前只认 low，会静默漏掉）。"""
+        ev = VisionStateEvaluator()
+        feed_range(ev, 0.0, 5.0)
+        state = feed_range(ev, 5.0, 12.0, feature="sad")
+        self.assertEqual(state.state, config.STATE_SAD)
+        self.assertIn("sad", state.reason)   # 确认是 A 端特征分支判的
+
+    def test_low_and_sad_are_equivalent(self):
+        """low 是 sad 的兼容别名 —— 两个值必须判出同一个状态，且都不回归。"""
+        for feature in ("low", "sad"):
+            with self.subTest(feature=feature):
+                ev = VisionStateEvaluator()
+                feed_range(ev, 0.0, 5.0)
+                state = feed_range(ev, 5.0, 12.0, feature=feature)
+                self.assertEqual(state.state, config.STATE_SAD)
+
+    def test_blank_maps_to_absent(self):
+        """blank（发呆/失神）判 absent —— C 端 absent 的标签本来就是「走神/无人」。
+
+        理由串必须提到 blank：否则这台机器一直有人脸在位，absent 也可能
+        是"丢脸超宽限期"那条分支蒙对的，测不出真正想守的东西。
+        """
+        ev = VisionStateEvaluator()
+        feed_range(ev, 0.0, 5.0)
+        state = feed_range(ev, 5.0, 12.0, feature="blank")
+        self.assertEqual(state.state, config.STATE_ABSENT)
+        self.assertIn("blank", state.reason)
+
+    def test_emo_feature_mapping_table(self):
+        """表驱动：四个合法值各自的落点，外加一个非法值。"""
+        cases = (
+            ("normal", config.STATE_NORMAL),
+            ("tired", config.STATE_TIRED),
+            ("low", config.STATE_SAD),
+            ("sad", config.STATE_SAD),
+            ("blank", config.STATE_ABSENT),
+        )
+        for feature, expected in cases:
+            with self.subTest(feature=feature):
+                ev = VisionStateEvaluator()
+                feed_range(ev, 0.0, 5.0)
+                state = feed_range(ev, 5.0, 12.0, feature=feature)
+                self.assertEqual(state.state, expected)
+
+    def test_unknown_emo_feature_falls_back_to_normal(self):
+        """没见过的取值不能崩、也不能误判成低落 —— 落到正常的兜底分支。"""
+        ev = VisionStateEvaluator()
+        feed_range(ev, 0.0, 5.0)
+        state = feed_range(ev, 5.0, 12.0, feature="weird")
+        self.assertEqual(state.state, config.STATE_NORMAL)
+
+    def test_blank_is_checked_before_tired(self):
+        """blank 与"困得睁不开眼"互斥，先判走神 —— 别被低 EAR 抢走。"""
+        ev = VisionStateEvaluator()
+        feed_range(ev, 0.0, 5.0)
+        state = feed_range(ev, 5.0, 20.0, ear=0.10, feature="blank")
+        self.assertEqual(state.state, config.STATE_ABSENT)
+        self.assertIn("blank", state.reason)
+
     def test_absent_after_face_lost_grace(self):
         """人脸消失后，超过宽限期要判 absent。"""
         ev = VisionStateEvaluator()
