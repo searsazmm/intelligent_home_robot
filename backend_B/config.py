@@ -5,7 +5,7 @@
 
 接口来源标注说明：
   [api_doc]  = api_doc.md 已规定的字段/端口，禁止私自修改
-  [新增]     = 本模块为补齐 chat 通道而新增，已同步进 api_doc.md §7，需 C 端同学对齐
+  [新增]     = 本模块为补齐 chat 通道而新增，已同步进 api_doc.md §5，需 C 端同学对齐
 
 所有配置项都支持环境变量覆盖，方便联调时不改代码换端口，例如：
     set B_VISION_PORT=9000 && python main.py
@@ -32,6 +32,14 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """环境变量里的布尔值。接受 1/true/yes/on（大小写不限）。"""
+    try:
+        return os.environ[name].strip().lower() in ("1", "true", "yes", "y", "on")
+    except KeyError:
+        return default
+
+
 # --------------------------------------------------------------------------
 # 1. 网络地址 —— 三模块统一 127.0.0.1
 # --------------------------------------------------------------------------
@@ -45,9 +53,9 @@ VISION_PORT = _env_int("B_VISION_PORT", 8000)
 STATUS_HOST = _env_str("B_STATUS_HOST", "127.0.0.1")
 STATUS_PORT = _env_int("B_STATUS_PORT", 8001)
 
-# [新增] C→B：C 需要把用户说的话发给 B，B 把回复发回 C。
+# [新增] C↔B：C 需要把用户说的话发给 B，B 把回复发回 C。
 # api_doc 原本只定义了 B→C 单向状态，没有"用户对话文本"的入口，故新增此端口。
-# 详见 api_doc.md §7 与 backend_B/README.md。
+# 详见 api_doc.md §5 与 backend_B/README.md。
 CHAT_HOST = _env_str("B_CHAT_HOST", "127.0.0.1")
 CHAT_PORT = _env_int("B_CHAT_PORT", 8002)
 
@@ -125,7 +133,7 @@ VALID_STATES = (STATE_NORMAL, STATE_SAD, STATE_TIRED, STATE_ABSENT)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# 离线调试用的视觉 CSV（模拟模块 A 导出的数据，api_doc §5.1）
+# 离线调试用的视觉 CSV（模拟模块 A 导出的数据，api_doc §6.1「开发阶段」）
 SAMPLE_VISION_CSV = os.path.join(DATA_DIR, "sample_vision.csv")
 # 历史对话记录 CSV（任务要求 4：预留读取 CSV 历史记录的接口）
 HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
@@ -159,3 +167,238 @@ STATUS_HEARTBEAT_SECONDS = _env_float("B_STATUS_HEARTBEAT", 15.0)
 # --------------------------------------------------------------------------
 
 LOG_LEVEL = _env_str("B_LOG_LEVEL", "INFO")
+
+# --------------------------------------------------------------------------
+# 9. 主动关怀 proactive（任务要求 3：检测到呆滞/低落时主动关心、日常主动问候）
+#
+# ⚠️ 这里的所有秒数都是**墙钟秒**，和 §3/§4 那些判定阈值同一量纲
+#    （VisionStateEvaluator 的防抖与窗口用的也是墙上时钟）。
+#
+#    实时运行时墙钟 == 数据时间，两者没有区别；
+#    但离线回放 --speed N 时，数据时间跑得比墙钟快 N 倍，
+#    门槛必须除以 N 才能在「同一段剧情」上触发。
+#    这个换算由 main.py 在装配时做（见 _scale_for_speed），
+#    策略本身只认墙钟，保持干净。
+# --------------------------------------------------------------------------
+
+# 总开关
+PROACTIVE_ENABLED = _env_bool("B_PROACTIVE", True)
+
+# sad / tired 必须**连续持续**这么久才主动关心（墙钟秒）。
+# 设成 20 是因为要明显长于判定器的防抖（STATE_MIN_HOLD 1.5s）
+# 和滑动窗口（WINDOW_SECONDS 10s）——「刚皱了下眉就凑过来问」很吓人。
+PROACTIVE_SUSTAIN = _env_float("B_PROACTIVE_SUSTAIN", 20.0)
+
+# 两次主动开口之间的最小间隔（墙钟秒）。
+# 这条是防骚扰的主力：抢话头比不说话更糟。
+PROACTIVE_MIN_INTERVAL = _env_float("B_PROACTIVE_MIN_INTERVAL", 90.0)
+
+# 一小时内最多主动开口几次。滑动窗口计数。
+PROACTIVE_MAX_PER_HOUR = _env_int("B_PROACTIVE_MAX_PER_HOUR", 4)
+
+# 用户说过话之后的静默期（墙钟秒）。
+# **任何**真实用户输入（麦克风 / 8002 / --stdin）之后都闭嘴这么久 ——
+# 用户正要往下说的时候被机器人抢话，是最糟的失败模式。
+# 顺带保证了用 --stdin 打字自测时机器人不会插嘴。
+PROACTIVE_USER_COOLDOWN = _env_float("B_PROACTIVE_USER_COOLDOWN", 60.0)
+
+# 人离开超过这么久再回来，才值得说一句「您回来啦」（墙钟秒）。
+# 短于这个时长的消失多半只是扭头/走开拿个东西，不值得开口。
+PROACTIVE_GREETING_ABSENT = _env_float("B_PROACTIVE_GREETING_ABSENT", 60.0)
+
+# 启动后的宽限期（墙钟秒）。刚开机就热情打招呼会吓人一跳，
+# 而且启动初期视觉状态本来就在 absent→normal 之间抖。
+PROACTIVE_STARTUP_GRACE = _env_float("B_PROACTIVE_STARTUP_GRACE", 15.0)
+
+# 静默时段：这段时间内**不主动开口**。
+# ⚠️ 注意只静默"主动"，**绝不静默应答** —— 凌晨两点的「我不舒服」必须回答。
+# 这是安全属性，不是体验偏好。
+PROACTIVE_QUIET_ENABLED = _env_bool("B_PROACTIVE_QUIET", True)
+PROACTIVE_QUIET_START = _env_int("B_PROACTIVE_QUIET_START", 22)   # 22:00
+PROACTIVE_QUIET_END = _env_int("B_PROACTIVE_QUIET_END", 7)        # 次日 07:00
+
+# --------------------------------------------------------------------------
+# 10. 主动关怀的演示预设（main.py --demo）
+#
+# 为什么需要它：实测 data/sample_vision.csv 全长只有 119.9 数据秒，
+# 其中 tired 段 31.9 秒、sad 段 20.0 秒。而上面的默认门槛是 20 秒 ——
+# sad 段刚好卡在边界上，演示时"有时触发有时不触发"，最难看。
+# 再叠加 --speed 5（sad 段只剩 4 个墙钟秒），默认门槛必然一次都不触发。
+#
+# 所以演示时改用这一组更宽松、但**仍然有意义**的阈值。
+# 它们只在 --demo 下生效，正常运行时用上面那组。
+# --------------------------------------------------------------------------
+
+PROACTIVE_DEMO_SUSTAIN = _env_float("B_PROACTIVE_DEMO_SUSTAIN", 10.0)
+PROACTIVE_DEMO_MIN_INTERVAL = _env_float("B_PROACTIVE_DEMO_MIN_INTERVAL", 20.0)
+PROACTIVE_DEMO_MAX_PER_HOUR = _env_int("B_PROACTIVE_DEMO_MAX_PER_HOUR", 60)
+PROACTIVE_DEMO_GREETING_ABSENT = _env_float("B_PROACTIVE_DEMO_GREETING_ABSENT", 5.0)
+PROACTIVE_DEMO_STARTUP_GRACE = _env_float("B_PROACTIVE_DEMO_STARTUP_GRACE", 3.0)
+
+# --------------------------------------------------------------------------
+# 11. 语音（听与说）
+#
+# ⚠️ 语音相关的库都是**可选的**：模块 B 的运行期零第三方依赖是刻意设计，
+#    所有语音库只在函数内部惰性 import。缺库时降级到键盘 / 8002 文本通道，
+#    绝不阻止 B 启动。安装指引见 requirements-voice.txt。
+# --------------------------------------------------------------------------
+
+# 语音总开关（auto 会在有设备时启用）
+VOICE_ENABLED = _env_bool("B_VOICE", True)
+
+# 识别引擎：auto / vosk / speechrecognition / dashscope / none
+STT_ENGINE = _env_str("B_STT", "auto")
+# 合成引擎：auto / doubao / edge / sapi / none
+#   auto 按 doubao → edge_tts → sapi 的顺序挑第一个**真的能用**的：
+#     有豆包凭证就用豆包（音色最好），没凭证退到 edge-tts（音色次之、要联网），
+#     再不行退到 SAPI（机械音，但完全离线）。
+#   这条链保证「默认用豆包」和「没配好也不能变哑巴」同时成立。
+#   ⚠️ 联网引擎要**试合成一句**才算通过，不只看库装没装 —— 本机实测
+#      到 edge-tts 服务器 TCP 连得上但 TLS 被重置，只查"装了没"会选中它，
+#      然后每句都在运行期失败，机器人彻底哑掉。见 tts.probe_synthesizer。
+TTS_ENGINE = _env_str("B_TTS", "auto")
+
+# 音频设备：**按名字子串匹配，不要填序号**（序号会随虚拟设备增减漂移）。
+# 留空 = 用系统默认。
+#   本机注意：默认输出是 [4] 扬声器 (Realtek(R) Audio)，不是 ToDesk 虚拟声卡
+#   （sd.default.device 为 [1, 4]）。听不见时先查**端点音量**，
+#   再考虑显式指定 --audio-out Realtek。
+AUDIO_INPUT_NAME = _env_str("B_AUDIO_IN", "")
+AUDIO_OUTPUT_NAME = _env_str("B_AUDIO_OUT", "")
+
+# 语速倍数（对齐 backend_A/shared/actions.py 的 Speak.speed）。
+# 0.9 = 比正常慢 10%。**刻意不说快**：这是陪聊安慰场景，语速一快就显得
+# 敷衍、像在赶时间，长者听感上也吃力。三个引擎都换算成各自的单位：
+#     SAPI     → Rate=-1（见 speed_to_sapi_rate）
+#     SeedTTS  → speech_rate=-10（见 speech_rate_from_speed）
+#     edge-tts → rate="-10%"（见 EdgeTtsSynthesizer）
+VOICE_SPEED = _env_float("B_VOICE_SPEED", 0.9)
+
+# 音色：留空 = 自动挑第一个中文音色（按 Culture 前缀匹配，**不硬编码名字**）。
+# 豆包引擎下这个值就是 voice_type，见下面的 B_DOUBAO_VOICE。
+VOICE_TTS_VOICE = _env_str("B_VOICE_NAME", "")
+
+# ---- 豆包（火山引擎）语音合成：语音合成大模型 2.0（SeedTTS 2.0）----
+#
+# 走 v3 的 HTTP Chunked 单向流式接口，用**标准库 urllib** 发请求，
+# 不引入 requests —— 这样「运行期零第三方依赖」的约束不用为它破例
+# （只有 MP3 解码需要 soundfile）。
+#
+# ⚠️ 缺任何一个，引擎就判为「不可用」，在启动日志里**点名缺的是哪个**，
+#    然后 build_synthesizer 自动退到下一个引擎，**不会让机器人变哑巴**。
+#
+# ⚠️⚠️ **这套凭证模型和以前那套完全不同，别再往 appid 上想。**
+#    实测（2026-09-29）：旧的 v1 接口（appid + access_token + cluster）
+#    在本项目的凭证下**永远**返回
+#        401 "load grant: requested grant not found in SaaS storage"
+#    —— 换集群、换音色、换 appid 形态、甚至喂故意的垃圾凭证，
+#    服务端回的都是同一句话，说明它压根没走到核对凭证那一步。
+#    换成 v3 的「API Key + ResourceId」之后，音频立刻就有了：
+#
+#        v1（旧）：appid + access_token + cluster，头 Authorization: Bearer;<token>
+#        v3（现在）：一个 API Key，头 X-Api-Key；模型版本走 X-Api-Resource-Id
+#
+#    **v3 里没有 appid 这个东西。** 所以本文件**刻意不读 B_DOUBAO_APPID** ——
+#    读了也没用，只会让人以为少配了它才不发声。
+TTS_DOUBAO_API_KEY = _env_str("B_DOUBAO_TOKEN", "")
+
+# ResourceId：要调哪个**模型版本**。**这是常量，不是账号里的值。**
+#   seed-tts-2.0 = 语音合成大模型 2.0（2.0 音色以 *_uranus_bigtts 结尾）
+#   seed-tts-1.0 = 1.0（兼容 BV*_streaming 音色）
+# 1.0 和 2.0 的音色**不能混用**：下面默认的 Vivi 2.0 是 2.0 音色，
+# 所以这里必须是 seed-tts-2.0。留空会自动回到这个默认值。
+TTS_DOUBAO_RESOURCE_ID = _env_str("B_DOUBAO_RESOURCE_ID", "seed-tts-2.0")
+
+# 音色（speaker）。**必须和模型版本匹配、且控制台里已开通**，大小写敏感。
+# 默认值 zh_female_vv_uranus_bigtts = Vivi 2.0 陪聊音色，适合长者陪伴场景。
+# 想换音色时用 B_DOUBAO_VOICE 覆盖；填错的报错长这样（服务端原话会被带出来）：
+#     豆包合成失败：code=45000010 message=invalid speaker
+TTS_DOUBAO_VOICE = _env_str("B_DOUBAO_VOICE", "zh_female_vv_uranus_bigtts")
+
+# 半双工：机器人播报期间丢掉麦克风数据。
+# 不做回声消除的话，喇叭的声音会被自己听见 → 自激回路 → 自言自语停不下来。
+# 戴耳机时可以用 --barge-in 关掉它实现插话。
+VOICE_HALF_DUPLEX = _env_bool("B_VOICE_HALF_DUPLEX", True)
+
+# 音频块大小（毫秒）。20ms 是语音处理的常规值：
+# 足够细的端点检测粒度，又不会让回调调用得太频繁。
+VOICE_BLOCK_MS = _env_int("B_VOICE_BLOCK_MS", 20)
+
+# ---- 预合成缓存 ----
+#
+# 在线引擎（豆包 / edge-tts）实测合成一句 4.6 秒的话要 3.3 秒，而 SAPI 只要 37ms。
+# 这个差距会变成「机器人先沉默三秒再开口」——聊天气氛上很致命。
+# 对策：把**固定不变的**回复在启动时后台预合成成 WAV 存下来，
+# 播放时直接命中缓存，零合成延迟；带 {topic} 的句子无法预测，不预合成。
+VOICE_CACHE_DIR = os.path.join(DATA_DIR, "tts_cache")
+VOICE_PREWARM = _env_bool("B_VOICE_PREWARM", True)
+
+# --------------------------------------------------------------------------
+# 12. 大模型对话（DeepSeek）
+#
+# 补的是 core/dialogue.py 的这块短板：它是纯关键词规则，任何不含那约 60 个
+# 关键词的话，兜底都掉进 3 句通用套话里 —— 听起来就是"回答生硬、接不住话"。
+#
+# 规则模板与大模型是**叠加**关系，不是替换：
+#     模板   —— 可预测、零依赖、永远有话说，**永远是兜底**
+#     大模型 —— 负责接住没预设过的话，挂了只是少一层
+#
+# ⚠️ 缺凭证 / 断网 / 超时 / 返回体不合法，一律**优雅降级回规则模板**，
+#    在启动日志里**点名缺的是哪个变量**，绝不让机器人变哑巴 ——
+#    和豆包那套（§11）同一套约定。
+#
+# ⚠️ 默认开启（auto），但**没配 API Key 就等于没开**：不配也能跑，
+#    所有现存测试构造的 DialogueEngine 都不带大模型（见 dialogue 的 llm 参数）。
+#
+# ⚠️⚠️ 致命信号和身体不适**永远不走大模型**，走确定性文案 ——
+#    见 core/dialogue.py 的 llm_eligible 与 text_emotion 的 crisis 标记。
+# --------------------------------------------------------------------------
+
+# 总开关。false = 完全走规则模板，一次网络请求都不发。
+LLM_ENABLED = _env_bool("B_LLM", True)
+
+# 引擎：auto / deepseek / none
+#   auto = 有凭证就用 deepseek，没有就静默降级（**不报错、不阻止启动**）
+LLM_ENGINE = _env_str("B_LLM_ENGINE", "auto")
+
+# API Key。控制台：platform.deepseek.com → API keys。
+# 变量名是 B_DEEPSEEK_TOKEN（和 B_DOUBAO_TOKEN 一个路数：名字是凭证标识，
+# 属性名另起），所以启动日志里点名的是**变量名**，不是这里的属性名。
+LLM_DEEPSEEK_API_KEY = _env_str("B_DEEPSEEK_TOKEN", "")
+
+# OpenAI 兼容端点。请求拼成 {BASE_URL}/chat/completions。
+# 带不带 /v1 都认（DeepSeek 两种都收），代码会 rstrip('/') 之后再拼。
+LLM_DEEPSEEK_BASE_URL = _env_str("B_DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+# 模型名。deepseek-chat = 通用对话模型。
+LLM_DEEPSEEK_MODEL = _env_str("B_DEEPSEEK_MODEL", "deepseek-chat")
+
+# 单次请求超时（秒）。**这里和 SYNTH_TIMEOUT=30 的取舍完全相反**：
+# 合成超时在启动路径上，慢一点也比哑巴强；这里是**用户正等着回话**的交互路径，
+# 超时越长，老人干等的时间越长。宁可早失败、早落回模板。
+# 启动探针也复用这个值 —— 否则一个错的 Key 会让启动卡满 30 秒。
+LLM_TIMEOUT = _env_float("B_LLM_TIMEOUT", 4.0)
+
+# 回复长度上限（token）。128 大约够 60~80 个汉字，而模板句都 ≤40 字。
+# 这是延迟的主要杠杆：输出 token 数直接决定等待时间。
+LLM_MAX_TOKENS = _env_int("B_LLM_MAX_TOKENS", 128)
+
+# 采样温度。DeepSeek 官方按场景给的建议是写代码 0.0 / 通用对话 1.3 / 创作 1.5，
+# 不设默认 1.0。陪聊属于"通用对话"，但**这是念给老人听的**，太飘会冒出
+# 莫名其妙的句子 —— 从 1.0 起步，按实际听感再调。
+LLM_TEMPERATURE = _env_float("B_LLM_TEMPERATURE", 1.0)
+
+# 回复字符上限（汉字数）。超了先试着截到第一个句号，截不出来就落回模板。
+# 40 字 ≈ 9 秒语音（语速 0.9），和模板的写作约束一致（见 dialogue.py 的模板库注释）。
+LLM_MAX_CHARS = _env_int("B_LLM_MAX_CHARS", 50)
+
+# 喂给大模型的对话窗口（轮）。只取**本次会话**的历史 ——
+# data/history.csv 会跨多次演示累积，不过滤的话新会话第一句话就会把
+# 上次排练的尾巴（还包括别人的话）喂给模型。
+# 见 core/history_store.recent_dialogue 的 session_only。
+LLM_CONTEXT_TURNS = _env_int("B_LLM_CONTEXT_TURNS", 4)
+
+# 启动时真调一次模型，验证「有 Key」≠「能用」。
+# 代价是一次真实请求（约 1 秒），换来的是"启动日志里就能看出 Key 有没有效"。
+# 详见 core/llm.py 的 probe_chatter。离线开发时用 --no-llm-probe 跳过。
+LLM_PROBE = _env_bool("B_LLM_PROBE", True)
