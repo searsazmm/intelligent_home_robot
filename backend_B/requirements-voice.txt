@@ -1,0 +1,163 @@
+# 模块 B · 语音（听与说）可选依赖
+#
+#   pip install -r requirements-voice.txt
+#
+# ---------------------------------------------------------------------------
+# 先读这段：不装这些，模块 B 照样能跑
+# ---------------------------------------------------------------------------
+# 「运行期零第三方依赖」是后端 B 的刻意设计（见 requirements.txt）。
+# 语音层的所有第三方 import 都写在**函数体内部**惰性执行，
+# 可用性探测用 importlib.util.find_spec（不执行模块，避免只为探测就初始化 PortAudio）。
+#
+# 所以缺库时 B 不会崩，只会记一行清晰指引并降级到文本通道：
+#     键盘输入  —— python main.py --stdin
+#     8002 文本 —— 模块 C / tools/mock_c_client.py
+#
+# 这一条是可演示性的一部分：答辩现场少一个装包失败的可能，就少一个坑。
+#
+# 依赖是否生效用这个命令查（不连模块 A、不占端口）：
+#     python main.py --list-audio
+# 启动横幅里的「语音」一行也会写明实际启用了什么引擎。
+
+# ---------------------------------------------------------------------------
+# 必需：音频输入输出
+# ---------------------------------------------------------------------------
+# 用 sounddevice 而**不是 pyaudio**：pyaudio 在本机 pip 直装编译失败
+# （也是 backend_A/README.md 里推荐改用 sounddevice 的原因）。
+# 自带 PortAudio 的 Windows wheel，零编译。
+sounddevice==0.5.5
+
+# ---------------------------------------------------------------------------
+# 可选：语音识别（STT）—— 装哪个用哪个，都没装就没有语音输入
+# ---------------------------------------------------------------------------
+# 代码里是「注册表 + 适配器」，`--stt auto` 按下面的顺序挑第一个**可用**的：
+#     vosk → speechrecognition → dashscope
+# 也可以用 --stt {auto,vosk,speechrecognition,dashscope,none} 显式指定。
+#
+# ⚠️「可用」= 装了 **且 配好了**（见 core/voice/stt.py 的 READINESS）。
+#    "装了库但没配好"的引擎会被 auto **跳过**，并打印一行说明缺什么 ——
+#    因为它虽然能被构造出来，但每次识别都会静默失败（返回空串），
+#    表现为"对着麦克风说话，机器人毫无反应"，最难查。
+#    显式 --stt 指定时不跳过（你明确要它，就给你试的机会）。
+
+# ① vosk —— 推荐，**本机已装并实测可用**。离线、免费、中文效果好。
+#    装完**还要下载中文模型**（约 40MB），只装库是没用的 ——
+#    这一步最容易漏，漏了的表现是"vosk 装了但机器人还是听不见"。
+#
+#      pip install vosk
+#      下载 https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip
+#      解压后把整个目录放到（任选其一）：
+#          %LOCALAPPDATA%\vosk\        ← 推荐
+#          backend_B\models\
+#      或者设环境变量 B_STT_MODEL 指向它。
+#
+#    ⚠️⚠️ **模型目录的路径绝对不能含中文。**
+#        vosk 的 C++ 层在 Windows 上打不开非 ASCII 路径，报错是
+#        「Folder '...' does not contain model files」—— 而文件明明都在，
+#        报错完全误导，会让人反复检查"是不是没解压全"。
+#
+#        这条对本仓库是**直接的**：项目就在
+#        D:\Virtually C\成都东软学院下期\... 下，所以 backend_B\models\ 这条路
+#        在这台机器上永远不可能成功。本程序会自动跳过含中文的候选并给出提示
+#        （见 core/voice/stt.py 的 find_model_dir / _warn_non_ascii）。
+#        这就是为什么上面把 %LOCALAPPDATA%\vosk\ 列为推荐位置。
+#
+#    关于 Python 3.14 的兼容性：实测 vosk 0.3.45 提供的是
+#    vosk-0.3.45-py3-none-win_amd64.whl（py3-none 标签），在 3.14.3 上装得上、
+#    能加载模型、能识别。本文件早先写的"wheel 未必跟得上"是错的，已实测推翻。
+vosk==0.3.45
+
+# ② speech_recognition —— 需要额外后端；默认走 sphinx（离线但中文很差），
+#    可以设 B_STT_SR_ENGINE=google 走网络（免费、中文可用）。
+#    这个没有额外前提，装了就算可用。
+# SpeechRecognition
+
+# ③ dashscope —— 阿里云云端识别，效果最好但**需要联网 + API key**，
+#    答辩现场断网就废了。也要设了 DASHSCOPE_API_KEY 才算可用。
+#
+#    ⚠️ 本机 **已经装了 dashscope**，但没有 DASHSCOPE_API_KEY，所以它会被
+#       `--stt auto` 跳过并打印「已跳过：dashscope 已安装，但没有
+#       DASHSCOPE_API_KEY」。这不是 bug，是刻意的：宁可不启用，
+#       也不要一个每次静默失败的识别器。
+#
+#       它排在 AUTO_ORDER 最后，只要 vosk 可用就轮不到它，实际影响很小。
+# dashscope
+
+# ---------------------------------------------------------------------------
+# 可选：语音合成（TTS）
+# ---------------------------------------------------------------------------
+# ⚠️ 默认**不需要装任何东西**。
+#
+# `--tts auto`（默认）按「豆包 → edge-tts → SAPI」挑第一个**真的能用**的，
+# 最后那个 SAPI 是 Windows 自带的（PowerShell + System.Speech），
+# 零安装、离线、答辩不怕断网。本机实测有中文音色 Microsoft Huihui Desktop，
+# 合成出 16000Hz / 单声道 / 16bit 的 WAV。
+#
+# 实现上是一个**常驻** PowerShell 子进程：每次新起一个进程要 ~600ms 死寂，
+# 常驻之后每句话只要 ~20ms。用 -EncodedCommand 传 UTF-16LE base64 的脚本
+# （argv 保持纯 ASCII），待朗读文本走 stdin 传 UTF-8 base64 的文本
+# （管道两边编码不同，不这样绕必然乱码）。
+
+# 想要更自然的音色时才装这两个（--tts edge）：
+# edge-tts==7.2.8   —— 微软在线音色，需要联网
+# soundfile==0.14.0 —— edge-tts 硬编码输出 MP3，而标准库 wave 读不了 MP3。
+#                       soundfile(自带 libsndfile 1.2.2) 负责解码，
+#                       再由 audio.resample_pcm 重采样到设备能开的采样率。
+#                       本机没有 ffmpeg / sox，所以只能用 soundfile。
+
+# 豆包（火山引擎，--tts doubao / auto 的首选）**不需要在这上面加任何一行**：
+# 它走标准库 urllib 发 HTTP 请求，不引 requests；
+# 返回的 MP3 复用上面那个 soundfile 解码。所以「接豆包」的代价只有
+# 两个环境变量，没有新依赖：
+#     B_DOUBAO_TOKEN（API Key）/ B_DOUBAO_VOICE
+# 可选：B_DOUBAO_RESOURCE_ID，默认 seed-tts-2.0，一般不用改。
+# 详见 README.md §4.8「豆包凭证怎么配」。
+#
+# ⚠️ **v3（语音合成大模型 2.0 / SeedTTS 2.0）里没有 appid。**
+#    旧接口（v1，/api/v1/tts）那套「appid + access_token + cluster +
+#    Authorization: Bearer;<token>」在本项目的凭证下**永远**返回
+#    401 "load grant: requested grant not found in SaaS storage" ——
+#    换集群、换音色、换 appid 形态、甚至喂故意编的垃圾凭证，服务端回的
+#    都是同一句，说明它压根没走到核对凭证那一步。现在的鉴权只要一个
+#    X-Api-Key，模型版本走 X-Api-Resource-Id。
+#
+# ⚠️ 本机实测：到 edge-tts 的服务器（speech.platform.bing.com）**连不通** ——
+#    TCP 能建连，但紧接着的 TLS 被重置。所以 auto 会跳过 edge-tts 落到 SAPI。
+#    这不是 bug，是候选链在起作用；日志里会写「试合成失败，跳过」。
+#    国内网络下豆包（openspeech.bytedance.com）反而是更可靠的选择。
+
+# ---------------------------------------------------------------------------
+# 关于采样率：为什么代码里到处在重采样
+# ---------------------------------------------------------------------------
+# **Windows 上 PortAudio 不做重采样**，声卡只接受自己的原生采样率。
+# 本机实测（check_output_settings）：
+#
+#   [ 5] Realtek 8 声道   mono @16000 OK  @44100 OK  @48000 OK   ← 什么都收
+#   [12] Realtek 2 声道   mono @16000 失败  @44100 失败  @48000 OK
+#   [21] Realtek 2 声道   mono @16000 失败  @44100 失败  @48000 OK
+#
+# 也就是说 SAPI 合成的 16kHz WAV 往**真正的音箱**上播会直接抛
+# PortAudioError: Invalid sample rate。而那个 8 声道的"能播"只是因为它内部
+# 替我们重采样了 —— 声音到底去了哪几个声道没人知道。
+# 所以不能靠"随便挑个能开的设备"，必须自己把采样率对上（audio.resample_pcm）。
+
+# ---------------------------------------------------------------------------
+# ⚠️ 本机注意：设备按名字选，不按索引
+# ---------------------------------------------------------------------------
+# 设备一律按**名字子串**解析，绝不按索引（索引会随虚拟设备增减漂移 ——
+# 本机装着 ToDesk 的远程虚拟声卡，这类设备列表每次远程连接都可能变）：
+#
+#     python main.py --list-audio              # 先看列表
+#     python main.py --audio-out Realtek       # 再显式指定
+#
+# 同名设备常有多个，代码会优先挑「声道数 <= 2」的：
+# 搜 "Realtek" 会依次命中 [5](8声道) [11](8声道) [12](2声道) [17](2声道) …
+# 第一个是环绕声端点，往它上面送单声道语音，声音去哪个音箱完全不受控。
+#
+# ⚠️ 更正一条**曾经写错的记录**：这里原本写「系统默认输出是
+#    [4] 扬声器 (ToDesk Virtual Audio)」，实测**不成立** ——
+#    PortAudio 的 MME 默认输出就是 [4] 扬声器 (Realtek(R) Audio)，
+#    `sd.default.device` 返回 [1, 4]。
+#    曾经那次「播放成功但听不见」的真因是 **Realtek 渲染端点的音量停在 14%**
+#    （用 Core Audio 的 IAudioEndpointVolume 读出来的），把音量调回 100% 就出声了。
+#    所以听不见时**先查端点音量**，再怀疑选错了设备。
