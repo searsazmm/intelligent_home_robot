@@ -175,6 +175,13 @@ def stream_frames_looping(client: socket.socket, frames, args) -> int:
 
 
 def main() -> int:
+    # Windows 控制台默认可能是 GBK，日志里有中文会乱码（同 main.py / watch_8002.py）
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="模拟模块 A（TCP 服务端，发视觉 JSON）")
     parser.add_argument("--csv", default=config.SAMPLE_VISION_CSV,
                         help=f"要回放的 CSV（默认 {config.SAMPLE_VISION_CSV}）")

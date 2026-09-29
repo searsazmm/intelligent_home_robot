@@ -3,7 +3,7 @@
 
 同时连 B 的两个端口：
     8001  只读，收 normal/sad/tired/absent 纯文本状态字符串（api_doc §4）
-    8002  双向，发用户对话文本、收机器人回复（api_doc §7）
+    8002  双向，发用户对话文本、收机器人回复（api_doc §5，V1.1 新增）
 
 用法：
     python tools/mock_c_client.py                  # 交互式打字聊天
@@ -196,6 +196,18 @@ def run_interactive(chat: ChatClient) -> None:
 
 
 def main() -> int:
+    # Windows 控制台默认可能是 GBK，日志里有中文会乱码。
+    # ⚠️ 这行不只是好看：输出**重定向到文件**时 Python 用的是 ANSI 代码页（本机 GBK），
+    #    而 tools/e2e_offline_check.sh 是 UTF-8 的、里面 grep 的是中文字面量 ——
+    #    两边编码不一致，脚本会一直报「没收到回复」，而功能其实完全正常。
+    #    同一个坑也让 `python tools/mock_c_client.py > log.txt` 出来的文件在
+    #    VSCode / Git Bash 里打开是乱码。
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="模拟模块 C：连 B 的状态口和对话口")
     parser.add_argument("--host", default="127.0.0.1", help="B 的地址")
     parser.add_argument("--status-port", type=int, default=config.STATUS_PORT)

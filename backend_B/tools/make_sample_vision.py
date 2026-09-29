@@ -162,6 +162,13 @@ def generate(out_path: str, seed: int = 20260923) -> int:
 
 
 def main() -> int:
+    # Windows 控制台默认可能是 GBK，日志里有中文会乱码（同 main.py / watch_8002.py）
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(description="生成离线调试用视觉 CSV")
     parser.add_argument("--out", default=config.SAMPLE_VISION_CSV,
                         help=f"输出路径（默认 {config.SAMPLE_VISION_CSV}）")
