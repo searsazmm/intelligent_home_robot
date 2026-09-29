@@ -300,6 +300,44 @@ class TestTextEmotion(unittest.TestCase):
         self.assertEqual(result.label, "negative")
         self.assertLess(result.score, -3.0)
 
+    def test_crisis_is_flagged(self):
+        """求救信号要留下**独立标记**，不能只靠"分数很低"让下游去猜。
+
+        这个标记是 core/dialogue.py 走危机关怀分支、并且**不把这句话交给
+        大模型**的唯一依据（见 llm_eligible）。别的极端消极句也能凑到低分，
+        但那些不需要走危机处理，所以必须能区分开。
+        """
+        for text in ("我不想活了", "活着没意思", "不如死了", "没人在乎我"):
+            with self.subTest(text=text):
+                self.assertTrue(self.analyzer.analyze(text).crisis)
+
+    def test_ordinary_sadness_is_not_crisis(self):
+        """普通抱怨不能被打成危机 —— 否则关怀语会变得很吓人。"""
+        for text in ("今天有点闷", "心里难受", "我挺累的", "没什么意思"):
+            with self.subTest(text=text):
+                self.assertFalse(self.analyzer.analyze(text).crisis)
+
+    def test_crisis_survives_whitespace_evasion(self):
+        """插空格、全角不能绕过危机判定。
+
+        匹配是在 _normalize() 之后做的（去空白、全角转半角），所以
+        「我 不 想 活 了」同样命中。这条同时钉住"下游不要拿原文自己再匹配
+        一遍"这个约定 —— 那样写就会漏掉这个用例。
+        """
+        for text in ("我 不 想 活 了", "不 想 活", "活着 没意思"):
+            with self.subTest(text=text):
+                self.assertTrue(self.analyzer.analyze(text).crisis)
+
+    def test_crisis_does_not_imply_discomfort(self):
+        """危机和身体不适是两个独立信号。
+
+        "我疼得不想活了"两者都命中，而 _candidates 里危机优先级更高 ——
+        这时候该回应的是"不想活"，不是"疼"。
+        """
+        result = self.analyzer.analyze("我不想活了")
+        self.assertTrue(result.crisis)
+        self.assertFalse(result.discomfort)
+
     def test_fine_grained_emotion(self):
         self.assertEqual(self.analyzer.analyze("我好困").emotion, "tired")
         self.assertEqual(self.analyzer.analyze("睡不着，很担心").emotion, "anxious")
@@ -345,6 +383,34 @@ class TestDialogue(unittest.TestCase):
         reply = self.engine.respond("")
         self.assertTrue(reply.reply)
 
+    def test_standalone_greeting_word_is_not_a_substring_match(self):
+        """「早」只有整句就是它时才算打招呼。
+
+        回归测试：词表里「早」是唯一的单字关键词，做**子串**匹配时
+        「我们家那口子走得早」会被识别成 greeting —— 那是在说老伴去世，
+        却被回一句热情的招呼。既答非所问，也不合适。
+        """
+        from core.dialogue import STANDALONE_KEYWORDS
+        for text in ("早", "早！", "早，", "早上好"):
+            with self.subTest(text=text):
+                emotion = self.engine.analyzer.analyze(text)
+                self.assertEqual(self.engine.recognize_intent(text, emotion),
+                                 "greeting")
+
+        for text, expected in (("我们家那口子走得早", "chat"),
+                               ("我起得早", "chat"),
+                               ("你早点睡吧", "chat")):
+            with self.subTest(text=text):
+                emotion = self.engine.analyzer.analyze(text)
+                got = self.engine.recognize_intent(text, emotion)
+                self.assertNotEqual(got, "greeting",
+                                    "%r 被当成了打招呼" % text)
+                self.assertEqual(got, expected)
+
+        # 单字规则只该罩住真正有歧义的那几个，别顺手把整张表都改了
+        self.assertEqual(STANDALONE_KEYWORDS, frozenset({"早"}))
+        self.assertNotIn("你好", STANDALONE_KEYWORDS)
+
     def test_intent_recognition(self):
         for text, expected in (("你好呀", "greeting"),
                                ("那先这样吧，再见", "farewell"),
@@ -383,6 +449,45 @@ class TestDialogue(unittest.TestCase):
         from core.vision_state import VisionState
         reply = self.engine.respond("嗯", VisionState(state=config.STATE_NORMAL))
         self.assertNotIn("嗯——", reply.reply)
+
+    def test_crisis_gets_the_crisis_replies(self):
+        """求救信号必须走专门的危机关怀文案。
+
+        回归测试：加这条分支之前，CRISIS_PATTERNS 只把情绪分拉到 -5.0，
+        下游没有任何特判 —— "我不想活了"和"今天有点闷"落进同一组模板，
+        回的是一句普通的共情套话。
+        """
+        from core.dialogue import CRISIS_REPLIES
+        from core.vision_state import VisionState
+        for state in config.VALID_STATES:
+            with self.subTest(state=state):
+                reply = self.engine.respond("我不想活了", VisionState(state=state))
+                self.assertIn(reply.reply, CRISIS_REPLIES)
+
+    def test_crisis_outranks_discomfort(self):
+        """"我疼得不想活了"该回应"不想活"，不是"疼"。"""
+        from core.dialogue import CRISIS_REPLIES
+        reply = self.engine.respond("我疼得不想活了")
+        self.assertIn(reply.reply, CRISIS_REPLIES)
+
+    def test_discomfort_still_wins_over_state_templates(self):
+        """身体不适那条分支没有被危机分支挤掉。"""
+        from core.dialogue import DISCOMFORT_REPLIES
+        reply = self.engine.respond("我胸口疼")
+        self.assertIn(reply.reply, DISCOMFORT_REPLIES)
+
+    def test_crisis_and_discomfort_replies_are_prewarmed(self):
+        """这两组必须进预合成集合。
+
+        它们早先是内联在 _candidates 里返回的字面量，而 static_replies()
+        只遍历那几张字典表 —— 于是**从来没被预合成过**，表现为
+        "老人说不舒服，机器先沉默三四秒"。这两类话恰恰最不能等。
+        """
+        from core.dialogue import CRISIS_REPLIES, DISCOMFORT_REPLIES, static_replies
+        prewarmed = static_replies()
+        for text in CRISIS_REPLIES + DISCOMFORT_REPLIES:
+            with self.subTest(text=text):
+                self.assertIn(text, prewarmed)
 
 
 # ==========================================================================

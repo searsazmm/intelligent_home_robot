@@ -92,9 +92,13 @@ NEGATIONS = ("不", "没", "别", "无", "非", "未", "莫", "勿", "不要", "
 # 否定词往后看多少个字符去找情感词（中文里"不怎么开心"的间隔很短）
 NEGATION_WINDOW = 4
 
-# 危险信号：命中直接给最强消极权重，对话管理会优先走关怀/提醒分支。
+# 危险信号：命中就置 TextEmotion.crisis 并直接给最强消极权重。
+# 对话管理（core/dialogue.py）靠这个标记走**专门的危机关怀分支**，并且
+# **不把这句话交给大模型** —— 见 dialogue.llm_eligible。
+#
 # 这里要穷举常见说法 —— 漏掉一种说法就可能把一个求救信号当成普通抱怨，
-# 值得多写几个变体。
+# 值得多写几个变体。匹配是在 _normalize() 之后做的，所以「想 死」「不 想 活」
+# 这种插空格的写法也能命中；下游不要再拿原文自己匹配一遍（会漏）。
 CRISIS_PATTERNS = (
     "不想活", "活不下去", "想死", "自杀", "想不开",
     "活着没意思", "没意思活着", "不如死了", "死了算了", "活着没劲",
@@ -115,6 +119,7 @@ class TextEmotion:
     score: float = 0.0            # 连续得分，负=消极
     hits: List[str] = None        # 命中的情感词，便于联调时解释结果
     discomfort: bool = False      # 是否提到身体不适（头疼 / 不舒服 …）
+    crisis: bool = False          # 是否命中 CRISIS_PATTERNS（求救信号，见下）
 
     def __post_init__(self) -> None:
         if self.hits is None:
@@ -132,6 +137,7 @@ class TextEmotion:
             "emotion": self.emotion,
             "score": round(self.score, 2),
             "discomfort": self.discomfort,
+            "crisis": self.crisis,
             "hits": self.hits,
         }
 
@@ -204,11 +210,17 @@ class TextEmotionAnalyzer:
                 emotion_weights["discomfort"] = emotion_weights.get("discomfort", 0.0) + magnitude
 
         # ---- 3) 危险信号：一票否决，直接拉到最强消极 ----
+        # crisis 不只是"分很低"，它是一个**独立信号**：对话管理据此走专门的关怀
+        # 分支，并且**绝不允许交给大模型自由发挥**（见 core/dialogue.py 的
+        # llm_eligible）。所以这里必须留下显式标记，不能让下游靠 score 去猜 ——
+        # 别的极端消极句子也能凑到 -5 分，但那些不需要走危机处理。
+        crisis = False
         for pattern in CRISIS_PATTERNS:
             if pattern in normalized:
                 score -= 5.0
                 hits.append(pattern)
                 emotion_weights["sad"] = emotion_weights.get("sad", 0.0) + 5.0
+                crisis = True
                 break
 
         # ---- 4) 标点微调 ----
@@ -223,6 +235,7 @@ class TextEmotionAnalyzer:
             score=score,
             hits=hits[:12],
             discomfort="discomfort" in emotion_weights,
+            crisis=crisis,
         )
 
     def label_of(self, text: str) -> str:

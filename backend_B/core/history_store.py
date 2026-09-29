@@ -215,14 +215,27 @@ class CsvHistoryStore:
                 break
         return result
 
-    def recent_dialogue(self, turns: int = config.DIALOGUE_CONTEXT_TURNS) -> List[Dict[str, str]]:
+    def recent_dialogue(self, turns: int = config.DIALOGUE_CONTEXT_TURNS,
+                        session_only: bool = False) -> List[Dict[str, str]]:
         """取最近 turns 轮对话，转成 [{"role": ..., "text": ...}]。
 
         对话管理在生成回复前调用它，用来避免重复上一句、并做上下文衔接。
+        大模型那条路也用它拼上下文（见 core/dialogue.py 的 _history_messages）。
+
+        ``session_only=True`` 只取**本次会话**的行。默认 False 是为了保持
+        这个方法原来的语义（纯透传），但**喂给大模型时一定要传 True**：
+        history.csv 会跨多次演示累积，不过滤的话新会话第一句话就会把
+        上次排练的尾巴喂给模型 —— 那里面还包括别人的话。
+
+        "记住昨天"对陪伴机器人是个真功能，但那需要真正的记忆摘要，
+        不是把 CSV 的尾巴直接塞进提示词；那是另一个独立决策。
         """
         if turns <= 0:
             return []
         records = self.load_recent(limit=turns * 2)
+        if session_only:
+            records = [record for record in records
+                       if record.session_id == self.session_id]
         return [record.as_dialogue() for record in records]
 
     def last_robot_replies(self, count: int = 3) -> List[str]:
