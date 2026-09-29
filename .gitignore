@@ -50,6 +50,14 @@ build/
 # 位置：backend_B/models/<模型目录名>/
 backend_B/models/
 
+# 后端A采集数据（只保留交付 B 的 4 标签样例）
+backend_A/data/*
+!backend_A/data/vis_data_20260922_154601.csv
+backend_A/baseline.json
+
+# 模块A 模型权重（体积大，不进版本库，见 backend_A/README.md 下载说明）
+backend_A/models/
+
 # Claude Code 的本地配置（.claude/settings.json 里的权限白名单是**本机**的、
 # 而且可能是从别的项目带过来的，对别人没有意义，不入库）
 .claude/
