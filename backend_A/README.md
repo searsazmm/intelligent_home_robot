@@ -15,7 +15,7 @@
 | 归属 | 本分支（移植自 `xiangmu1/home_robot`） | 队友 GYZ（原 `origin/main`） |
 | 人脸 | MediaPipe **Tasks** `FaceLandmarker` | MediaPipe **FaceMesh**（solutions） |
 | 独有能力 | 五项指标 + 10 秒聚合 + 隐私闸 + v1 契约闸 + **40 个测试** + 确定性**合成源**（无摄像头也能演示） | **CHROM rPPG**（心率/呼吸率）+ **ONNX 性别年龄** + 多人脸锁主脸 + 照度自检 + 挂机态 A8/A9/A11 |
-| 依赖 | numpy / opencv-contrib / mediapipe | 另加 `onnxruntime`（**可选**，缺了自动降级） |
+| 依赖 | numpy / opencv-contrib / mediapipe（**Tasks 构建**） | mediapipe（**需带 `solutions` 的旧构建**，见下方警告）+ 可选 `onnxruntime` |
 | `emo_feature` 取值 | `normal` / `low` / `tired` | `normal` / `tired` / `sad` / `blank` |
 
 ## 两套的 `emo_feature` 枚举不一样 —— 已确认按下面处理
@@ -32,6 +32,46 @@
 > ⚠️ 一处已知副作用：`blank` 判成 `absent` 后，如果发呆持续够久再「回来」，
 > 会触发一次主动问候。默认阈值 60 秒，而 `blank` 只需 3 秒静止 → 默认配置下
 > 不会误触发；但 **`--demo` 模式把它降到 5 秒，演示时会误触发**。
+
+## ⚠️ 但两套 A **装不进同一个 Python 环境**（2026-09-29 实测）
+
+代码可以并存、`git` 上没有冲突，但**依赖层面互斥** —— 两套要的是同一个包名
+`mediapipe` 的两个不同构建：
+
+| | 用的 API | 需要什么 |
+|---|---|---|
+| A-包 | `mediapipe.tasks.python`（Tasks API） | Tasks 构建即可。本仓库锁的 **0.10.35 是 Tasks-only**，`mediapipe.solutions` **不存在** |
+| A-单文件 | `mediapipe.solutions.face_mesh`（旧 Solutions API） | 必须是**仍带 `solutions` 的旧构建**，GYZ 当时用的是 0.10.14 |
+
+本机实测（mediapipe 0.10.35 + Python 3.14）：A-包正常起服务；
+`vision_a.py` 在自检阶段就退出：
+
+```
+[A] 性别/年龄估计禁用：未找到 age_gender.onnx（一次性下载见 README）
+[A] ❌ 自检失败：FaceMesh 模型加载失败（module 'mediapipe' has no attribute 'solutions'）
+```
+
+（性别/年龄那条是**正常的降级提示**，不是故障 —— `onnxruntime` 装了但模型文件
+需要另外下载，见下文。真正拦住的是第二条。）
+
+**这不是合并引入的回归**：两套 A 在合并前就各自锁着不同的 mediapipe，
+只是此前互相看不见、没人同时装过。合并到同一个仓库后它才浮出来。
+
+**要跑 A-单文件**，得单独给它一个环境：
+
+```bash
+python -m venv .venv-gyz-a && . .venv-gyz-a/Scripts/activate
+pip install opencv-contrib-python==4.13.0.92 mediapipe==0.10.14 onnxruntime==1.23.2
+python vision_a.py --no-window --seconds 10
+```
+
+> 未在本机验证的两点（换环境前请先确认）：
+> ① 0.10.14 是否同时带 `solutions` 和 `tasks` —— 若两个都有，那 0.10.14 就是
+> 两套都能满足的下限，可以考虑改锁它，省掉两个环境；
+> ② 0.10.14 在 Python 3.14 上有没有 wheel（GYZ 当时的环境未必是 3.14）。
+>
+> **演示路径走的是 A-包**（合成源、不需要摄像头、40 个测试），
+> 所以当前锁 0.10.35 不影响演示。
 
 ---
 

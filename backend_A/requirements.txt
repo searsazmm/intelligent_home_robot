@@ -17,6 +17,11 @@ numpy>=1.26
 # Solutions API（mediapipe.solutions.face_mesh）。顶上那条"新版移除了
 # solutions"的担心针对的是后者，与本模块无关。
 #
+# ⚠️ 但同目录下的另一套 A（vision_a.py）用的**正是** Solutions API，
+#    所以它在本文件锁的 0.10.35 下起不来（0.10.35 是 Tasks-only 构建，
+#    mediapipe.solutions 不存在）。要跑它得单独一个环境装带 solutions 的
+#    旧构建。两套 A 装不进同一个 Python 环境 —— 详见 ../backend_A/README.md。
+#
 # ⚠️ 锁死 0.10.35 而不是写 >=1.0。写 >=1.0 时 pip 会解析到 **1.0.1** ——
 #    那是跨大版本的另一套东西，wheel 标签（py3-none-win_amd64）都与已装的
 #    0.10.35 原生包不同形态。本机实测 0.10.35 可导入可用，
