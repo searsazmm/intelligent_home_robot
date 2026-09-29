@@ -50,9 +50,13 @@ build/
 # 位置：backend_B/models/<模型目录名>/
 backend_B/models/
 
-# 后端A采集数据（只保留交付 B 的 4 标签样例）
+# 后端A采集数据（只保留交付 B 的 4 标签样例 + 一份 rPPG 波形样例）
 backend_A/data/*
 !backend_A/data/vis_data_20260922_154601.csv
+# rPPG 波形样例：本仓库唯一一份真实波形数据（1563 帧 / HR=75bpm / SQI=1.0，
+# hr 有值 93%、ibi 82%），给 api_doc §3.5 那个仍标着「未确认」的 rPPG 字段
+# 提案当实证。GYZ 当初只留了 4 标签样例、没留波形样例。
+!backend_A/data/pulse_wave_20260929_181230.csv
 backend_A/baseline.json
 
 # 模块A 模型权重（体积大，不进版本库，见 backend_A/README.md 下载说明）

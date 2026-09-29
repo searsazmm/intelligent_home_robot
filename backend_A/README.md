@@ -33,10 +33,12 @@
 > 会触发一次主动问候。默认阈值 60 秒，而 `blank` 只需 3 秒静止 → 默认配置下
 > 不会误触发；但 **`--demo` 模式把它降到 5 秒，演示时会误触发**。
 
-## ⚠️ 但两套 A **装不进同一个 Python 环境**（2026-09-29 实测）
+## ⚠️ 跑 A-单文件要单独一个环境（两件事：mediapipe 版本 + **中文路径**）
 
-代码可以并存、`git` 上没有冲突，但**依赖层面互斥** —— 两套要的是同一个包名
-`mediapipe` 的两个不同构建：
+两套 A 代码可以并存、`git` 上没有冲突，但 `vision_a.py` 起不来有**两个独立原因**，
+必须同时解决。先看两套要的东西不一样：
+
+### 一、版本：0.10.35 是 Tasks-only，没有 `solutions`
 
 | | 用的 API | 需要什么 |
 |---|---|---|
@@ -52,26 +54,66 @@
 ```
 
 （性别/年龄那条是**正常的降级提示**，不是故障 —— `onnxruntime` 装了但模型文件
-需要另外下载，见下文。真正拦住的是第二条。）
+需要另外下载，见下文。真正拦住的是下面那条自检失败。）
 
 **这不是合并引入的回归**：两套 A 在合并前就各自锁着不同的 mediapipe，
-只是此前互相看不见、没人同时装过。合并到同一个仓库后它才浮出来。
+只是此前互相看不见、没人同时装过；合并到同一个仓库后才浮出来。
 
-**要跑 A-单文件**，得单独给它一个环境：
+### 二、路径：**换对版本也还起不来** —— Solutions API 打不开含中文的路径
 
-```bash
-python -m venv .venv-gyz-a && . .venv-gyz-a/Scripts/activate
-pip install opencv-contrib-python==4.13.0.92 mediapipe==0.10.14 onnxruntime==1.23.2
-python vision_a.py --no-window --seconds 10
+这条 2026-09-29 才挖出来，比版本问题隐蔽得多。本仓库路径含中文
+（`D:\Virtually C\成都东软学院下期\...`），而 Solutions API 会把模型**文件路径**
+（`face_landmark_front_cpu.binarypb` 等）交给 C++ 层，C++ 按 ANSI 代码页解释路径，
+中文目录打不开。症状极具欺骗性：
+
+```
+FileNotFoundError: The path does not exist: ...\mediapipe\modules\face_landmark\face_landmark_front_cpu.binarypb
 ```
 
-> 未在本机验证的两点（换环境前请先确认）：
-> ① 0.10.14 是否同时带 `solutions` 和 `tasks` —— 若两个都有，那 0.10.14 就是
-> 两套都能满足的下限，可以考虑改锁它，省掉两个环境；
-> ② 0.10.14 在 Python 3.14 上有没有 wheel（GYZ 当时的环境未必是 3.14）。
+**文件确实在、`os.path.exists()` 也返回 True**，只有 C++ 那边看不见。
+
+> 定位判据：把 mediapipe 包整个拷到纯 ASCII 路径并用 `PYTHONPATH` 前置，
+> FaceMesh 立刻能实例化。**用目录 junction 骗不过去** —— venv 里
+> `mediapipe.__file__` 会解析回中文原路径。
+
+A-包不受影响：它用 **Tasks** API，模型字节在 Python 侧读出来再交给 C++，不传路径。
+
+### 可用组合（2026-09-29 实测）
+
+```bash
+# 环境必须建在 **仓库外** 的纯 ASCII 路径；Python 用 3.12（原因见下）
+python3.12 -m venv C:\venv-gyz-a
+C:\venv-gyz-a\Scripts\pip install opencv-contrib-python==4.13.0.92 mediapipe==0.10.14 onnxruntime==1.23.2
+
+cd backend_A
+C:/venv-gyz-a/Scripts/python.exe vision_a.py --no-window --no-socket --seconds 10
+```
+
+实测（本机 `C:\Users\35920\venv-gyz-a`，Python 3.12.10）：打印
+`[A] 性别/年龄模型已加载` → `[A] 摄像头已打开：index=0` → `[A] 自检通过`，退出码 0。
+
+### 更正：两套 A **不互斥**，可以共用一套环境
+
+本文档早先写过「两套 A 装不进同一个 Python 环境」，**这个结论是错的**。
+2026-09-29 实测两项后更正：
+
+| 实测 | 结果 |
+|---|---|
+| `mediapipe==0.10.14` 是否同时带两套 API | **是** —— `solutions` 与 `tasks` 都在 |
+| A-包跑在 0.10.14 下 | **40 个测试全过**（`python -m unittest discover -s tests`） |
+
+即 **0.10.14 是两套都满足的下限，一套环境就能同时跑两套 A**。真正的约束是另两条：
+
+1. **Python ≤ 3.12** —— 0.10.14 **没有 cp314 wheel**
+   （`pip download --python-version 3.14` 报 `No matching distribution found`）。
+   本机的 3.12.10 可以，3.14 装不上。
+2. **环境建在纯 ASCII 路径**（仓库外）—— 否则 A-单文件仍然起不来，见上。
+
+> 早先本节建议 `python -m venv .venv-gyz-a`（建在仓库里），**那条路走不通**
+> （中文路径，且 3.14 装不上 0.10.14），已按实测替换为上面的建法。
 >
 > **演示路径走的是 A-包**（合成源、不需要摄像头、40 个测试），
-> 所以当前锁 0.10.35 不影响演示。
+> 所以锁 0.10.35 不影响演示。
 
 ---
 
@@ -422,7 +464,7 @@ python sim_b.py                   # 另开终端：模拟 B 连 8000 收流并�
 | 文件 | 内容 |
 |---|---|
 | `data/vis_data_时间戳.csv` | 协议数据：表头 `timestamp,has_face,ear,blink_cnt,pitch,yaw,roll,emo_feature`（api_doc §3.4，UTF-8 无 BOM，`\n` 换行，数值 2 位小数） |
-| `data/pulse_wave_时间戳.csv` | 实验数据：`timestamp,r,g,b,a_lab,b_lab,mouth_open,hr,rr,ibi_ms,sqi`（rPPG 原始三通道/双颊 Lab 色值/口部开口度 + 派生指标 + 质量分，未进协议；`mouth_open` 为唇 13/14 开口度时序，供 B 对话状态机，协议字段见 api_doc §3.5 V1.2 草案） |
+| `data/pulse_wave_时间戳.csv` | 实验数据：`timestamp,r,g,b,a_lab,b_lab,mouth_open,hr,rr,ibi_ms,sqi`（rPPG 原始三通道/双颊 Lab 色值/口部开口度 + 派生指标 + 质量分，未进协议；`mouth_open` 为唇 13/14 开口度时序，供 B 对话状态机，协议字段见 api_doc §3.5 V1.2 草案）。**仓库内保留了一份真实波形样例** `data/pulse_wave_20260929_181230.csv`（1563 帧、`hr` 有值 93%、末次 HR=75bpm / SQI=1.0）作为格式实证，由 .gitignore 的 `!` 例外放行 |
 | TCP 127.0.0.1:8000 | 每帧一行 JSON + `\n`（字段同 CSV）；**无人脸帧照发心跳** `has_face=false`（api_doc §3.3）——B 靠心跳区分"没人"与"掉线"，B 断开自动等待重连 |
 
 **rPPG 成熟度（诚实标注）**：采用 **CHROM 色度法**（三通道抗运动伪影，优于裸绿通道）+ **SQI 质量门控**
@@ -467,6 +509,18 @@ curl -L -o backend_A/models/age_gender.onnx \
 `baseline.json` 属个人派生数据，仅存本地，已加入 .gitignore 不进版本库。
 **首次标定（或按 c 重标）时保持正常坐姿，不要歪头做表情。**
 
+**2026-09-29 实测（Python 3.12.10 + mediapipe 0.10.14，纯 ASCII 路径环境）**：
+首跑打印 `[A] 基线标定完成：pitch=15.30 yaw=-4.73 roll=-0.92` 并写出 `baseline.json`；
+再跑时 `Calibrator.load()` 返回 `True`、`feeding()` 返回 `False`（不再重新标定）、
+`_loaded=True`（自动重标保护已激活）—— **A8 持久化确实生效**，不只是文档里写着。
+
+⚠️ 标定出的 `baseline[3]`（嘴角弧度基准）**容易正好是 `0.0`**：若前 25 个有效帧的
+弧度均值落在 ±0.0005 内，四舍五入后即为 0，此时 `sad` 判据退化成「原始弧度 >
+`sad_curvature`」，不再相对个人基线，而默认 0.015 偏严 —— 实测 1538 帧、其中
+刻意做了 20 秒难过表情的会话里，`sad` 也只触发 19 帧（1.2%）。想采到足量 `sad`
+得真的皱眉、嘴角明显下压。**这与本仓库既有样例一致**（`vis_data_20260922_154601.csv`
+610 帧里 `sad` 只有 2 帧），是阈值口径问题、不是故障。
+
 ### 调参
 
 所有阈值集中在 `config.json`。个体差异大时优先调：`ear_tired`（疲劳）、`sad_curvature`（难过）、
@@ -479,6 +533,9 @@ curl -L -o backend_A/models/age_gender.onnx \
 
 ### 给 B 交付样例前的检查项
 
-1. 程序退出时打印自测摘要：**四种标签都出现过**（对着镜头分别做正常/疲惫/难过/发呆各十几秒）；
+1. 程序退出时打印自测摘要：**四种标签都出现过**（对着镜头分别做正常/疲惫/难过/发呆各十几秒）。
+   ⚠️ `sad` 和 `blank` 是最难采的两类：前者要真皱眉（阈值说明见「基线标定」一节），
+   后者要求视线静止满 `gaze_still_sec`（默认 3 秒）—— 实测各留 20 秒也只采到
+   19 / 18 帧。交付口径是**出现过**即可，不要求这两类占比高；
 2. CSV 行数 = 有人脸帧数，表头与 api_doc §3.4 逐字一致；
 3. Socket 用 `telnet 127.0.0.1 8000` 或 B 侧脚本连上能收到 JSON 流（含无人脸心跳）。

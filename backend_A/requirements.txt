@@ -19,8 +19,11 @@ numpy>=1.26
 #
 # ⚠️ 但同目录下的另一套 A（vision_a.py）用的**正是** Solutions API，
 #    所以它在本文件锁的 0.10.35 下起不来（0.10.35 是 Tasks-only 构建，
-#    mediapipe.solutions 不存在）。要跑它得单独一个环境装带 solutions 的
-#    旧构建。两套 A 装不进同一个 Python 环境 —— 详见 ../backend_A/README.md。
+#    mediapipe.solutions 不存在）。要跑它得换 0.10.14 —— 实测 0.10.14
+#    **同时带 solutions 和 tasks**，两套 A 可以共用一套环境；但它没有
+#    cp314 wheel（Python 得 ≤3.12），且环境必须建在**纯 ASCII 路径**
+#    （仓库外，Solutions API 会把文件路径交给 C++，中文目录打不开）。
+#    详见 ../backend_A/README.md 的「跑 A-单文件要单独一个环境」一节。
 #
 # ⚠️ 锁死 0.10.35 而不是写 >=1.0。写 >=1.0 时 pip 会解析到 **1.0.1** ——
 #    那是跨大版本的另一套东西，wheel 标签（py3-none-win_amd64）都与已装的

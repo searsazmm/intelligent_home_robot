@@ -33,9 +33,12 @@ opencv-contrib-python==4.13.0.92
 #
 # ⚠️ 0.10.35 是 **Tasks-only 构建**：`mediapipe.solutions` 不存在。
 #    backend_A 里另一套 A（vision_a.py）用的是旧的 Solutions API
-#    （mp.solutions.face_mesh），**在本版本下起不来**，要单独给它一个
-#    环境装带 solutions 的旧构建（GYZ 当时用的是 0.10.14）。
-#    详见 backend_A/README.md 的「两套 A 装不进同一个 Python 环境」一节。
+#    （mp.solutions.face_mesh），**在本版本下起不来**。
+#    2026-09-29 实测更正：0.10.14 **同时带 solutions 和 tasks**，是两套都满足的
+#    下限（A-包在 0.10.14 下 40 个测试全过），所以两套 A **可以共用一套环境**。
+#    但它**没有 cp314 wheel**，得用 Python ≤3.12；且环境必须建在**纯 ASCII
+#    路径**（仓库外）—— Solutions API 交给 C++ 的是文件路径，中文目录打不开。
+#    详见 backend_A/README.md 的「跑 A-单文件要单独一个环境」一节。
 #    演示路径走的是 Tasks 那套（合成源、不需要摄像头），所以这条不影响演示。
 mediapipe==0.10.35
 
