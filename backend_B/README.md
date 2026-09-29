@@ -22,6 +22,10 @@ python main.py --offline data/sample_vision.csv --stdin
 # 方式三：离线回放 + 模拟前端，看完整链路
 python main.py --offline data/sample_vision.csv --loop --speed 5   # 终端1
 python tools/mock_c_client.py --auto                              # 终端2
+
+# 方式四：全语音（装没装语音库都能跑，见 §4.8）
+python main.py                                    # 默认就带语音
+python main.py --list-audio                       # 先看有哪些声卡
 ```
 
 首次使用如果 `data/sample_vision.csv` 不存在，先执行：
@@ -30,7 +34,17 @@ python tools/mock_c_client.py --auto                              # 终端2
 python tools/make_sample_vision.py
 ```
 
-跑单元测试（48 个用例，标准库 unittest，无需安装任何东西）：
+### 一条命令自检链路
+
+```bash
+bash tools/e2e_offline_check.sh    # 五步：状态判定 / 主动关怀 / 8002 收报文 / 对话回环 / 无异常
+bash tools/fault_drill.sh          # 容错演练：杀掉 A 或 B，看另外两个模块自己长回来
+```
+
+两个脚本都不开摄像头、不碰声卡（`--no-voice`），任何机器上都能跑，
+不需要先起模块 A 或 C。**答辩前跑一遍**，比现场才发现问题强。
+
+跑单元测试（340 个用例 + 118 个子用例，标准库 unittest，无需安装任何东西）：
 
 ```bash
 python tests/test_core.py
@@ -49,10 +63,13 @@ python -m pytest tests/ -v
 | ---- | ---- | -------- | -------- | ---- |
 | A → B | 127.0.0.1:8000 | **客户端**（连 A） | JSON，`\n` 分隔 | api_doc §3 |
 | B → C | 127.0.0.1:8001 | 服务端 | 纯文本状态串，`\n` 分隔 | api_doc §4 |
-| C ↔ B | 127.0.0.1:8002 | 服务端 | JSON，`\n` 分隔 | api_doc §5（V1.1 新增） |
+| C ↔ B | 127.0.0.1:8002 | 服务端 | JSON，`\n` 分隔 | api_doc §5（V1.1 新增对话、V1.2 新增 proactive） |
 
-8002 是本次新增的：api_doc V1.0 只定义了 B→C 的单向状态，没有"用户说的话怎么进 B"
+8002 是新增的：api_doc V1.0 只定义了 B→C 的单向状态，没有"用户说的话怎么进 B"
 的通道，文本情绪识别拿不到输入。已按流程补进 api_doc §5，**C 端同学需要对齐这一节**。
+
+V1.2 在 8002 上又加了一种报文 `proactive`（B 主动开口）。它**不改**任何已有字段，
+只是多了一个 `type`，旧客户端收到不认识就忽略 —— 见 api_doc §5.5 与本文 §4.7。
 
 所有端口都能用命令行参数或环境变量改，联调时不用改代码：
 
@@ -70,27 +87,54 @@ backend_B/
 ├── main.py                    入口：装配组件、管线程、处理退出
 ├── config.py                  全部常量：端口、阈值、路径（改参数只看这个文件）
 ├── requirements.txt           依赖清单（运行期零依赖）
+├── requirements-voice.txt     语音可选依赖（不装也能跑，见 §4.8）
 ├── core/
 │   ├── protocol.py            \n 分帧 + JSON 编解码（防粘包/半包/中文截断）
 │   ├── vision_client.py       连模块 A，带指数退避断线重连；另含离线 CSV 回放
 │   ├── vision_state.py        视觉特征 → normal/sad/tired/absent（防抖 + 迟滞）
 │   ├── text_emotion.py        文本情绪识别（情感词典 + 否定/程度副词规则）
-│   ├── dialogue.py            对话管理：视觉 × 文本 × 意图 → 回复
+│   ├── dialogue.py            对话管理：视觉 × 文本 × 意图 → 回复（大模型 + 模板兜底）
+│   ├── llm.py                 大模型客户端（DeepSeek）+ 输出清洗 + 降级链，见 §4.9
+│   ├── proactive.py           主动关怀策略（纯函数 + 可注入时钟，见 §4.7）
 │   ├── history_store.py       CSV 历史记录读写
-│   └── ui_channel.py          对 C 的两个服务（8001 状态推送 / 8002 双向对话）
+│   ├── ui_channel.py          对 C 的两个服务（8001 状态推送 / 8002 双向对话）
+│   └── voice/                 语音（听与说），第三方库全部惰性 import
+│       ├── base.py            接口协议 + Null 实现 + 可用性探测
+│       ├── vad.py             端点检测（bytes 上的纯函数，不碰设备不放依赖）
+│       ├── audio.py           sounddevice 封装：按名字选设备、原生采样率、重采样
+│       ├── stt.py             识别引擎注册表（vosk / speech_recognition / dashscope）
+│       ├── tts.py             合成引擎注册表（豆包 / edge-tts / SAPI 常驻 PowerShell）
+│       ├── speech_cache.py    预合成缓存：固定回复提前合成好，消掉开口前的等待
+│       └── loop.py            听 → 识别 → handle_chat → 朗读
 ├── data/
 │   ├── sample_vision.csv      离线调试用的视觉数据（由 tools 脚本生成）
 │   ├── face_data.csv          简版视觉数据（timestamp,emotion,fatigue 三列）
+│   ├── tts_cache/             预合成语音缓存（自动生成、自动失效，见 §4.8）
 │   ├── sample_chat.csv        模拟 C 的自动对话脚本
 │   └── history.csv            历史对话记录（运行时生成，不进版本库）
 ├── tools/
 │   ├── make_sample_vision.py  生成样例视觉 CSV
 │   ├── mock_a_server.py       模拟模块 A（TCP 服务端），含断线演练开关
-│   └── mock_c_client.py       模拟模块 C（命令行），连 B 的两个端口
+│   ├── mock_c_client.py       模拟模块 C（命令行），连 B 的两个端口
+│   ├── watch_8002.py          被动监听 8002，看 B 到底发了什么（排错第一步）
+│   ├── e2e_offline_check.sh   离线端到端自检（不开摄像头、不碰声卡）
+│   └── fault_drill.sh         容错演练：杀 A / 杀 B，看链路自己恢复
 └── tests/
-    ├── test_core.py           48 个单元测试
+    ├── test_core.py           协议、状态判定、情绪、对话、历史
+    ├── test_llm.py            大模型：鉴权头、响应解析、输出清洗、
+    │                          降级链、上下文组装（全程不碰网络）
+    ├── test_proactive.py      主动关怀：触发条件、静默时段、倍速缩放
+    ├── test_voice_vad.py      端点检测（合成 PCM，不依赖 numpy）
+    ├── test_voice_audio.py    采样率选择与重采样
+    ├── test_voice_engines.py  STT/TTS 引擎注册表、SAPI 脚本构造、
+    │                          豆包请求构造与回退链、预合成缓存、试合成探测
+    ├── test_no_third_party_imports.py  零依赖守卫（AST 扫描顶层 import）
     └── replay_script.py       CSV 回放脚本：假装自己是模块 A，把 face_data.csv 发给 B
 ```
+
+> `tools/` 与 `tests/` 里的脚本**自己也会读中文字面量**。它们都会把 stdout
+> 切到 UTF-8 —— 因为输出重定向到文件时 Python 用系统 ANSI 码页（本机 GBK），
+> 会让 grep 中文的脚本永远匹配不上。详见 §6 排查里那一条。
 
 ---
 
@@ -155,6 +199,16 @@ api_doc §3.3.2 明确写了"A 仅负责采集，不做最终状态判定"，所
 输出三分类 `label`（negative/neutral/positive）、细粒度 `emotion`
 （tired/sad/angry/anxious/happy/neutral）、连续 `score`、命中的词 `hits`（调试用）。
 
+⚠️ **`crisis` 是一个独立字段，不是"分数很低"的另一种说法。**
+别的极端消极句也能凑到 -5 分，但只有求救信号走危机处理分支。做成显式字段
+（而不是让下游拿 `score <= -5` 去猜）是因为「我不想活了」不匹配任何意图关键词，
+意图会落到 `venting` —— 正是要交给大模型的那一类。接了 DeepSeek 之后，
+**一个布尔值就是"这句话会不会被发给第三方"的开关**，不能靠猜。
+
+匹配是对 `_normalize()` **之后**的文本做的（小写、去空白、全角转半角），
+所以「我 不 想 活 了」这类插空格的写法照样命中。下游**不要**拿原文自己
+再匹配一遍 `CRISIS_PATTERNS` —— 那会漏掉这一层归一化。
+
 要扩充词表，直接改 `EMOTION_LEXICON` 即可，逻辑不用动。
 注意词典是**子串匹配**的：`"心情不好"` 匹配不到 `"心情不太好"`，
 插入式的常用变体必须单独列一条。
@@ -172,15 +226,55 @@ api_doc §3.3.2 明确写了"A 仅负责采集，不做最终状态判定"，所
    | tired | 中性 | **tired** | 视觉更"硬"，用户说"我没事"也不改 |
    | absent | 用户刚发过消息 | **normal** | 人在打字，说明人在，推翻视觉误判 |
 
-3. **挑回复模板** — 按 `(状态, 意图)` 精确匹配 → 意图专属 → 状态兜底 → 通用兜底，
-   并避开最近说过的句子，不让回复显得机械
+3. **生成回复文本** — 配了 DeepSeek 就走大模型，没配就走规则模板（见下）
 4. **返回结果** — 由 `main.py` 写入历史 CSV
+
+#### 两层：大模型 + 规则兜底
+
+原型阶段原本是**纯规则模板**，问题很直接：全部家当只有 8 个意图、十几组
+`REPLY_TEMPLATES`，兜底只剩三句 `DEFAULT_REPLIES`。任何不含预设关键词的话
+（「我年轻的时候在东北待过」）都掉进那三句里 —— 用户的原话是
+**「回答太过生硬，硬板，没有应对其他话语的能力」**。
+
+现在接上 DeepSeek 负责接住没预设过的话，规则模板**永远是兜底**：
+
+| 层 | 负责 | 什么时候生效 |
+| -- | ---- | ------------ |
+| 大模型 (`core/llm.py`) | **只产出回复文本** | 意图是 `chat`/`venting`/`question`，且不含危机/不适信号 |
+| 规则模板 (`dialogue.py`) | 其余一切 | 其余所有情况，或大模型超时/失败/降级 |
+
+三条硬边界，改代码前必须先读：
+
+1. **`state` / `intent` / `emotion_*` / `discomfort` 全部保持规则判定，一行不动。**
+   它们驱动 8001 状态机、CSV 的列、以及前端 C 的灯 —— 让模型碰这些，
+   等于让灯和记录跟着模型跑。大模型只借"回复文本"这一件事。
+2. **默认拒绝的白名单** `LLM_ELIGIBLE_INTENTS = {"chat", "venting", "question"}`。
+   这是**允许表不是拒绝表**：新加意图时忘了更新，后果是"少用一次大模型"
+   （照常回复，只是用了模板）；写成拒绝表忘了更新，后果是"一个本该确定性
+   的回答被模型自由发挥"。被排除的以及为什么：
+   - `identity`/`time` —— `test_core.py` 断言身份回答必须 `in INTENT_FALLBACK["identity"]`，
+     那条测试**就是**规格；`time` 更糟：模型没有时钟，只会瞎编。
+   - `discomfort` —— 全仓唯一会说"要不要我帮您叫家里人"的地方，不能交给模型。
+   - `greeting`/`farewell`/`thanks`/`praise` —— 延迟敏感回合（「你好」是用户说的
+     第一句话，让它等 5 秒正是预合成缓存要消灭的那个失败模式），且这几组
+     模板是全仓最强的（`(tired, greeting)`、`(sad, greeting)` 都手工调过）。
+3. **危机信号是独立信号，不是"分数很低"。** `TextEmotion.crisis`（见 §4.3）
+   一票否决：走 `CRISIS_REPLIES` 确定性文案，**绝不把这句话发给第三方**。
+   在接大模型之前这是个真实的安全缺口 —— `CRISIS_PATTERNS` 只把分数拉到
+   -5.0，没有任何下游分支特判它，而「我不想活了」不匹配任何关键词，
+   意图会落到 `venting`，正是要交给大模型的那一类。
+
+大模型的输出要过 `llm.sanitize_reply()`：剥 Markdown/emoji/动作描写/网址、
+拒医疗建议与「我是真人」式的冒充、超长截断，**洗不干净就返回 `None`
+落回模板** —— 模板永远是手写的、领域内的一句话。
+`reason` 里新增的 `来源=llm` / `来源=template` 是肉眼验证这套机制的主要手段，
+也是 `main.py` 日志里那一行。
 
 回复模板都在 `dialogue.py` 底部的 `REPLY_TEMPLATES` 里，改文案不用碰逻辑。
 写模板的原则：一句话不超过 40 字、先说共情再给建议、不用命令句。
 
-> 这里刻意**不接大模型**：原型阶段要的是可预测、可调试、零依赖。
-> 每条回复为什么被选中，看日志里的 `意图/状态/情绪` 就能指着代码说清楚。
+> **主动开口（§4.7）100% 保持模板，不交给大模型。** 它是摄像头触发、
+> 逐句审过、跨重启去重的，不该因为模型换了措辞而改变。
 
 ### 4.5 CSV 历史记录
 
@@ -230,6 +324,408 @@ tired 只会从 `emo_feature` 和 EAR 进来。要连那两条一起测，用 `s
 
 固定每行间隔 0.05 秒（20fps），**不**按 CSV 里 timestamp 的差值走。
 
+### 4.7 主动关怀（`core/proactive.py`）
+
+任务要求 3 的后半句：「检测用户呆滞/情绪低落时，主动发起关心安慰对话；日常主动问候」。
+这是 B 从"应答器"变成"陪伴者"的地方。
+
+两种触发：
+
+| 触发 | 条件 | 说什么 |
+| ---- | ---- | ------ |
+| 关心 | `sad` / `tired` **连续**持续 ≥ 20 秒 | 按状态挑安慰话（`care_sad` / `care_tired`） |
+| 问候 | 离开（`absent`）≥ 60 秒后**又回来** | 「您回来啦」类（`greeting_back`） |
+
+#### 一个会静默毁掉主动关怀的坑（重点）
+
+**主动关怀绝不走 `respond()` / `handle_chat()`。** 看起来走那条路最省事
+（复用意图识别、模板、历史），但它会做三件坏事：
+
+1. 设 `_last_user_text_at` → 「用户刚说过话」变真 → `fuse_state` 把 `absent`
+   改写成 `normal`。等于**把机器人自己的安慰话当成了用户在场的证据**。
+2. 往历史 CSV 写一行 `role=user`，内容却是机器人的话。
+3. 刷新 30 秒状态覆盖。主动关怀只要比 30 秒更频繁，视觉状态就被永久钉住。
+
+所以 `_fire_proactive()` 走的是另一条路：只经 `CsvHistoryStore` 写**一行**
+`role=robot`（`TurnRecord`），**不设状态覆盖** —— 机器人的话不构成关于用户的证据。
+`DialogueEngine.respond()` 为此多了个 `from_user: bool = True` 关键字参数，
+只有真实用户输入才更新 `_last_user_text_at`（默认值保证现有调用方行为不变）。
+
+#### 防骚扰（比"多说几句"重要得多）
+
+抢话头是最糟的失败模式 —— 用户正要往下说的时候被机器人打断。四条闸门：
+
+| 参数 | 默认 | 作用 |
+| ---- | ---- | ---- |
+| `PROACTIVE_MIN_INTERVAL` | 90s | 两次主动开口的最小间隔 |
+| `PROACTIVE_MAX_PER_HOUR` | 4 | 滑动一小时上限 |
+| `PROACTIVE_USER_COOLDOWN` | 60s | **任何**用户输入（麦克风 / 8002 / `--stdin`）之后闭嘴这么久 |
+| `PROACTIVE_STARTUP_GRACE` | 15s | 刚开机别热情打招呼（启动初期状态本来就在抖） |
+
+外加：STT 采集中、TTS 播报中都不触发。
+
+#### 静默时段是安全属性，不是体验偏好
+
+`PROACTIVE_QUIET_START/END`（默认 22:00–07:00）**只静默"主动开口"，绝不静默"应答"** ——
+凌晨两点的「我不舒服」必须回答。改这段代码前请先想清楚这一点。
+
+#### 报文
+
+`{"type": "proactive", "text": ..., "state": ..., "reason": ..., "kind": ...}`
+在 8002 上广播给 C，定义见 api_doc §5.5。C 收到就用它记日志（表情仍由状态驱动）。
+
+#### 怎么看它到底触发了没有
+
+⛔ **不要用 `mock_c_client.py` 验主动关怀**：它每发一句话都会刷新上面那个
+60 秒 `user_cooldown`，**主动关怀在此期间按设计不会触发** —— 用它验必然失败，
+而且看起来像功能坏了。
+
+用**一句话都不发**的被动监听：
+
+```bash
+python tools/watch_8002.py --seconds 90
+```
+
+#### 倍速回放下的阈值缩放（`--demo`）
+
+实测 `data/sample_vision.csv` 全长 119.9 数据秒，其中 tired 段 31.9 秒、sad 段 20.0 秒。
+`--speed 5` 时整份只播 24 墙钟秒，sad 段只剩 4 秒 —— 按墙钟算的 20 秒阈值
+**永远不会触发**，看起来就像没实现。
+
+处理：`--speed N` 时把 sustain / min_interval / greeting_absent 按 N 缩放
+（`main.py` 的 `_scale_for_speed`，策略本身只认墙钟，保持干净）。
+**但 `startup_grace` 和 `user_cooldown` 不缩放** —— 那是操作者的真实行为，
+和数据跑多快无关。演示再加 `--demo` 换成一组更宽松的阈值。
+
+想确认缩放真的生效，看 `reason` 字段：
+
+```
+reason: 「tired」已持续 2 秒（阈值 2 秒）      ← 10（demo sustain）÷ 5（speed）= 2
+```
+
+### 4.8 语音：听与说（`core/voice/`）
+
+「全程语音对话，不用打字」这条需求的实现。**运行期零依赖这条硬约束在这里最容易被破坏**，
+所以：所有第三方 import 都写在**函数体内部**惰性执行，可用性探测用
+`importlib.util.find_spec`（不执行模块 —— 只为探测就初始化 PortAudio 是浪费）。
+缺库时记一行清晰指引并降级到键盘 / 8002 文本通道，**绝不让 B 启动失败**。
+
+这条约束有测试守着：`tests/test_no_third_party_imports.py` 用 AST 扫描
+backend_B 全部运行期代码的顶层 import，`test_voice_engines.py` 另在干净子进程里
+import 语音层、检查 `sys.modules` 有没有混进第三方库。
+
+#### 识别（STT）
+
+引擎注册表 + 适配器，`--stt auto` 按 `vosk → speechrecognition → dashscope` 挑第一个**可用**的。
+
+> ⚠️ 「可用」= **装了 且 配好了**，两个条件都要。
+> 早先只看 `find_spec`，于是本机这种「dashscope 装了但没设 `DASHSCOPE_API_KEY`」
+> 会被算成可用并被 `auto` 选中；而 dashscope 的 `transcribe` 吞掉异常返回空串 ——
+> 现场表现是**对着麦克风说话，机器人毫无反应**，且没有一句报错指向真正原因。
+> 现在这种引擎会被跳过，并明确打印「已跳过：dashscope 已安装，但没有 DASHSCOPE_API_KEY」。
+> 宁可明确地"没有语音输入"，也不要一个每次静默失败的识别器。
+
+| 引擎 | 额外要求 | 说明 |
+| ---- | -------- | ---- |
+| vosk | **要下中文模型**（约 40MB），放进 `%LOCALAPPDATA%\vosk\` 或 `backend_B/models/`（⚠️ **本机只有前者可行**，见下一节） | 离线、免费、中文好。**本机已装并实测可用** |
+| speechrecognition | 无 | 默认走 sphinx（离线但中文差），可设 `B_STT_SR_ENGINE=google` |
+| dashscope | 要 `DASHSCOPE_API_KEY` + 联网 | 效果最好，但**答辩断网就废** |
+
+显式指定（`--stt dashscope`）时会跳过 readiness 检查 —— 用户明确要它，就给它试的机会，
+启动期替他回退反而更难查。
+
+#### ⚠️ 模型路径不能含中文（本仓库踩得到）
+
+vosk 的 C++ 层在 Windows 上**打不开非 ASCII 路径**下的模型文件。实测：
+
+| 模型所在路径 | 结果 |
+| ------------ | ---- |
+| `C:\Users\...\AppData\Local\vosk\vosk-model-small-cn-0.22` | ✅ 加载成功 |
+| `D:\Virtually C\成都东软学院下期\...\backend_B\models\vosk-model-small-cn-0.22` | ❌ `Failed to create a model` |
+
+而失败时 vosk 报的是 **`Folder '...' does not contain model files`** ——
+**文件明明都在**。这条报错是误导性的，会让人反复检查"是不是没解压全"，
+真正的原因却是路径编码。
+
+本仓库的路径恰好是 `D:\Virtually C\成都东软学院下期\...`，所以
+`backend_B/models/` 这条路**在这台机器上永远不可能成功**。
+代码的做法（`core/voice/stt.py` 的 `find_model_dir`）：
+
+- 搜索顺序 `B_STT_MODEL` → `backend_B/models/` → `%LOCALAPPDATA%\vosk`
+- **含中文的候选直接跳过**，并打一条说清原因、给出下一步的 warning
+- 显式指定 `B_STT_MODEL` 时不替用户否决（与 readiness 的取舍一致），
+  但如果路径含中文会先提醒一句
+
+所以模型放在 `%LOCALAPPDATA%\vosk\` 是最省事的。
+
+#### 合成（TTS）
+
+| 引擎 | 额外要求 | 说明 |
+| ---- | -------- | ---- |
+| doubao | `B_DOUBAO_TOKEN` + `B_DOUBAO_VOICE` + `soundfile` | **音色最自然**，需要联网（见下）；走语音合成大模型 2.0（SeedTTS 2.0），鉴权只要一个 API Key |
+| edge_tts | `edge-tts` + `soundfile` | 音色比 SAPI 自然，需要联网 |
+| sapi | **无**。Windows 自带 | 离线、零安装、答辩不怕断网 |
+
+`--tts auto`（默认）按上面的**从上到下**顺序挑第一个**真的能用**的，
+所以「默认用最好的音色」和「断网 / 没配好也不会变哑巴」同时成立。
+
+> ⚠️ **`available` 不等于"能出声"。** 库里装好了、凭证也填了，
+> 但网络不通的话，每句话都会在合成时才失败 —— 机器人彻底哑掉，
+> 而候选链后面那个离线可用的 SAPI 永远轮不到。
+> 所以联网引擎在入选之前要**真的试合成一句话**（`probe_synthesizer`）。
+> 本机的现场正是这样：到 `speech.platform.bing.com` 的 TCP 连接**成功**，
+> 但紧接着的 TLS 被重置（`ClientConnectorError ... 指定的网络名不再可用`）——
+> 只探端口会得出"网络正常"的错误结论，所以探测走的是完整合成。
+> 代价是启动时多一次往返（失败时约 2 秒），日志里会写
+> 「正在试合成一句话，确认 'edge_tts' 真的能用…」。
+
+##### 豆包（火山引擎）凭证怎么配
+
+```bash
+set B_DOUBAO_TOKEN=<控制台「语音技术 → API Key 管理」里的 API Key>
+set B_DOUBAO_VOICE=zh_female_vv_uranus_bigtts   # 可选，默认就是 Vivi 2.0 陪聊音
+set B_DOUBAO_RESOURCE_ID=seed-tts-2.0           # 可选，默认就是这个
+python main.py --tts doubao                     # 或干脆不写，auto 会优先选它
+```
+
+- **API Key 和音色都必须有**，少一个就判为不可用并**在日志里点名缺的是哪个**，
+  然后自动回退到下一个引擎 —— 「凭证没填」不该表现为「机器人突然不说话了」。
+- ⚠️ **v3 里没有 appid，`B_DOUBAO_APPID` 已不再读取。**
+  这一条是踩过坑才定下来的：旧接口（v1，`/api/v1/tts`）那套
+  「appid + access_token + cluster + `Authorization: Bearer;<token>`」
+  在本项目的凭证下**永远**返回
+
+  ```
+  401 load grant: requested grant not found in SaaS storage
+  ```
+
+  ——换集群、换音色、换 appid 形态（字符串/数字）、**甚至喂故意的垃圾凭证**，
+  服务端回的都是同一句话。同一个报错能匹配上任意输入，就说明它压根没走到
+  核对凭证那一步：这套凭证模型本身就不对。换成 v3 的「API Key + ResourceId」
+  之后第一次请求就有音频了。
+- 现在的接口是 `POST https://openspeech.bytedance.com/api/v3/tts/unidirectional`，
+  请求头是三个（**没有 `Authorization`**）：
+
+  | 头 | 值 |
+  | -- | -- |
+  | `X-Api-Key` | 控制台的 API Key（就是 `B_DOUBAO_TOKEN`） |
+  | `X-Api-Resource-Id` | `seed-tts-2.0` —— 要调哪个**模型版本**，是常量，不是账号里的值 |
+  | `X-Api-Request-Id` | 每次请求唯一的 uuid，接口要求必填 |
+
+  把 v1 的 `Authorization: Bearer;<token>` 混进来，v3 会回
+  `no token or access_key was found from the header or query` ——
+  一个和真实原因（头放错了）毫无关系的报错。这几条都有专门的测试钉着。
+- 响应是 **JSON 行流**：音频块 `{"code":0,"data":"<base64>"}` 一行一块，
+  结束码 `{"code":20000000,"message":"OK"}`。**出错时也走 HTTP 200**，
+  错误只在 `message` 里 —— 所以判据必须在流里面，只看状态码会把
+  「鉴权失败」当成「合成成功但没有声音」。
+- `B_DOUBAO_VOICE` 必须与 `B_DOUBAO_RESOURCE_ID` 指定的模型版本**配套**，
+  且控制台里**已开通**。1.0 和 2.0 的音色**不能混用**：默认的
+  `zh_female_vv_uranus_bigtts` 是 2.0 音色，所以 ResourceId 必须是
+  `seed-tts-2.0`。填错了服务端原话会被带进日志
+  （`豆包合成失败：code=45000010 message=invalid speaker`），不会只剩一个数字。
+- 走**标准库 `urllib`**，不引 `requests`：B 的运行期零第三方依赖是被测试守着的，
+  能用标准库解决就不为它破例。所以**不需要新增任何依赖**（`soundfile` 本来就在）。
+
+##### 运行期兜底：这一句失败了，下一句还有机会
+
+`--tts auto` 只在**启动时**挑一次引擎。挑中豆包之后，运行中途网络抖一下，
+那一句就彻底没声音了 —— 用户看到的是"机器人突然不吭声"，
+而本地明明有个完全离线的 SAPI 闲着，只是没人叫它。
+
+所以联网引擎外面会再套一层 `FallbackSynthesizer`
+（`--tts auto` / `--tts doubao` 都套，`--tts sapi` 不套 —— 它本来就在本地）：
+
+- 主引擎这一句失败 → **逐句**改用本地 SAPI 把它发出来，日志留一条 WARNING。
+- ⚠️ 兜底产出的那句**不写入预合成缓存**。缓存键记的是主引擎的
+  `name|voice|speed`，把 SAPI 的机械音存进"豆包"的键下，等网络恢复后
+  这句话就永远是错的音色了 —— 而且是**永久**的，因为缓存命中不会再走合成。
+  宁可下次重合成，也不要缓存一个错音色。
+- 备用引擎用**工厂**而不是实例：`SapiSynthesizer.__init__` 会真的拉起一个
+  PowerShell 进程，提前建一个就等于每次启动都白起一个进程、还拖慢启动。
+  所以工厂只在**第一次真失败**时调用一次，之后复用。
+
+> 为什么不靠启动时那次探测就够了：本机实测的网络故障是「TCP 连得上、
+> TLS 被重置」，它是**间歇性**的 —— 探测通过只说明那一刻能通。
+
+##### 预合成缓存：把"先沉默三秒再开口"抹掉
+
+联网引擎合成一句话要等一次网络往返（本机实测 4.6 秒的话要 **3.3 秒**，
+SAPI 只要 37ms）。这个沉默在聊天里很致命 —— 体感像卡住了而不是在思考。
+
+而机器人要说的话里很大一部分是**固定的**（问候、主动关怀、各种兜底句），
+启动时就知道了。于是 `core/voice/speech_cache.py` 把它们提前合成成 WAV 存进
+`data/tts_cache/`，播放时直接读文件，**延迟归零**。
+
+- 启动时起一个 **daemon 线程**后台预热，**绝不阻塞启动**；日志里逐条记
+  「新合成 / 复用缓存 / 失败」，最后给一行汇总。
+- 只预合成**不带 `{topic}` 占位符**的固定回复（`dialogue.static_replies()`，72 条）——
+  带占位符的句子要拼进用户刚说的话，无法预测。
+  （72 条里包含危机 / 身体不适那两组：老人说"我不舒服"和说"我不想活了"，
+  都不该让机器先沉默三秒。它们原本是内联在 `_candidates` 里的字面量，
+  于是**从来没被预合成过**，表现就是"说不舒服时机器先沉默三四秒"。）
+- **只有 `static_replies()` 里的句子会被写进缓存**（`Speaker(cache_allow=...)`）。
+  缓存只有会被反复说起的固定句才划算 —— `SpeechCache.prune()` 的保留集
+  正是 `static_replies()`，存别的文本只是等着被 prune 删掉。接上大模型之后
+  每条回复都是模型现编的、**必然唯一**，缓存它们会让缓存目录一直涨而
+  命中率始终是 0。（`{topic}` 填充出来的动态模板句同理。）
+- 缓存键 = `引擎|音色|语速|文本` 的哈希。**换了音色/语速旧缓存自动失效**，
+  不需要手动清目录（旧的由 `prune` 顺手删掉）。
+- 只对**联网引擎**开缓存：SAPI 只要 37ms，缓存它只是白写磁盘。
+  所以 `--tts sapi` 时不会预热、也不会有缓存文件。
+- 缓存目录建不出来（权限、磁盘满）时**整个缓存降级为"永不命中"**，
+  而不是让播报失败 —— 缓存是优化，不该成为故障点。
+- 写入是**原子**的（先写临时文件再 `os.replace`）：预热在后台线程、
+  播报在另一个线程，非原子写会让播放线程正好打开一个只写了一半的 WAV。
+
+SAPI 适配器的几个要点（每条都对应一个真实的坑）：
+
+- 走**常驻** PowerShell 子进程。每次新起一个要 ~600ms 死寂（`Add-Type` 的开销），
+  常驻之后每句话 ~20ms。
+- 用 `-EncodedCommand` 传 UTF-16LE base64 的脚本，argv 保持纯 ASCII ——
+  否则中文的引号 / `$` / 反引号在命令行上会被转义搞乱。
+- 待朗读文本走 **stdin**，不落在命令行上（同理，也避免出现在进程列表里）。
+- `creationflags=CREATE_NO_WINDOW`。`-WindowStyle Hidden` **挡不住**控制台闪窗。
+- 强制输出 16000Hz / 16bit / 单声道：默认可能是 22.05k 或 `WAVE_FORMAT_EXTENSIBLE`，
+  而标准库 `wave` 可能拒收。
+- 用同步的 `SpeechSynthesizer.Speak()`。COM 的 `SAPI.SpVoice.Speak()` 可能异步提前返回，
+  导致 WAV 被截断。
+- 音色**不硬编码**名字，枚举 `GetInstalledVoices()` 取第一个 `Culture.Name` 以 `zh`
+  开头的（换台机器硬编码就会抛异常）。
+
+#### 设备与采样率
+
+- 设备一律按**名字子串**解析，**绝不按索引** —— 索引会随虚拟设备增减漂移。
+  ```bash
+  python main.py --list-audio        # 先看列表
+  python main.py --audio-out Realtek # 再显式指定
+  ```
+- **Windows 上 PortAudio 不做重采样**，声卡只接受自己的原生采样率。本机实测：
+
+  | 设备 | mono @16000 | @44100 | @48000 |
+  | ---- | ----------- | ------ | ------ |
+  | Realtek 8 声道 | OK | OK | OK |
+  | Realtek 2 声道 | **失败** | **失败** | OK |
+
+  所以 SAPI 合成的 16kHz WAV 往真正的音箱上播会直接抛 `Invalid sample rate`。
+  不能靠"随便挑个能开的设备"，必须自己把采样率对上（`audio.resample_pcm`）。
+  那个 8 声道的"能播"只是因为它内部替我们重采样了 —— 声音去了哪几个声道没人知道。
+
+#### 回声：用半双工而不是回声消除
+
+同一台机器的扬声器必然被麦克风收进去，会形成「机器人听见自己 → 识别成用户说话 →
+再回答」的自激回路。AEC 超出本项目范围，所以默认**半双工**：播报期间丢掉麦克风数据。
+再加一层保险：识别文本与上一次机器人回复**高度相似**（`difflib` 相似度 ≥ 0.6）就丢弃。
+
+戴耳机时可以用 `--barge-in` 关掉半双工实现插话。
+
+#### 诚实说明：音频通路验证到什么程度
+
+- **已验证（实测）**：`--list-audio` 能列出 29 个设备；WAV 能合成出来且时长非零；
+  重采样后的 PCM 能正确送入设备并**流式播完**（无异常、无截断）。
+- **已验证（实测）**：**用耳朵听过，确实出声**。曾经"播放成功但听不见"的真因是
+  Realtek 渲染端点的音量停在 **14%**（用 Core Audio 的 `IAudioEndpointVolume`
+  读到并改回 100%）。要注意 PortAudio 的 MME 默认输出是
+  `[4] 扬声器 (Realtek(R) Audio)`，**不是** ToDesk 虚拟声卡 ——
+  这点此前记错过，已更正。
+- **仍未验证**：音色好不好听、音量合不合适，只有人在机器前能判。
+  听感不对时先 `--list-audio` 看设备，再用 `--audio-out` 显式指定。
+- **已验证（本机已装 vosk + 中文模型）**：合成语音 → 16kHz PCM → vosk → 正确中文文本，
+  三句话全部识别正确（模型 `vosk-model-small-cn-0.22`，放在 `%LOCALAPPDATA%\vosk\`）。
+- **未验证**：**真人对着麦克风说话**。上面那次是用 SAPI 合成的语音喂进去的，
+  真人说话的口音、语速、环境噪声都还没试过。要验收这一条，请装好麦克风后
+  跑一次 `python main.py --voice`，对麦克风说一句，
+  看日志里 `语音识别：'...'`（`core/voice/loop.py` 打的 INFO）是否对得上你说的话。
+
+### 4.9 大模型对话怎么配（`core/llm.py`）
+
+不配也能跑 —— 没配就完全走规则模板，和接大模型之前一模一样。
+**没配 Key 不等于"机器人不说话了"**，只是接不住没预设过的话（回复会显得硬板）。
+
+```bash
+# Windows（当前会话；要长期生效用 setx，然后重开终端）
+set B_DEEPSEEK_TOKEN=sk-xxxxxxxx
+python main.py
+```
+
+启动横幅会明确告诉你是哪一种状态，**并带上原因**：
+
+```
+  大模型对话  已启用（deepseek / deepseek-chat）
+  大模型对话  未启用 —— 未配置 B_DEEPSEEK_TOKEN（API Key 在 platform.deepseek.com → API keys 页面）
+  大模型对话  未启用 —— deepseek 试调失败（Key 无效 / 断网 / 端点不通）
+  大模型对话  未启用 —— 已按配置停用（--llm none）
+```
+
+这行是回答「它怎么还是这么硬板」的唯一一眼可见的线索，所以刻意写具体原因，
+而不是一个布尔值。
+
+| 环境变量 | 默认 | 说明 |
+| -------- | ---- | ---- |
+| `B_LLM` | `True` | 总开关（`false` = 完全不走大模型） |
+| `B_LLM_ENGINE` | `auto` | `auto` / `deepseek` / `none`，命令行 `--llm` 覆盖 |
+| `B_DEEPSEEK_TOKEN` | 空 | **API Key**，在 platform.deepseek.com → API keys 拿 |
+| `B_DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | 带不带 `/v1` 都认 |
+| `B_DEEPSEEK_MODEL` | `deepseek-chat` | |
+| `B_LLM_TIMEOUT` | `4.0` | ⚠️ **不是 30 秒**，见下 |
+| `B_LLM_MAX_CHARS` | `50` | 超了就截断，截不出整句就落回模板 |
+| `B_LLM_CONTEXT_TURNS` | `4` | 喂几轮上下文 |
+
+命令行：`--llm {auto,deepseek,none}`、`--no-llm-probe`。
+
+#### 超时为什么是 4 秒而不是 30 秒
+
+`SYNTH_TIMEOUT`（豆包合成）是 **30 秒**：那是启动路径，慢一点也比哑巴强。
+`B_LLM_TIMEOUT` 是 **4 秒**：这是**用户正等着回话**的交互路径，
+宁可早失败落回模板，也不能让老人干等 —— 这一点搞反过一次，
+后果是"Key 无效"变成"启动卡 30 秒"。
+
+#### 启动探针（`--no-llm-probe` 可跳过）
+
+配好了 ≠ 能用。`Key 填错 / 模型名下线 / base URL 不通` 这三种情况在
+`__init__` 里都看不出来，所以启动时**真调一次最小请求**。
+探针也复用 `B_LLM_TIMEOUT`，所以最坏情况是启动多等 4 秒，不会卡 30 秒。
+离线开发或跑测试时用 `--no-llm-probe` 跳过这次网络请求。
+
+#### 延迟：这是目前最大的已知短板，先量再说
+
+预合成缓存（§4.8）只覆盖 `static_replies()` 那 72 条固定句；大模型的回复
+**必然唯一，永远不命中缓存**，每次都要真合成（~3.3 秒）。
+所以沉默时间 = 模型（1.5~3 秒）**+** 合成（3.3 秒以上）≈ **5~8 秒**，
+而纯模板路径是 3.3 秒。**接上大模型之后，"先沉默几秒"这个老毛病在最想
+改善的那类话上反而更严重了。**
+
+已有的缓解：`B_LLM_TIMEOUT = 4.0`、提示词要求「1~2 句、不超过 40 字」
+（主要不是延迟手段，真正的杠杆是 `B_LLM_MAX_TOKENS = 128`，而是**质量和
+TTS 时长**手段）。
+
+还没做的缓解是**应声词**（先出一声「嗯，我想想…」再出正式回复）和
+**流式合成 + 分句播报**。要不要做取决于三个实测数：
+`complete` 的 p50/p95、未命中缓存时 40 字句子的合成耗时、8002 的 `耗时 %dms`。
+若前两个加起来在 1.5 秒以内就不做。
+
+#### 故障表现（都是刻意设计成这样，不是 bug）
+
+- **断网 / Key 失效**：每句话在 `B_LLM_TIMEOUT` 内落回模板，照常出声，
+  日志有失败原因。**第二句不比第一句慢**（没有重试风暴）。
+- **模型返回脏东西**：`sanitize_reply` 挡住 Markdown/emoji/动作描写/网址/
+  医疗建议/冒充人类，洗不干净就落回模板。
+- **模型返回空 / 超时 / 坏 JSON**：`complete` 的契约是
+  **任何失败都返回 `None`、永不抛异常**，调用方拿到 `None` 一律落回模板。
+- **危机语句 / 身体不适 / 问候 / 问身份 / 问时间**：**根本不发给模型**，
+  走确定性文案。见 §4.4 的三条硬边界。
+
+#### 怎么看它到底走了哪条路
+
+`main.py` 每次应答打的那行日志末尾有 `来源=`：
+
+```
+机器人：……  [视觉=sad(…) 文本=negative/sad 意图=venting 来源=llm]
+机器人：身体不舒服可别硬扛着…  [视觉=normal(…) 文本=negative/… 意图=chat 来源=template]
+```
+
+`来源=llm` 是大模型说的，`来源=template` 是规则模板说的。
+
 ---
 
 ## 5. 命令行参数
@@ -249,6 +745,45 @@ python main.py [选项]
   --history PATH       历史记录 CSV 路径
   --no-history         不读写历史记录
   --log-level LEVEL    DEBUG / INFO / WARNING / ERROR（默认 INFO）
+```
+
+主动关怀（§4.7）：
+
+```
+  --proactive / --no-proactive   总开关（默认开）
+  --demo                         演示预设：阈值放宽 + 关静默时段（配合 --speed）
+  --no-quiet-hours               关闭 22:00–07:00 的主动开口静默
+```
+
+语音（§4.8，全部默认值在坏机器上也能启动）：
+
+```
+  --voice / --no-voice           语音总开关（默认开；没库时自动降级）
+  --stt ENGINE                   auto / vosk / speechrecognition / dashscope / none
+  --tts ENGINE                   auto / doubao / edge / sapi / null
+                                 （auto = 豆包 → edge-tts → SAPI，见 §4.8）
+  --tts-voice NAME               音色名；用 --tts doubao 时它是 speaker，
+                                 必须与控制台已开通的音色一致，且要和
+                                 模型版本配套（见 §4.8）
+  --voice-speed FLOAT            语速倍数（默认 0.9，比正常慢一点，给老人听正好）
+  --barge-in                     关掉半双工，允许播报时插话（戴耳机时用）
+  --no-play                      只合成不播放（排查"是合成坏了还是播放坏了"）
+
+  --audio-in NAME                输入设备名子串（留空用系统默认）
+  --audio-out NAME               输出设备名子串（留空用系统默认）
+  --list-audio                   列出所有音频设备后退出（排错第一步，不占端口）
+```
+
+> `--audio-in/--audio-out` 用**名字里的一段**，不要用序号 —— 序号会随
+> 虚拟设备增减漂移（见 §4.8）。
+
+对话大模型（§4.9，不配 `B_DEEPSEEK_TOKEN` 就完全走规则模板）：
+
+```
+  --llm ENGINE                   auto / deepseek / none（默认 auto）
+                                 auto = 有 Key 就用 DeepSeek，没有就只用模板
+  --llm-probe / --no-llm-probe   启动时真调一次确认 Key 有效（默认开）。
+                                 离线开发、跑测试时用 --no-llm-probe 跳过
 ```
 
 ---
@@ -289,16 +824,94 @@ B 会自己退避重连）：
 cd backend_B && python tests/replay_script.py
 ```
 
+### 答辩演示路径（不用摄像头，整套跑通）
+
+没有摄像头、或者模块 A 起不来时，用离线回放当"模块 A"。
+`--demo` 会放宽主动关怀阈值，让它在演示的几十秒内触发：
+
+```bash
+# 终端1：后端 B —— 离线回放 + 演示阈值 + 循环
+cd backend_B && python main.py --offline data/sample_vision.csv --speed 5 --loop --demo
+
+# 终端2：前端 C —— 纯黑窗口 + 白色颜文字（真实界面）
+cd frontend_C && python main.py
+
+# 终端3（可选）：被动监听 8002，确认 B 真的发了 proactive
+cd backend_B && python tools/watch_8002.py --seconds 90
+```
+
+三个终端分别负责：B 的状态判定、C 的表情渲染、proactive 报文的实测。
+**启动顺序 A → B → C**；但 C 不依赖 B（B 没起来它会安静退避重连，界面照常显示
+normal 表情），所以顺序反了也不会坏。
+
+如果连 B 都起不来，前端还有最后的兜底：`cd frontend_C && python main.py --demo`
+（不连任何后端，四态循环）。
+
 ### 排查问题
 
 - **B 一直打印"连接模块 A 失败"** — 模块 A 没启动，或端口不是 8000。
   用 `netstat -ano | findstr :8000` 看到底谁在听。
 - **C 连上了但收不到状态** — B 只在状态**变化**时推送，另外每 15 秒有一次心跳。
   想看实时变化，用 `--log-level DEBUG`。
+  （刚连上的那一刻会补发一条当前状态，不会开局空白 15 秒。）
 - **状态一直是 absent** — 检查 A 发的 `has_face` 是不是一直是 false；
   B 收到的报文会记进日志。
 - **端口被占用** — 用 `--status-port` / `--chat-port` 换端口，
   或 `netstat -ano | findstr :8001` 找到进程 PID 后 `taskkill /F /PID <PID>`。
+- **主动关怀一直不触发** — 最常见的原因是**你自己刚说过话**（60 秒冷却），
+  或者没加 `--demo` 就跑倍速回放（阈值没跟着缩放）。排查顺序见 §4.7 最后一节。
+
+#### ⚠️ 三个"看起来像灵异事件"的坑
+
+**1. 脚本 grep 中文永远匹配不上（编码）**
+
+如果输出**重定向到文件**，Python 用的是系统 ANSI 码页（本机 GBK），而脚本文件
+本身是 UTF-8 —— 于是 `grep "状态="` 一条都匹配不到，脚本报"没收到回复"，
+**而功能其实完全正常**。
+
+`main.py` / `tools/` 下每个脚本的 `main()` 都会把 stdout 切到 UTF-8 来避免这一点。
+自己写新脚本时记得照做：
+
+```python
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+```
+
+**别靠放宽断言来"修"这类失败** —— 那会把真实故障一起放过去。
+
+**2. Windows 上两个 B 能同时绑定同一端口**
+
+Windows 的 `SO_REUSEADDR` 语义与 Linux **不同**：它允许第二个进程绑定同一端口
+（等价于 Linux 的 `SO_REUSEPORT`）。于是第二个 B 不会报错，而是**静默分走一部分连接**。
+
+症状是：新 B 的日志一路写着「对话通道 0 个客户端」，而监听端却收到了状态报文
+（来自那个没有视觉输入的旧 B）；主动关怀照常触发，却一条都没送到监听端。
+看起来像广播坏了，实际上只是连到了另一个进程。
+
+⚠️ 别把这条和另一个**无害**的 0 搞混：C 默认只连 8002，所以正常演示时
+B 的日志就是「状态通道 0 个客户端，**对话通道 1 个**」—— 状态通道那个 0
+是对的（C 根本不在 8001 上），看**对话通道**那个数字。
+
+Linux 上这种情况会直接抛 `Address already in use`，反而更好查。
+所以 `tools/e2e_offline_check.sh` 和 `tools/fault_drill.sh` 开头都有一段端口预检。
+
+**3. 声音"播放成功"但听不见**
+
+两种可能的原因，本机都真出现过：
+
+- **音量在端点级被调低了。** Realtek 渲染端点曾经停在 **14%** ——
+  播放调用完全成功、耗时也正常，就是没声音。查这个要看端点音量
+  （Core Audio 的 `IAudioEndpointVolume`），不是应用音量。
+- **数据进了虚拟声卡。** 本机装着 `ToDesk Virtual Audio`（远程虚拟声卡），
+  误选到它会**播放成功且完全不报错**，但没人能听见。
+
+先用 `--list-audio` 看列表，再用 `--audio-out Realtek` 之类的显式指定。
+同名设备常有多个，代码会优先挑声道数 ≤ 2 的那个（8 声道的是环绕声端点）。
+
+> ⚠️ 更正一条**曾经的错误记录**：PortAudio 的 MME 默认输出是
+> `[4] 扬声器 (Realtek(R) Audio)`，**不是** ToDesk 虚拟声卡
+> （`sd.default.device` 返回 `[1, 4]`）。所以"走默认设备必然听不见"
+> 这个结论是错的 —— 那次听不见是端点音量的问题。
 
 ---
 
@@ -306,15 +919,60 @@ cd backend_B && python tests/replay_script.py
 
 写在明处，避免联调时误判成 bug：
 
-1. **`--speed` 会压缩时间尺度。** 离线回放的倍速是按墙钟 sleep 实现的，
-   所以"持续 N 秒"这类阈值在倍速下也按同样比例压缩（这是想要的效果，
-   能更快看完状态变化）。但**短事件可能被漏掉**：样例数据里"无人"只有 8 秒，
-   在 `--speed 5` 下只剩 1.6 秒，而"人脸丢失宽限 2 秒"是按墙钟算的，
-   就来不及判定。要看完整状态序列请用 `--speed 1`。
-   眨眼频率已经改成按数据里的 timestamp 计算，不受倍速影响。
+1. **`--speed` 会压缩时间尺度，但两组阈值的处理方式不同**，这点容易搞混：
+
+   | 阈值 | 时钟 | 倍速下的表现 |
+   | ---- | ---- | ------------ |
+   | 状态判定：防抖 1.5s、窗口 10s、脸部丢失宽限 2s、EAR 持续 3s | **墙钟**，**不缩放** | 相当于要求更长的数据时间 |
+   | 主动关怀：sustain / 最小间隔 / 问候间隔 | 墙钟，**按 N 缩放** | 同一段剧情里照常触发 |
+
+   为什么不统一：状态判定器就在墙钟上工作（`VisionStateEvaluator` 的防抖与窗口都是），
+   而动它的时钟语义风险太大；主动关怀的阈值是"叙事节奏"，本来就该跟着剧情走，
+   所以在装配时缩放（`main.py` 的 `_scale_for_speed`）。
+   但 `startup_grace` 和 `user_cooldown` **不缩放** —— 那是操作者的真实行为。
+
+   实际影响：**短事件可能被漏掉**。样例数据里"无人"只有 8 秒，`--speed 5` 下
+   只剩 1.6 秒，而"人脸丢失宽限 2 秒"按墙钟算，就来不及判定。
+   想看完整状态序列请用 `--speed 1`；想快点看到主动关怀用 `--speed 5 --demo`。
+   眨眼频率按数据里的 timestamp 计算，不受倍速影响。
 2. **文本情绪是词典法，不是模型。** 反讽、隐喻、"累是累了点但挺开心的"
    这种混合情绪会落在 neutral。对陪伴机器人的原型够用，不要当成通用情感分析。
-3. **对话是规则模板，没有真正的上下文记忆。** 历史 CSV 目前只用于
-   避免回复重复，没有喂进语义理解。
+3. **对话的上下文记忆是"两条路、两种待遇"的。** 两个都要说清楚，别混起来：
+
+   | 路径 | 有上下文吗 | 说明 |
+   | ---- | ---------- | ---- |
+   | 大模型（`chat`/`venting`/`question`） | **有**，最近 4 轮 | `recent_dialogue(session_only=True)` 喂进消息数组，所以「刚才说到哪儿了」接得上 |
+   | 规则模板（其余全部意图） | **没有** | 历史 CSV 只用于避免回复重复，没有喂进任何理解 |
+
+   另外大模型的窗口**只取本次会话**。`data/history.csv` 会跨多次演示累积，
+   不过滤的话新会话第一句话就会把上次排练的尾巴（还包括别人的话）喂给模型。
+   "记住昨天"对陪伴机器人是个真功能，但那需要真正的记忆摘要，
+   不是把 CSV 的尾巴直接塞进提示词 —— 那是另一个独立决策。
 4. **阈值是按样例数据调的**，`config.py` 里的 EAR、低头角度等需要按
    真实摄像头和真实用户重新标定。
+
+5. **语音识别只用合成语音验证过，没有真人说过话。** 本机已装 vosk 0.3.45 +
+   `vosk-model-small-cn-0.22`（放在 `%LOCALAPPDATA%\vosk\`），
+   合成语音 → PCM → 识别这条链路跑通过，三句话都对。
+   但**没有真人对着麦克风说过**，口音/语速/环境噪声都还没试。
+   验收方法：`python main.py --voice`，对麦克风说一句，
+   看日志里的 `语音识别：'...'`（`core/voice/loop.py` 打的 INFO）对不对得上。
+   ⚠️ 模型路径不能含中文，而本仓库路径含中文 —— 详见 §4.8
+   「模型路径不能含中文」那一节，不要往 `backend_B/models/` 里放。
+6. **音频播放已用耳朵验收过（2026-09-28），但音色仍未定。**
+   已验证：确实出声，且"播放成功但听不见"的真因是 Realtek 渲染端点音量停在 14%
+   （不是虚拟声卡 —— 那条旧结论已更正，见 §4.8 的故障排查）。
+   仍未验证：**音色好不好听、音量合不合适**，这只有人在机器前能判。
+   详见 §4.8 最后一节。
+7. **接上大模型之后，开口前的沉默变长了，这是目前最大的已知短板。**
+   走大模型的那一类话延迟 ≈ 模型 1.5~3 秒 + 合成 3.3 秒（必然不命中缓存）
+   ≈ **5~8 秒**，而纯模板路径是 3.3 秒。已做的缓解是 4 秒超时和"短回复"
+   提示词；**应声词和流式合成还没做**，见 §4.9 最后一节。
+   注意这不影响纯模板路径 —— 没配 Key 时行为和接大模型之前完全一样。
+8. **主动关怀的文案是模板，不是大模型生成的。** 这是**刻意的决定**，不是还没做 ——
+   它是摄像头触发、逐句审过、跨重启去重的，不该因为模型换了措辞而改变。
+   文案在 `core/dialogue.py` 的 `PROACTIVE_TEMPLATES` 里，改文案不用碰逻辑。
+   （§4.4 的普通应答则是"大模型 + 模板兜底"，两者不同。）
+9. **SAPI 走的是一个常驻 PowerShell 子进程。** 退出时会 `kill()` 掉它
+   （`main.py` 的 `shutdown()` 里，在 join 之前）。如果 B 被 `taskkill /F` 强杀，
+   子进程可能残留 —— 用任务管理器搜 `powershell` 结束掉即可。
