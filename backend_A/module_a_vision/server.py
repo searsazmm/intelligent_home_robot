@@ -65,7 +65,7 @@ from shared.schema import WindowState
 
 from .aggregate.window import AggregatorConfig, WindowAggregator
 from .capture.base import CaptureConfig, is_feature_source, is_frame_source
-from .privacy.guard import PrivacyViolationError, assert_clean
+from .privacy.guard import PrivacyViolationError, assert_clean, scrub_frame
 from .wire import KIND_FRAME, check_contract, to_focus_payload, to_v1_sample
 
 #: 默认监听地址与端口（《系统总接口文档》§2.2：8000）。
@@ -107,6 +107,11 @@ class VisionServer:
         ``gaze_off_ratio`` 里——所以没有"挂不上"的情况。
         关掉它会让 B 的 VAI 校准**永远做不完且不报错**，只应在排查
         "B 到底有没有被类型化报文影响"时临时关掉。
+    :param stream: 展示流的帧缓存（:class:`~module_a_vision.stream.FrameHub`）。
+        ``None``（默认）表示不开展示流 —— 这时 ``_publish_frame`` 整个是
+        空转，连一次 ``scrub_frame`` 都不会发生。**展示流走 HTTP、只绑
+        回环，与 8000 那条报文链路互不重叠**（见 :mod:`module_a_vision.stream`
+        开头的边界说明）。
     """
 
     def __init__(
@@ -121,6 +126,7 @@ class VisionServer:
         emit_mode: str = EMIT_V1,
         vitals: Any = None,
         focus: bool = True,
+        stream: Any = None,
     ) -> None:
         if emit_mode not in EMIT_MODES:
             raise ValueError(
@@ -136,6 +142,7 @@ class VisionServer:
         self.emit_mode = emit_mode
         self.vitals = vitals
         self.focus = focus
+        self.stream = stream
 
         self.aggregator = aggregator or WindowAggregator()
 
@@ -172,6 +179,13 @@ class VisionServer:
             "v1_contract_blocked": 0,
             #: 被契约闸拦下的**类型化**报文数（rppg / focus）。
             "typed_contract_blocked": 0,
+            #: 已就地清零的帧数（"用完即毁"真的发生的次数）。
+            #: 只在 ``stream`` 开着时增长 —— 没有展示流就没人经手像素，
+            #: 也就没有"用完"这一说。
+            "frames_scrubbed": 0,
+            #: 清不掉的帧数（缓冲只读）。**应当恒为 0**；非零说明某个采集源
+            #: 在拿只读缓冲，那时"用完即毁"是失效的（见 :meth:`_scrub`）。
+            "scrub_skipped": 0,
         }
 
     # ------------------------------------------------------------ 生命周期
@@ -244,17 +258,22 @@ class VisionServer:
 
     def _produce(self) -> None:
         while not self._stop.is_set():
-            frame = self._read_one()
-            if frame is None:
+            step = self._read_one()
+            if step is None:
                 # 源耗尽（视频播完 / 合成剧本走完 / 已达帧上限）。
                 print(f"[A] 采集源已耗尽（共 {self.stats['frames']} 帧）")
                 break
+            frame, pixels = step
 
             self.stats["frames"] += 1
 
             # 摄入**必须**排在投影前面：本帧若恰好完成一次眨眼，
             # 累计计数器是在 add_frame 里自增的。反过来会永远晚一帧。
             self.aggregator.add_frame(frame)
+
+            # 展示流排在**推理之后**：叠加要画 face_bbox，它来自 frame。
+            # 反过来框会比画面晚一帧，头一转就看得出来。
+            self._publish_frame(frame, pixels)
 
             if self.emit_mode == EMIT_V1:
                 self._emit_v1(frame)
@@ -264,10 +283,19 @@ class VisionServer:
                 if self.aggregator.should_close(frame.ts):
                     self._emit(self.aggregator.close_window(frame.ts))
 
-    def _read_one(self):
-        """从任意种类的源读一帧特征。"""
+    def _read_one(self) -> tuple[Any, Any] | None:
+        """从任意种类的源读一帧，返回 ``(特征, 像素)``；``None`` 表示已耗尽。
+
+        ``pixels is None`` 表示这个源根本没有像素（特征源、CSV 回放）——
+        展示流那边于是什么都不做，这是正常情况而不是缺数据。
+
+        ⚠️ **像素的生命周期就是这个返回值。** 刻意不挂
+        ``self._last_pixels``：这个实例是长驻的，一旦挂上去，"A 模块内不留
+        像素"就从一条**事实**降级成一条**纪律**。调用方（``_produce``）
+        拿到之后马上编码，随即 :meth:`_scrub` 当场清零。
+        """
         if is_feature_source(self.source):
-            return self.source.read_features()
+            return self.source.read_features(), None
 
         if is_frame_source(self.source):
             pixels = self.source.read()
@@ -278,11 +306,45 @@ class VisionServer:
                     "给了帧源却没有给人脸后端：请传 backend=MediaPipeFaceBackend(...) "
                     "或 backend=SyntheticFaceBackend(...)。"
                 )
-            return self.backend.process(pixels)
+            # **先 process 再返回** —— 叠加要画 face_bbox，而它来自这一步。
+            return self.backend.process(pixels), pixels
 
         raise RuntimeError(
             "采集源既不是帧源也不是特征源：它既没有 read() 也没有 read_features()。"
         )
+
+    # ------------------------------------------------------------ 展示流
+
+    def _publish_frame(self, frame: Any, pixels: Any) -> None:
+        """把这一帧交给展示流，然后**当场把像素清零**。
+
+        三步的顺序换不得：画叠加 + 编 JPEG（没人看时它一次 cv2 都不调）→
+        ``scrub_frame`` 就地清零 → 参数出栈，这一帧的像素从此没有引用者。
+        "用完即毁"到这一步才第一次真的发生（此前 ``scrub_frame`` 全仓
+        没有任何调用点）。
+        """
+        hub = self.stream
+        if hub is None or pixels is None:
+            return
+        hub.offer(pixels, frame)
+        self._scrub(pixels)
+
+    def _scrub(self, pixels: Any) -> None:
+        """就地清零一帧。**清不掉也绝不能把视觉主循环带走。**
+
+        只读缓冲是清不掉的，而 ``scrub_frame`` 对这种情况**故意**抛
+        ``ValueError``（"以为清零了其实没有"比报错危险得多）。这里接住它，
+        理由是这个循环比"这一帧有没有被清干净"重要得多：像素在这之后已经
+        没有别的引用者，清零只是多加一层保险。**但不装作没发生** ——
+        第一次会打一行，计数也留着。
+        """
+        try:
+            scrub_frame(pixels)
+            self.stats["frames_scrubbed"] += 1
+        except (TypeError, ValueError) as exc:
+            self.stats["scrub_skipped"] += 1
+            if self.stats["scrub_skipped"] == 1:
+                print(f"[A] ⚠ 有帧无法就地清零，已跳过（不影响采集）：{exc}")
 
     def _emit_v1(self, frame: Any) -> None:
         """把一帧投影成 api_doc §3.2 报文并广播。"""
@@ -536,11 +598,13 @@ def build_server(
     emit_mode: str = EMIT_V1,
     vitals: bool = True,
     focus: bool = True,
+    stream: Any = None,
     **kwargs: Any,
 ) -> VisionServer:
     """按种类装配一个服务端。供 ``main.py`` 与 ``tools/`` 使用。
 
-    ``source_kind`` 取 ``synthetic`` / ``video`` / ``csv`` / ``camera``。
+    ``source_kind`` 取 ``synthetic`` / ``synthetic-pixels`` / ``video`` /
+    ``csv`` / ``camera``。
     真实人脸后端只在 ``camera`` 与 ``video`` 下才需要——合成源与 CSV
     直接产出特征，不经过像素。
 
@@ -557,6 +621,8 @@ def build_server(
         每一帧自己的 ``gaze_off_ratio``，不需要额外数据源），所以默认开，
         而且**与 ``vitals`` 无关** —— 想得到"只含帧报文"的干净流，
         两个都要传 ``False``。
+    :param stream: 展示流的帧缓存（:class:`~module_a_vision.stream.FrameHub`），
+        透传给 :class:`VisionServer`。``None`` = 不开展示流。
     """
     cfg = CaptureConfig(real_time=real_time, **kwargs)
 
@@ -572,6 +638,32 @@ def build_server(
             emit_mode=emit_mode,
             vitals=RppgMonitor(SyntheticVitalsSource()) if vitals else None,
             focus=focus,
+            stream=stream,
+        )
+
+    if source_kind == "synthetic-pixels":
+        # **本机没有摄像头时的展示流数据源。** 与 synthetic 的区别只有一条：
+        # 它多给一路玩具像素（见 capture/synthetic.py 的类文档）。
+        #
+        # ⚠️ ``backend=source`` —— 它**自己是自己的人脸后端**。这不是偷懒：
+        # 像素与特征必须来自同一次剧本推进，分两次读会让时间轴走快一倍。
+        # 也因此它**不能**配 MediaPipeFaceBackend（那会去检一张合成脸，
+        # 而这里画的本来就不是人脸），更不能配 SyntheticFaceBackend
+        # （它收到 ndarray 直接报错）。
+        from .capture.synthetic import SyntheticPixelSource
+
+        pixel_source = SyntheticPixelSource(scenario=scenario, cfg=cfg)
+        return VisionServer(
+            source=pixel_source,
+            backend=pixel_source,
+            aggregator=WindowAggregator(AggregatorConfig(elder_id=elder_id, device_id=device_id)),
+            host=host,
+            port=port,
+            emit_mode=emit_mode,
+            # 体征要 RGB，而这条路径**没有** RGB（玩具图是 BGR 三通道但
+            # 与体征无关）。宁可不发，也不发一条从玩具图里"取色"出来的假体征。
+            focus=focus,
+            stream=stream,
         )
 
     if source_kind == "csv":
@@ -588,6 +680,7 @@ def build_server(
             # CSV 回放没有体征（没有 RGB 列也没有像素），**但有视线**：
             # 若 CSV 带 ``gaze_off_ratio`` 列，这一路就是真实的视线数据。
             focus=focus,
+            stream=stream,
         )
 
     # camera 与 video 都要走像素 → 人脸后端。
@@ -609,7 +702,8 @@ def build_server(
         source = VideoFileSource(video, cfg=cfg)
     else:
         raise ValueError(
-            f"未知采集源 {source_kind!r}。可选：synthetic / video / csv / camera"
+            f"未知采集源 {source_kind!r}。可选：synthetic / synthetic-pixels / "
+            "video / csv / camera"
         )
 
     return VisionServer(
@@ -620,6 +714,7 @@ def build_server(
         port=port,
         emit_mode=emit_mode,
         focus=focus,
+        stream=stream,
     )
 
 

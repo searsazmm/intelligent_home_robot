@@ -6,6 +6,7 @@
 :class:`CameraSource`      帧（BGR）     真机实时采集（本机无摄像头，属预期情况）
 :class:`VideoFileSource`   帧（BGR）     回放视频文件，可循环
 :class:`SyntheticSource`   帧 + 特征    **本机主路径**：按剧本产出，确定性、零模型
+:class:`SyntheticPixelSource` 帧 + 特征 同上，但**同源同帧**且自任人脸后端，供展示流
 :class:`CsvReplaySource`   特征          回放 A 自己导出的 CSV，供 B 离线开发
 ====================  ============  ==================================================
 
@@ -40,6 +41,7 @@ from .synthetic import (
     Segment,
     StateSpec,
     SyntheticFeatureSource,
+    SyntheticPixelSource,
     SyntheticSource,
     parse_timeline,
 )
@@ -56,13 +58,14 @@ __all__ = [
     "is_feature_source",
     "is_frame_source",
     "read_any",
-    # 四种源
+    # 各种源
     "CameraSource",
     "NoCameraError",
     "VideoFileSource",
     "CsvReplaySource",
     "SyntheticSource",
     "SyntheticFeatureSource",
+    "SyntheticPixelSource",
     # 合成剧本
     "BUILTIN_SCENARIOS",
     "INF",

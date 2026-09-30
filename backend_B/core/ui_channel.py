@@ -19,6 +19,10 @@
                   的表里冻结了这三个字面量，core/proactive.py 的 CARE_KINDS 与之对应）。
                   别在这里随手写 "care" —— 前端若按 kind 分派文案会静默走到兜底分支。
         C→B  {"type":"ping"}  /  B→C {"type":"pong"}
+        B→C  {"type":"vai","index":72.5,"index_status":"...","status":"有效",...}
+             ↑ 专注度（VAI）**展示**报文。**只供界面显示**，不带 state 字段、
+               不驱动表情、不参与任何判决 —— 它是一条**只读旁路**。
+               判决（静默模式）仍然只在 B 内部，见 core/focus.py。
 
 两个服务都是"多客户端"的：C 端可能反复重启，所以每个连接单开一个线程处理，
 写失败就把该连接剔除，绝不因为一个客户端掉线影响其它客户端。
@@ -292,6 +296,50 @@ class StatusBroadcaster(_BaseTcpServer):
         super()._client_loop(client, addr)
 
 
+#: ``vai`` 展示报文里那句免责声明。**两半都不能少。**
+#:
+#: 「研究趋势（非认知专注）」是 ``core/focus.py`` 里 ``index_status`` 的原文 ——
+#: 那是这套指数自带的安全声明，改写成更顺口的说法就等于替它下了它明确没下的结论。
+#: 「日常参考，非医疗结论」是需求文档 §12.3 对"界面上展示这个数"的硬要求，
+#: 而这次是它**第一次真的落到界面上**（在此之前 VAI 根本不下发 C）。
+VAI_NOTE = "研究趋势（非认知专注）；日常参考，非医疗结论"
+
+
+def build_vai_message(snapshot: object, timestamp: Optional[float] = None) -> dict:
+    """把 :class:`~core.focus.FocusSnapshot` 投影成给 C 看的展示报文。
+
+    **逐字段原样转发，不做任何加工。**
+
+    ⚠️ **刻意不带 ``state`` 字段。** 带了它，迟早会有人把它接到表情上 ——
+    于是「专注度报文」变成第二个状态源，去和 8001/8002 的 state 打架，
+    而那两个是 api_doc 定了的、C 端还按优先级去重。专注度只该是**另一栏数字**。
+
+    ``index`` 允许是 ``None``（校准没锁定 / 有效观察不够 / 门控拦了）：
+    **那不是"0 分"，是没有分数**，前端必须分开显示，不能当低分处理。
+
+    这里用鸭子类型读属性而不是 import ``FocusTracker``：本模块是纯粹的对 C
+    传输层，不该认识专注度那个领域对象；传给它的只要是个"长得像快照"的东西。
+    """
+    index = getattr(snapshot, "index", None)
+    status = getattr(snapshot, "status", None)
+    return {
+        "type": "vai",
+        "index": None if index is None else round(float(index), 1),
+        "index_status": str(getattr(snapshot, "index_status", "") or ""),
+        # FocusStatus 是枚举，取 .value 得到中文；万一是字符串也照发
+        "status": str(getattr(status, "value", status) or ""),
+        "reason": str(getattr(snapshot, "reason", "") or ""),
+        "modalities": list(getattr(snapshot, "available_modalities", ()) or ()),
+        "recent_modalities": list(getattr(snapshot, "recent_modalities", ()) or ()),
+        "modality_config_id": str(getattr(snapshot, "modality_config_id", "") or ""),
+        "valid_seconds": round(float(getattr(snapshot, "valid_seconds", 0.0) or 0.0), 1),
+        "formula_version": str(getattr(snapshot, "formula_version", "") or ""),
+        "weight_version": str(getattr(snapshot, "weight_version", "") or ""),
+        "note": VAI_NOTE,
+        "timestamp": time.time() if timestamp is None else float(timestamp),
+    }
+
+
 class ChatServer(_BaseTcpServer):
     """[新增] 8002 端口：与 C 双向通信，收用户对话文本、回机器人回复。
 
@@ -306,6 +354,7 @@ class ChatServer(_BaseTcpServer):
         self,
         on_chat: Callable[[str], object],
         state_provider: Optional[Callable[[], tuple]] = None,
+        vai_provider: Optional[Callable[[], object]] = None,
         host: str = config.CHAT_HOST,
         port: int = config.CHAT_PORT,
     ) -> None:
@@ -314,6 +363,18 @@ class ChatServer(_BaseTcpServer):
         #: 返回 (state, reason) 的可调用体，由 main.py 注入。
         #: 用回调而不是直接持有 BackendB —— 服务端不该认识应用层。
         self._state_provider = state_provider
+        #: 返回一个「长得像 FocusSnapshot」的对象（或 None）的可调用体。
+        #: 同样是回调，理由同上；未开专注静默时注入 None，于是整条展示
+        #: 通道不存在 —— 与 focus 报文"照收照计数、只是没人消费"的处境一致。
+        self._vai_provider = vai_provider
+        #: 上一次发出去的展示报文签名 ``(status, index, index_status, 模态)``。
+        #: 只有签名变化或心跳到期才真发 —— 0.2 秒一拍、每拍都发的话，
+        #: C 端一秒钟要处理五条一模一样的专注度。
+        self._last_vai_sig: Optional[tuple] = None
+        self._last_vai_at: float = 0.0
+        #: 保护上面两个字段的读-改-写。展示节拍只有一条线程在推，
+        #: 但「新客户端连上补发」发生在**客户端线程**里，两者会并发。
+        self._vai_lock = threading.Lock()
 
     # ------------------------------------------------------------------
 
@@ -351,11 +412,34 @@ class ChatServer(_BaseTcpServer):
             logger.info("已向新客户端 %s:%d 补发当前状态 %s", addr[0], addr[1], state)
         return ok
 
+    def _send_initial_vai(self, client: socket.socket, addr) -> None:
+        """新客户端连上时也补一条专注度展示报文。
+
+        理由与 :meth:`_send_initial_state` 完全相同：这东西**变化才发**，
+        而指数是个秒级平滑的慢变量 —— 不补发的话，新连上的 C 右栏要盯着
+        「专注度：未提供」一直等到指数下一次变动或 5 秒心跳。
+
+        失败**不**掐连接：专注度只是一栏展示，它没发出去不该让整条对话通道
+        断掉（状态那条是语义必需，这条是锦上添花）。
+        """
+        if self._vai_provider is None:
+            return
+        try:
+            snapshot = self._vai_provider()
+        except Exception:
+            logger.exception("取专注度快照失败，跳过补发（连接保留）")
+            return
+        if snapshot is None:
+            return
+        if self._send(client, build_vai_message(snapshot)):
+            logger.info("已向新客户端 %s:%d 补发专注度展示报文", addr[0], addr[1])
+
     def _client_loop(self, client: socket.socket, addr) -> None:
         """覆写：连上先补发当前状态，再进入正常的读循环。"""
         if not self._send_initial_state(client, addr):
             self._remove_client(client)
             return
+        self._send_initial_vai(client, addr)
         super()._client_loop(client, addr)
 
     def _on_line(self, client: socket.socket, line: str) -> None:
@@ -430,6 +514,44 @@ class ChatServer(_BaseTcpServer):
             "kind": kind,
             "timestamp": time.time(),
         }))
+
+    def publish_vai(self, snapshot: object, force: bool = False) -> bool:
+        """推一条专注度展示报文。签名没变且没到心跳时间就不发。返回是否真发了。
+
+        语义与 :meth:`StatusBroadcaster.publish` 对齐（变化 + 心跳），
+        理由也一样：C 端要能分辨「数值没变」与「B 挂了」。
+
+        ⚠️ **本方法以及它的调用者，都不许碰判决。** 它只读 ``snapshot()``
+        这一个只读快照，绝不调 ``should_stay_silent`` / ``focus_is_live`` /
+        ``_focus_liveness``（后者有日志副作用），也不调 ``_publish_state``。
+        四条约束的完整理由见 ``main.BackendB._publish_vai``。
+        """
+        if snapshot is None:
+            return False
+
+        message = build_vai_message(snapshot)
+        # 签名里带模态：模态一变，同一个分值不再等价（权重重归一化了），
+        # 只比分数会让 C 端停留在上一组证据的解读上。
+        signature = (
+            message["status"],
+            message["index"],
+            message["index_status"],
+            message["modality_config_id"],
+        )
+        now = time.monotonic()
+
+        # 判定与记账在锁内、发送在锁外 —— 与 StatusBroadcaster 同一条理由：
+        # sendall 可能阻塞到 socket 超时，持锁发送会把 0.2 秒的节拍拖垮。
+        with self._vai_lock:
+            changed = signature != self._last_vai_sig
+            heartbeat_due = (now - self._last_vai_at) >= config.VAI_HEARTBEAT_SECONDS
+            if not force and not changed and not heartbeat_due:
+                return False
+            self._last_vai_sig = signature
+            self._last_vai_at = now
+
+        self._broadcast(encode_line(message))
+        return True
 
     @staticmethod
     def _send(client: socket.socket, obj: dict) -> bool:

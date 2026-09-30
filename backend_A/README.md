@@ -118,7 +118,9 @@ C:/venv-gyz-a/Scripts/python.exe vision_a.py --no-window --no-socket --seconds 1
 ---
 
 ## 一、A-包（`module_a_vision/`）
-采集 → 人脸关键点 → 五项指标 → 上报。**图像不出本模块**，出站只有结构化统计量。
+采集 → 人脸关键点 → 五项指标 → 上报。**出站只有结构化统计量** ——
+唯一例外是**默认关闭**的本机回环展示流（`--stream`，`127.0.0.1:8010`，
+只把画面送给同一台机器上的前端，不承载任何协议字段，见 §11 与 api_doc §3.6）。
 
 从 `xiangmu1/home_robot` 移植而来，并对齐团队 `api_doc.md` §3.2 的报文格式。
 
@@ -141,31 +143,40 @@ python main.py --scenario no_face
 
 # 看有哪些剧本
 python main.py --list-scenarios
+
+# 给前端右栏的那条展示流（默认关；**只绑 127.0.0.1:8010**）
+python main.py --source synthetic-pixels --scenario drowsy --stream
+# 没摄像头时用 synthetic-pixels 验收画面：像素与特征同一次剧本推进
 ```
 
-跑测试（40 个用例，标准库 unittest，**不需要装任何东西**）：
+跑测试（136 个用例，标准库 unittest，**不需要装任何东西**）：
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
 > `tests/test_interop_with_b.py` 会起**真的** A 服务与**真的** B 客户端，
-> 约 13 秒。`backend_B` 不在旁边时其中一半会自动跳过。
+> 约 13 秒；`tests/test_stream.py` 会起**真的** HTTP 服务，约 10 秒。
+> `backend_B` 不在旁边时其中一半会自动跳过。
 
 ---
 
 ### 2. 端口与连接方向
 
-| 链路 | 端口 | A 的角色 | 数据格式 |
-| ---- | ---- | -------- | -------- |
-| A → B | 127.0.0.1:8000 | **服务端**（listen） | 一行一条 JSON，`\n` 分隔 |
+| 链路 | 端口 | A 的角色 | 数据格式 | 默认 |
+| ---- | ---- | -------- | -------- | ---- |
+| A → B | 127.0.0.1:8000 | **服务端**（listen） | 一行一条 JSON，`\n` 分隔 | ✅ 起 |
+| A → C 画面 | 127.0.0.1:8010 | **服务端**（listen） | **HTTP** 上的 MJPEG 分区流 | ❌ 不起（`--stream` 才起） |
 
-⚠️ **方向别写反**：A 是 `listen` 的一方，B 主动 `connect`。
+⚠️ **方向别写反**：两条链路上 A 都是 `listen` 的一方，B 与 C 主动 `connect`。
 
 ```bash
 python main.py --port 9000        # 换端口
 python main.py --host 0.0.0.0     # 换监听地址（本机回环以外，需自行评估风险）
 ```
+
+⚠️ **展示流的地址不可配置** —— 没有 `--stream-host`，端口可用 `--stream-port`。
+「例外写窄」最窄的实现，就是让它**无法**被命令行放宽成对外监听（§11）。
 
 ---
 
@@ -178,15 +189,21 @@ backend_A/
 ├── shared/                 枚举 · schema · 分帧收发 · FrameFeatures
 ├── module_a_vision/
 │   ├── capture/            camera · video · csv · synthetic（四源同接口）
+│   │                       其中 synthetic.py 另含 SyntheticPixelSource（--source synthetic-pixels）
 │   ├── face/               MediaPipeFaceBackend（Tasks API）· SyntheticFaceBackend
 │   ├── metrics/            head_pose · eye · expression · attention · fatigue
 │   ├── aggregate/          10 秒窗口 + N-of-M 投票 + 跨窗口累计
 │   ├── privacy/guard.py    出站断言：报文只许含聚合量
-│   ├── wire.py             ★ 新增：api_doc §3.2 的逐帧投影与契约闸
+│   ├── vitals.py           rPPG 体征通道（§3.5 的 rppg 报文）
+│   ├── wire.py             api_doc §3.2 的逐帧投影与契约闸（含 §3.5 类型化报文）
+│   ├── stream.py           ★ 展示流：FrameHub（单槽）+ MjpegStreamServer + 叠加层
 │   └── server.py           8000 服务
 └── tests/
-    ├── test_v1_contract.py      27 个：投影、映射、契约闸、眨眼计数器
-    └── test_interop_with_b.py   13 个：真 socket、真 A、真 B
+    ├── test_v1_contract.py      51 个：投影、映射、契约闸、眨眼计数器
+    ├── test_gaze_optional.py    11 个：§3.5 的 focus 报文与视线缺失
+    ├── test_vitals.py           13 个：rPPG 报文与节流
+    ├── test_stream.py           41 个：展示流 + **像素红线**（见 §11）
+    └── test_interop_with_b.py   20 个：真 socket、真 A、真 B
 ```
 
 ---
@@ -381,11 +398,17 @@ CHROM 的 `α = std(X)/std(Y)` **只取幅度、没有符号**。而真实皮肤
 ```
 python main.py [选项]
 
-  --source {synthetic,camera,video,csv}   采集源（默认 synthetic）
-  --scenario NAME        合成剧本名（--source synthetic）
+  --source {synthetic,camera,video,csv,synthetic-pixels}
+                         采集源（默认 synthetic）
+                         synthetic-pixels = 特征 + 玩具像素，用来验收展示流（见 §11.3）
+  --scenario NAME        合成剧本名（--source synthetic / synthetic-pixels）
   --video PATH           视频文件（--source video）
   --csv PATH             CSV 文件（--source csv）
   --camera-index N       摄像头序号
+
+  --stream               起展示流（给前端右栏拉画面；默认关，见 §11）
+  --stream-port N        展示流端口（默认 8010）
+                         ⚠️ 没有 --stream-host：地址硬编码 127.0.0.1，不可配置
 
   --emit {v1,v2}         出站格式（默认 v1，见 §4）
   --host / --port        监听地址与端口（默认 127.0.0.1:8000）
@@ -418,6 +441,20 @@ cd backend_A && python main.py --scenario sad
 cd backend_B && python main.py --log-level DEBUG
 ```
 
+要连前端一起看（右栏画面），加 `--stream` 与一个**有像素**的源：
+
+```bash
+# 终端1：换成带展示流的 A（真摄像头，或没摄像头时用玩具像素）
+cd backend_A && python main.py --scenario drowsy --source synthetic-pixels --stream
+# 终端3：前端 C 拉那条流
+cd frontend_C && python main.py --stream-url http://127.0.0.1:8010/stream.mjpeg
+```
+
+```bash
+curl -s http://127.0.0.1:8010/healthz    # 一行统计：clients / offered / served / …
+curl -s http://127.0.0.1:8010/stream.mjpeg | head -c 200   # 分区头，人眼可见
+```
+
 三个非 `normal` 状态都有现成的合成剧本，**不需要摄像头、不需要造数据**：
 
 | 剧本 | 时长 | 预期 B 的状态 |
@@ -443,7 +480,7 @@ cd backend_B && python main.py --log-level DEBUG
 
 | 内容 | 怎么验的 |
 | --- | --- |
-| 报文严格符合 §3.2 的 8 字段 | 27 个单元测试 + 对端测试逐条断言键集合**精确相等** |
+| 报文严格符合 §3.2 的 8 字段 | 51 个单元测试 + 对端测试逐条断言键集合**精确相等** |
 | 真 A → 真 B 的链路与字段对齐 | `test_interop_with_b.py`：真 socket、真 A 服务线程、真 `VisionClient` + 真 `VisionStateEvaluator` |
 | **B 能判成 `normal`**（= 字段名真的对上了） | 同上。字段错位时 B 会静默停在 `absent`，这是唯一能证明对齐的观测 |
 | **无失联抖动** | 自动化断言：稳定运行期内 `state.stale` 一次都不为真；另有帧间隔 < 2.5s 的断言 |
@@ -451,6 +488,16 @@ cd backend_B && python main.py --log-level DEBUG
 | 三个非 `normal` 状态的端到端轨迹 | 真时钟实跑，见下表 |
 | `v2` 模式无回归 | `--dry-run --emit v2 --scenario drowsy` 输出与改动前逐字相同 |
 | 契约闸拦得住脏报文 | 逐类断言：缺字段 / 多字段 / `blink_cnt=True` / NaN / 字符串数字 / 非法 `emo_feature` |
+| **展示流只绑回环** | 单元测试从**真实 socket 地址**上再确认一遍是 `127.0.0.1`（配置写对了但绑错的事真会发生）；真机 `netstat` 也确认是 `127.0.0.1:8010` 而非 `0.0.0.0:8010` |
+| **默认关是真的关** | 真机：不加 `--stream` 时 `netstat` 在 8010 上**查无监听**；`--dry-run --stream` 打印「展示流已忽略」且不起服务 |
+| **地址不可配置** | 单元测试：`build_parser()` 的选项里**没有** `stream_host`，有 `stream_port` —— 这一条是"例外写窄"最硬的落点 |
+| **像素红线没被放宽**（§11.4） | 6 条用例：敏感词表仍含 `jpeg`/`pixel`/`bbox` 等；把 JPEG 字节塞进报文 → 抛 `PrivacyViolationError`；塞在**无辜键名**下也抛；ndarray 帧同样抛；干净的认同报文仍能过（闸门没把自己人也拦了）；展示流路径**完全不碰** `broadcast()` |
+| **`scrub_frame` 真的在跑** | 单元测试计数：编码后被调用、只读缓冲区跳过并计数（不让它打崩主循环）、没起流时是空操作 |
+| **像素不驻留** | 单元测试：`vars(server)` 里没有任何 `pixel`/`frame_` 开头的名字 |
+| **无订阅者时不做编码** | 单元测试：`FrameHub` 没有订阅者时 `offer()` 不调用 `imencode` |
+| **真跑起来能收到帧** | 真机 `curl` 取到含 `--frame` + `Content-Type: image/jpeg` 的分区、`/healthz` 返 200、未知路径返 **404 响应**（不是断连）；解出来的图里有烧进画面的绿框与两行 ASCII |
+| **不落盘** | 真机跑 60s 后 `git status --porcelain` 无新增文件；`stream.py` 里没有 `imwrite` / `open(...,'wb')` |
+| **客户端"连上就断"不打 traceback** | 单元测试：用 `SO_LINGER=(1,0)` 主动发 RST，断言 stderr 里**没有** Traceback 且计数进了 `client_resets`。回归用例 —— 这条曾经真的坏过：C 每次 `stop()` 都会在 A 的终端上打一段看着像崩溃的栈 |
 
 真时钟实跑记录（A 与 B 同时起，B 连上后观察 45 秒，`--log-level DEBUG`）：
 
@@ -469,6 +516,7 @@ cd backend_B && python main.py --log-level DEBUG
 | --- | --- | --- |
 | **「像素 → 人脸关键点」这一步** | 开发机**没有摄像头**。合成源与 CSV 回放直接产出特征，**跳过了像素** | 接真实摄像头或真人视频：`python main.py --source camera` |
 | MediaPipe 后端在真实画面上的表现 | 同上 | 同上 |
+| **带真像素的展示流（`--source camera --stream`）** | 展示流的验收全程用 `--source synthetic-pixels` 的**玩具像素**（那张图不是人脸，叠加层的框也是画上去的）。像素→JPEG→HTTP→C 解码上屏这条链子**已验证**，但**真实人脸画面的观感没看过** | 在演示机上：`A --source camera --stream` + `C --stream-url …`，确认人脸占比、绿框贴合、叠加层字号可读 |
 | **真实场景下的判定准确率** | 同上。验的是**判定逻辑**，不是**视觉精度** | 需要真人数据，并做误报/漏报统计 |
 | **表情识别的精度** | 是 52 个 ARKit blendshape 的**规则启发式基线**，不是训练模型 | 采集真实老人表情数据后接 ONNX 模型，`ExpressionClassifier` 接口已留好 |
 | 长时间运行稳定性 | 没有跑过数天量级的浸泡测试 | — |
@@ -515,6 +563,10 @@ pip install --force-reinstall --no-deps opencv-contrib-python==4.13.0.92
 | **B 没启动** | A 照常采集，只是没人收；B 起来后自动接上 | 日志 `[A] B 已连接` |
 | **B 断开** | A 继续跑，日志提示等待重连 | `[A] 所有 B 连接均已断开，等待重连` |
 | **采集源耗尽** | 停止产出但进程不退出（"看不见了"本身是要上报的状态） | `[A] 采集源已耗尽` |
+| **展示流端口被占（8010）** | 只打印一行提示，**8000 照常跑**；C 侧反复重连 | 启动输出里的提示行；`netstat` 上 8010 无监听 |
+| **没给 `--stream`** | 展示流**完全不存在**（一次 cv2 调用都不做，8010 无监听） | `netstat` 查无 8010 |
+| **`--stream` 配了无像素的源** | 打印一行说明后**继续跑**，不失败退出 | 启动输出里有那行说明 |
+| **客户端断线 / RST** | 名额归还、计数进 `client_resets`，**不打 traceback** | 日志无栈回溯；`/healthz` 的 `clients` 回落 |
 
 ---
 
@@ -542,6 +594,76 @@ pip install --force-reinstall --no-deps opencv-contrib-python==4.13.0.92
 团队这边状态一直是 absent"。
 
 `--emit v2` 保留上游的原生行为，所以消费 V2 报文的代码不会因为这次移植而失效。
+
+---
+
+### 11. 展示流（A→C）⚠️ 「像素不出模块」的唯一例外
+
+前端右栏要显示实时画面，而 Windows 的摄像头被 A 独占、C 又不许 import cv2
+（cv2 与 PyQt5 同进程会互相顶掉平台插件）。所以画面只能由 **A 推、C 拉**。
+
+**规格在 `api_doc.md` §3.6，与 §1「A 与 C 无直接通信」成对阅读。** 这里只写
+实现上必须知道的几件事。
+
+#### 11.1 默认关，而且地址改不了
+
+```bash
+python main.py --stream                       # 起在 127.0.0.1:8010
+python main.py --stream --stream-port 8011    # 端口可改
+python main.py --source synthetic-pixels --stream   # 没摄像头时用它验收
+```
+
+**没有 `--stream-host`。** 这不是忘了加：`stream.py` 里 `BIND_HOST` 是硬编码的
+常量，「例外写窄」最窄的实现就是让它**无法**被命令行放宽成对外监听。
+`--dry-run --stream` 会打印「展示流已忽略」并且真的不起服务。
+
+**端口起不来不拖垮主链路**：`_open_stream` 接住 `OSError` 只打印一行提示，
+8000 那条 TCP 照常跑。展示流是纯装饰，不许它把视觉功能带下水。
+
+#### 11.2 三个实现上的硬约束
+
+**① 顺序：先 `process` 再发布。** 叠加层要画 `face_bbox`，它来自
+`process()` 产出的 `FrameFeatures`。反过来做就只能画一个没框的画面。
+
+**② 像素不驻留。** `_read_one` 把 `(frame, pixels)` 一起返回，`pixels` 只在
+`_produce` 的**局部作用域**里活着，编码进 `FrameHub` 的单槽之后立刻
+`scrub_frame` 抹掉。**故意不挂 `self._last_pixels`** —— 那会把"模块内不留像素"
+从**事实**降级成**纪律**，而纪律是靠不住的。`test_stream.py` 里有一条用例
+直接断言 `vars(server)` 里没有任何 `pixel`/`frame_` 开头的名字。
+
+`scrub_frame` 这次是**第一次真的被调用**（这个函数在仓库里躺了很久没人调）。
+它先判 `flags.writeable`，只读的缓冲区跳过并计数，**绝不**让它把视觉主循环打崩。
+
+**③ 没有订阅者时一次 cv2 调用都不做。** `FrameHub` 是**单槽**（最新一帧胜出、
+永不排队）：没人拉流就不该付编码的代价。这是它在 `--stream` 没给时**零开销**的原因。
+
+#### 11.3 叠加层：只出 ASCII
+
+画一个绿框（`face_bbox`，已外扩 5%）+ 左上两行 ASCII
+（`ts / face / ear / blink / pitch / yaw / roll / emo / gaze`）。
+
+⚠️ **画不了中文。** `cv2.putText` 用的是 Hershey 字库，**只有 ASCII** ——
+写中文进去**不报错、不警告**，只是屏幕上出现一串 `????`。所以 A 只出原始量，
+**中文解释全部在 C 侧**（`frontend_C/c_core/display_text.py`）。
+这条不是风格选择，是字库限制。
+
+`--source synthetic-pixels` 是为了**没摄像头也能验收画面**而加的：它的像素与
+特征由**同一次剧本推进**产出（复用父类的推进逻辑，同时 `_build` 出 features），
+**绕开 `SyntheticFaceBackend`**（它收到 ndarray 直接报错）。
+**它画的不是能被 MediaPipe 检出的人脸**，只是一张会跟着 roll 转的玩具图 ——
+用来验"像素 → 编码 → 推流 → 解码 → 上屏"这条链子通不通，不是验视觉精度。
+
+#### 11.4 红线没松，只是绕得极窄
+
+`privacy/guard.py` 的 `assert_clean` 只在 `broadcast()` 上执行，展示流走 HTTP
+**绕开了那道闸**。**`SENSITIVE_TOKENS` / `SAFE_KEYS` / `assert_clean` 一个字符
+都没改** —— `test_stream.py` 里有 6 条用例专门钉住这一点（敏感词表里仍含
+`jpeg`/`pixel`/`bbox` 等词；把 JPEG 字节塞进报文、甚至塞在一个**无辜的键名**
+下，照旧抛 `PrivacyViolationError`）。
+
+同一批用例还钉住：**展示流这条路径完全不碰 `broadcast()`**。
+「这条通路是有意绕开，不是闸门失效」—— 两句话必须同时成立，
+只有前一句成立就成了"偷偷开的后门"，只有后一句成立就成了"红线作废"。
 
 ---
 

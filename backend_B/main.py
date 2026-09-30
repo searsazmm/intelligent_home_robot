@@ -124,6 +124,13 @@ class BackendB:
             # 注入当前状态，让新连上的 C 端**立刻**拿到状态而不是等 15 秒心跳。
             # C 端默认只连 8002，这条就是它开局的唯一状态来源。
             state_provider=self._effective_state,
+            # 专注度展示报文（B→C，只读旁路）。**必须惰性取** ——
+            # chat_server 建在 focus_tracker 之前，这里写成直接传对象会
+            # AttributeError；而且关掉专注静默时它整个是 None（不提供）。
+            vai_provider=lambda: (
+                getattr(self, "focus_tracker", None).snapshot()
+                if getattr(self, "focus_tracker", None) is not None else None
+            ),
             host=args.chat_host, port=args.chat_port,
         )
 
@@ -616,17 +623,43 @@ class BackendB:
             return
         self.chat_server.broadcast_state(state, reason)
 
+    def _publish_vai(self) -> None:
+        """把专注度快照推给 C（**只供界面显示**）。不发就返回。
+
+        ⚠️ **只读旁路，四条硬约束**（每条都有对应的验收测试）：
+
+        1. 只调 ``FocusTracker.snapshot()`` —— 它返回不可变快照，跨线程安全；
+        2. **不调** ``should_stay_silent()`` / ``focus_is_live()`` —— 那两个是
+           静默判定的输入，展示不许反过来影响它；
+        3. **不调** :meth:`_focus_liveness` —— 它有日志副作用（进出静默各打一条），
+           展示路径按 0.2 秒的节拍调它会把日志刷爆，也会把静默边沿弄脏；
+        4. **不调** ``_publish_state()`` —— ``vai`` 报文刻意不带 ``state`` 字段，
+           不能变成第二个状态源去和 8001/8002 打架。
+
+        另外它不进 ``evaluator``：VAI 是"给老人看的参考"，不是给状态机的输入。
+
+        关掉 ``--no-vai-display`` 或没开 ``--focus-silence``（tracker 为 None）时
+        整个方法直接返回 —— 后者是配置问题，不刷日志。
+        """
+        if not self.args.vai_display or self.focus_tracker is None:
+            return
+        self.chat_server.publish_vai(self.focus_tracker.snapshot())
+
     def _state_publish_loop(self) -> None:
         """定期取当前状态并推给 C。变化时推，没变化时靠心跳推。
 
         主动关怀也挂在这个节拍上 —— 它需要的输入（当前状态、用户最近说话的
         时刻、是否正在播报）在这个节拍上本来就齐了，单开一个轮询线程
         只会多一处要同步的状态，不会更快。
+
+        专注度展示同理挂在同一节拍上（:meth:`_publish_vai`），**不新开线程**：
+        "变了才发、没变 5 秒心跳"的去重逻辑在 ``ChatServer.publish_vai`` 里。
         """
         while not self._stop.is_set():
             try:
                 state, reason = self._effective_state()
                 self._publish_state(state, reason)
+                self._publish_vai()
                 self._tick_proactive(state)
             except Exception:
                 logger.exception("状态发布出错")
@@ -890,6 +923,20 @@ class BackendB:
                 f"抑制上限 {self.proactive.focus_suppress_max:.0f}s）"
             )
 
+        # 专注度**展示**单独一行，且与上面那行的开关**各自独立**。
+        # 这一行存在的理由和 focus_line 一样：展示不出东西时，"没开"
+        # （配置）和"开了但 A 没发 focus 报文 / 还没校准完"（数据）在
+        # C 的界面上长得一模一样（都是"未提供"），只有开机这一屏能分辨。
+        if not self.args.vai_display:
+            vai_line = "已关闭（--no-vai-display）"
+        elif self.focus_tracker is None:
+            vai_line = "未启用 —— 专注静默关掉了（无 tracker，--no-focus-silence）"
+        else:
+            vai_line = (
+                f"已开启（变化即发，无变化每 {config.VAI_HEARTBEAT_SECONDS:g}s 心跳，"
+                f"新客户端连上补发；C 侧标注为非医疗结论）"
+            )
+
         print("=" * 62)
         print("  居家陪伴机器人 · 后端 B")
         print("-" * 62)
@@ -901,6 +948,7 @@ class BackendB:
         print(f"  大模型对话  {llm_line}")
         print(f"  主动关怀    {proactive}")
         print(f"  专注静默    {focus_line}")
+        print(f"  专注度展示  {vai_line}")
         print("-" * 62)
         print("  Ctrl+C 退出")
         print("=" * 62)
@@ -974,7 +1022,13 @@ def build_parser() -> argparse.ArgumentParser:
                         default=config.FOCUS_SILENT_ENABLED,
                         help="专注静默：老人正专注时暂不主动开口（--no-focus-silence 关闭）。"
                              "指数由 core/focus.py 从 A 的 §3.5 focus 报文选出来，"
-                             "**B 内部使用，不下发 C**；应答永远不受影响")
+                             "**只用于静默判定**；应答永远不受影响")
+    parser.add_argument("--vai-display", action=argparse.BooleanOptionalAction,
+                        default=config.VAI_DISPLAY_ENABLED,
+                        help="把专注度（VAI）作为**只读展示报文**下发给 C 的界面"
+                             "（--no-vai-display 关闭）。与 --focus-silence 解耦："
+                             "关掉静默不影响显示，关掉显示不影响静默。"
+                             "报文不带 state 字段，不驱动表情、不进状态机")
 
     # ---- 语音 ----
     parser.add_argument("--voice", action=argparse.BooleanOptionalAction,

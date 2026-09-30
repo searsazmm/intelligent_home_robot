@@ -161,6 +161,7 @@ class Recorder:
 
     def __init__(self) -> None:
         self.states: list[tuple[str, str, str]] = []
+        self.vais: list[dict] = []
         self.replies: list[dict] = []
         self.proactives: list[dict] = []
         self.links: list[tuple[str, bool]] = []
@@ -170,6 +171,11 @@ class Recorder:
     def on_state(self, state: str, reason: str, source: str) -> None:
         with self._lock:
             self.states.append((state, reason, source))
+        self._event.set()
+
+    def on_vai(self, msg: dict) -> None:
+        with self._lock:
+            self.vais.append(msg)
         self._event.set()
 
     def on_reply(self, msg: dict) -> None:
@@ -193,6 +199,17 @@ class Recorder:
         while time.monotonic() < deadline:
             with self._lock:
                 if len(self.states) >= count:
+                    return True
+            self._event.wait(0.05)
+            self._event.clear()
+        return False
+
+    def wait_for_vai(self, count: int = 1, timeout: float = TIMEOUT) -> bool:
+        """等专注度展示报文攒够 ``count`` 条。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if len(self.vais) >= count:
                     return True
             self._event.wait(0.05)
             self._event.clear()
@@ -225,6 +242,7 @@ def build_link(recorder: Recorder, port: int, status_port: int | None = None) ->
         chat_port=port,
         status_port=status_port,
         on_state=recorder.on_state,
+        on_vai=recorder.on_vai,
         on_reply=recorder.on_reply,
         on_proactive=recorder.on_proactive,
         on_link=recorder.on_link,
@@ -494,6 +512,75 @@ class TestMessageKinds(LinkTestCase):
         self.server.send_state(STATE_SAD)
         self.assertTrue(self.recorder.wait_for_states(1))
         self.assertEqual(self.recorder.states, [(STATE_SAD, "", SOURCE_CHAT)])
+
+
+class TestVaiReception(LinkTestCase):
+    """专注度展示报文（api_doc §5.6）：**只派发，绝不碰状态**。
+
+    这条约束在 C 侧最容易被"顺手"破坏 —— 报文里既然有 ``status``、
+    看着又很像一个状态，接着写一句 ``self._apply_state(msg["status"], ...)``
+    是极自然的动作。所以这里用**同一个连接**同时喂 vai 与 state，
+    断言状态序列只由后者决定。
+    """
+
+    VAI = {
+        "type": "vai",
+        "index": 63.5,
+        "index_status": "研究趋势（非认知专注）",
+        "status": "有效",
+        "reason": "校准已锁定",
+        "modalities": ["gaze", "pose", "eye_open"],
+        "recent_modalities": ["gaze", "pose", "eye_open"],
+        "modality_config_id": "凝视+头姿+睁眼",
+        "valid_seconds": 42.0,
+        "note": "研究趋势（非认知专注）；日常参考，非医疗结论",
+        "timestamp": 1.0,
+    }
+
+    def test_vai_is_dispatched_with_every_field_intact(self):
+        """整条报文原样交给上层 —— 挑字段是 display_text 的事，不是传输层的事。"""
+        self.start_link()
+        self.server.send_json(self.VAI)
+        self.assertTrue(self.recorder.wait_for_vai())
+        self.assertEqual(self.recorder.vais[0], self.VAI)
+
+    def test_vai_does_not_change_the_expression(self):
+        """收到专注度**不能**让表情变 —— 那会变成第二个状态源。"""
+        self.start_link()
+        self.server.send_json(self.VAI)
+        self.assertTrue(self.recorder.wait_for_vai())
+        time.sleep(0.2)
+        self.assertEqual(self.recorder.states, [])
+
+    def test_a_stray_state_field_in_vai_is_still_not_a_state(self):
+        """就算报文里真的混进了 ``state`` 字段，也不许它改状态。
+
+        B 侧目前的 ``build_vai_message`` 不带这个字段，但"以后有人加上"是
+        很可能发生的事 —— 那时这条测试会站出来说话，而不是悄悄多出一个状态源。
+        """
+        self.start_link()
+        self.server.send_json({**self.VAI, "state": STATE_SAD})
+        self.assertTrue(self.recorder.wait_for_vai())
+        self.server.send_state(STATE_TIRED)
+        self.assertTrue(self.recorder.wait_for_states(1))
+        self.assertEqual(self.recorder.states, [(STATE_TIRED, "", SOURCE_CHAT)])
+
+    def test_index_null_is_passed_through_as_none(self):
+        """``index: null`` = 没有分数（不是 0 分）。传输层**不许**把它变成 0。"""
+        self.start_link()
+        self.server.send_json({**self.VAI, "index": None,
+                               "index_status": "有效观察时长不足", "status": "观察不足"})
+        self.assertTrue(self.recorder.wait_for_vai())
+        self.assertIsNone(self.recorder.vais[0]["index"])
+        self.assertNotEqual(self.recorder.vais[0]["index"], 0)
+
+    def test_malformed_vai_does_not_kill_the_thread(self):
+        """``vai`` 字段类型乱来（index 是字符串、modalities 是数字）也不许带走线程。"""
+        self.start_link()
+        self.server.send_json({"type": "vai", "index": "高", "modalities": 42})
+        self.assertTrue(self.recorder.wait_for_vai())
+        self.server.send_state(STATE_SAD)
+        self.assertTrue(self.recorder.wait_for_states(1), "线程在脏报文之后死了")
 
     def test_error_message_does_not_kill_the_thread(self):
         self.start_link()

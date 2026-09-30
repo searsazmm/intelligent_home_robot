@@ -6,13 +6,18 @@
 
     [("normal", 30.0), ("drowsy", 40.0)]
 
-同一份剧本有两条输出，由两个类分别提供：
+同一份剧本有三条输出，由三个类分别提供：
 
 * :class:`SyntheticFeatureSource`——直接产出
   :class:`~shared.frame_features.FrameFeatures`。**这是被测试的路径**：
   零第三方依赖（除 numpy）、完全确定性、微秒级。
 * :class:`SyntheticSource`——在它之上再加一条像素路径（``read()``），
   保证真实管线的形状不因"本机没摄像头"而悄悄分叉。
+* :class:`SyntheticPixelSource`——同时给出像素与特征，并**充当自己的人脸
+  后端**。它是给展示流（``--source synthetic-pixels --stream``）用的：
+  本机没有摄像头，但右栏那张图总得有点东西可看。它**不是**
+  ``SyntheticSource`` 的子类，理由写在那个类自己的文档里（一句话：
+  服务器"特征源优先"的派发会让像素永远拿不到）。
 
 像素路径刻意**不**生成能被 MediaPipe 检出的人脸
 ------------------------------------------------
@@ -53,7 +58,7 @@ from shared.frame_features import (
 )
 from shared.geometry import fuse_closure
 
-from .base import BaseFeatureSource, CaptureConfig, CaptureError
+from .base import BaseCapture, BaseFeatureSource, CaptureConfig, CaptureError
 from ..metrics.expression import NEUTRAL_CALIBRATION_SEC
 
 #: 表示"一直持续下去"。剧本的最后一段常取它。
@@ -396,6 +401,22 @@ class SyntheticFeatureSource(BaseFeatureSource):
 
     def read_features(self) -> FrameFeatures | None:
         """产出下一帧特征；``None`` 表示剧本已走完（``loop=False`` 时）或已达上限。"""
+        step = self._advance()
+        if step is None:
+            return None
+        spec, ts, t_local = step
+        return self._build(spec, ts, t_local)
+
+    # ------------------------------------------------------------ 时间轴
+
+    def _advance(self) -> tuple[StateSpec, float, float] | None:
+        """推进一步时间轴，返回 ``(本帧配方, ts, 段内秒数)``；``None`` = 已耗尽。
+
+        **像素路径与特征路径共用这一段**（``read_features`` 与
+        ``SyntheticSource.read``）。共用是刻意的：两条路径的换段时刻必须
+        逐字相同，否则同一个剧本在"看画面"与"看数字"两边会在不同的秒数
+        切状态 —— 那正是"合成源与真机形状悄悄分叉"的开始。
+        """
         if not self._opened:
             raise CaptureError(
                 "合成源尚未 open()。请先调用 open() —— 或在 with 语句里使用它。"
@@ -411,8 +432,7 @@ class SyntheticFeatureSource(BaseFeatureSource):
         self._pace(ts)
 
         state, t_local = self._scenario.state_at(ts)
-        spec = self._states[state]
-        return self._build(spec, ts, t_local)
+        return self._states[state], ts, t_local
 
     # ------------------------------------------------------------ 构造
 
@@ -426,7 +446,7 @@ class SyntheticFeatureSource(BaseFeatureSource):
                 quality=spec.quality,
             )
 
-        ear, blink = self._eye_values(spec, t_local)
+        ear, blink = eye_values(spec, t_local)
         closure = fuse_closure(ear, blink)
 
         blendshapes = dict(spec.blendshapes)
@@ -453,22 +473,6 @@ class SyntheticFeatureSource(BaseFeatureSource):
             gaze_off_ratio=gaze,
             quality=spec.quality,
         )
-
-    def _eye_values(self, spec: StateSpec, t_local: float) -> tuple[float, float]:
-        """返回 ``(EAR, eyeBlink 系数)``。
-
-        持续闭眼的状态没有眨眼相位——否则会在"闭着的基础上再眨一下"，
-        产生一个语义上不存在的开合片段。
-        """
-        if spec.eyes_closed:
-            return spec.ear_closed, spec.blink_closed
-        if spec.blink_period and spec.blink_period > 0:
-            # 相位偏移半个周期：否则第一帧恰好落在眨眼中间，启动标定的
-            # 第一个样本就是一张闭眼脸，个体基线从一开始就是偏的。
-            phase = math.fmod(t_local + spec.blink_period / 2.0, spec.blink_period)
-            if phase < spec.blink_sec:
-                return spec.ear_closed, spec.blink_closed
-        return spec.ear_open, spec.blink_open
 
     def _noisy(self, value: float) -> float:
         """按 ``noise`` 叠加抖动。``noise=0`` 时原样返回（确定性）。"""
@@ -531,72 +535,192 @@ class SyntheticSource(SyntheticFeatureSource):
 
     def read(self) -> np.ndarray | None:
         """产出一张合成 BGR 图；``None`` 表示剧本已走完或已达上限。"""
-        if not self._opened:
-            raise CaptureError("合成源尚未 open()。请先调用 open()。")
-        if self._over_budget():
-            self._exhausted = True
+        step = self._advance()
+        if step is None:
             return None
-
-        ts = self._tick()
-        if not self._scenario.loop and ts >= self._scenario.total_sec:
-            self._exhausted = True
-            return None
-        self._pace(ts)
-
-        state, t_local = self._scenario.state_at(ts)
-        return self._render(self._states[state], t_local)
+        spec, _ts, t_local = step
+        return render_toy_frame(spec, t_local, self.cfg)
 
     def describe(self) -> str:
         return super().describe().replace("特征直出", "特征直出 + 玩具像素")
 
-    # ------------------------------------------------------------ 画图
 
-    def _render(self, spec: StateSpec, t_local: float) -> np.ndarray:
-        """画一张形状正确的玩具图。
+class SyntheticPixelSource(BaseCapture):
+    """合成 **像素 + 特征同源** 源：没有摄像头时，让展示流也有画面。
 
-        按需导入 cv2：特征路径（本机的主路径）因此**不需要** opencv，
-        只有真的要看像素时才要求它。
+    为什么是 :class:`SyntheticSource` 的**兄弟**而不是子类
+    -----------------------------------------------------
+
+    理由很具体：服务器的派发（``server._read_one``）是"特征源优先"的，
+    而 :class:`SyntheticSource` 同时有 ``read()`` 与 ``read_features()`` ——
+    只要它还是 ``FeatureSource``，那条分支就会抢先命中，像素**永远拿不到**。
+    本类只有 ``read()``，派发上不存在任何歧义。
+
+    它同时也是**自己的人脸后端**（``process()``）
+    --------------------------------------------
+
+    一帧的像素与一帧的特征必须来自**同一次**剧本推进：分两次读会让时间轴
+    走快一倍（这个坑 :class:`SyntheticSource` 的文档里已经写过一次）。
+    所以 :meth:`read` 一次把两样都算出来，特征先存进一个单槽，紧跟着由
+    :meth:`process` 取走 —— ``server._read_one`` 里
+    ``read() → backend.process(pixels)`` 这个既有顺序**一行都不用改**。
+
+    ⚠️ **它画不出能被 MediaPipe 检出的人脸**，也不该试图画。这里模拟的是
+    "特征与像素可以同时拿到"这条理想管线（真机上 MediaPipe 就是一边收像素
+    一边出特征），不是"合成一个人"。喂给真实后端只会得到
+    ``has_face=False`` —— 那是预期行为。
+
+    内层那个 ``_script`` 只借剧本、状态配方与构造器；**时间轴不借**：
+    ``SyntheticSource`` 与 ``SyntheticFeatureSource`` 引用的私有件
+    （``_advance`` / ``_build``）就是这条管线的零件，为它们各写一层公开
+    包装只是把同一个东西写两遍。
+    """
+
+    def __init__(
+        self,
+        scenario: str = "normal",
+        timeline: Iterable[tuple[str, float]] | None = None,
+        cfg: CaptureConfig | None = None,
+        states: Mapping[str, StateSpec] | None = None,
+        noise: float = 0.0,
+        seed: int = 0,
+    ) -> None:
+        super().__init__(cfg)
+        self._script = SyntheticFeatureSource(
+            scenario=scenario, timeline=timeline, cfg=self.cfg,
+            states=states, noise=noise, seed=seed,
+        )
+        #: 本帧的特征，等人脸后端（就是本类自己）取走。**只有一槽**：
+        #: 取走即清空，下一次 ``read()`` 再放。存两帧以上没有意义 ——
+        #: 像素与特征永远是成对消费的。
+        self._pending: FrameFeatures | None = None
+
+    # ------------------------------------------------------------ 生命周期
+
+    def open(self) -> None:
+        self._script.open()
+        self._pending = None
+        self._opened = True
+
+    def close(self) -> None:
+        self._pending = None
+        super().close()
+
+    def describe(self) -> str:
+        return self._script.describe().replace("特征直出", "特征直出 + 玩具像素")
+
+    # ------------------------------------------------------------ 时间轴
+
+    @property
+    def exhausted(self) -> bool:
+        return self._script.exhausted
+
+    @property
+    def frame_index(self) -> int:
+        return self._script.frame_index
+
+    @property
+    def last_ts(self) -> float:
+        return self._script.last_ts
+
+    # ------------------------------------------------------------ 读取
+
+    def read(self) -> np.ndarray | None:
+        """一次产出 **像素 + 那一帧的特征**；返回像素，特征存进单槽。
+
+        分两步给（而不是返回一个二元组）是为了让 ``_read_one`` 保持它原本的
+        形状：``pixels = source.read()`` → ``backend.process(pixels)``。
         """
-        try:
-            import cv2
-        except ImportError as exc:  # pragma: no cover - 本机已装
+        step = self._script._advance()
+        if step is None:
+            self._pending = None
+            return None
+        spec, ts, t_local = step
+        self._pending = self._script._build(spec, ts, t_local)
+        return render_toy_frame(spec, t_local, self.cfg)
+
+    def process(self, pixels: np.ndarray | None) -> FrameFeatures:
+        """人脸后端协议的那个 ``process()``：把刚读出的特征交出去。
+
+        ``pixels`` 只用来判一次"调用顺序对不对" —— 特征不是从它算出来的，
+        而是与它同一帧、同一次剧本推进的产物（见类文档）。**顺序错了必须
+        报错**：静默返回上一帧的特征会让画面上的人和文字描述的人差一帧，
+        而一帧的错位在界面上几乎看不出来，却能让人排一整天的队。
+        """
+        features = self._pending
+        self._pending = None
+        if features is None or pixels is None:
             raise CaptureError(
-                "合成像素路径需要 opencv。请安装 opencv-contrib-python，"
-                "或改用 read_features() 走特征路径（不需要 opencv）。"
-            ) from exc
-
-        w, h = self.cfg.width, self.cfg.height
-        img = np.full((h, w, 3), _bg_level(spec.quality.illumination), dtype=np.uint8)
-
-        if spec.has_face:
-            ear, _ = self._eye_values(spec, t_local)
-            cx, cy = int(w * 0.5), int(h * 0.45)
-            axes = (int(w * 0.16), int(h * 0.22))
-            # 椭圆按 roll 旋转：肉眼即可看出"头歪了"，便于人工排查。
-            cv2.ellipse(img, (cx, cy), axes, spec.roll, 0, 360, (170, 165, 160), -1)
-            # 眼睛：按 EAR 决定开口高度（EAR 越小越闭）。
-            openness = _clamp01((ear - 0.10) / 0.20)
-            eye_h = max(1, int(axes[1] * 0.10 * openness))
-            for dx in (-axes[0] // 2, axes[0] // 2):
-                cv2.ellipse(
-                    img, (cx + dx, cy - axes[1] // 4), (axes[0] // 6, eye_h),
-                    0, 0, 360, (40, 40, 45), -1,
-                )
-
-        if spec.quality.blur in (Blur.MEDIUM, Blur.HIGH):
-            k = 7 if spec.quality.blur is Blur.MEDIUM else 21
-            img = cv2.GaussianBlur(img, (k, k), 0)
-
-        if spec.quality.occlusion is Occlusion.SEVERE:
-            # 遮挡：糊成一团近似的纯色，与 "no_face"（画面正常但没人）区分开。
-            img = np.full_like(img, 90)
-        return img
+                "SyntheticPixelSource.process() 收到的像素与本帧特征对不上："
+                "它必须紧跟在本类 read() 之后被调用一次（本类同时充当自己的"
+                "人脸后端，见 server.build_server 里的 synthetic-pixels 分支）。"
+            )
+        return features
 
 
 # ================================================================ 工具
 
 def _clamp01(v: float) -> float:
     return 0.0 if v < 0.0 else 1.0 if v > 1.0 else v
+
+
+def eye_values(spec: StateSpec, t_local: float) -> tuple[float, float]:
+    """返回 ``(EAR, eyeBlink 系数)``。特征构造与玩具绘图共用这一份。
+
+    持续闭眼的状态没有眨眼相位 —— 否则会在"闭着的基础上再眨一下"，
+    产生一个语义上不存在的开合片段。
+    """
+    if spec.eyes_closed:
+        return spec.ear_closed, spec.blink_closed
+    if spec.blink_period and spec.blink_period > 0:
+        # 相位偏移半个周期：否则第一帧恰好落在眨眼中间，启动标定的
+        # 第一个样本就是一张闭眼脸，个体基线从一开始就是偏的。
+        phase = math.fmod(t_local + spec.blink_period / 2.0, spec.blink_period)
+        if phase < spec.blink_sec:
+            return spec.ear_closed, spec.blink_closed
+    return spec.ear_open, spec.blink_open
+
+
+def render_toy_frame(spec: StateSpec, t_local: float, cfg: CaptureConfig) -> np.ndarray:
+    """画一张形状正确的玩具图。两个合成源共用（``read()`` 都走到这里）。
+
+    按需导入 cv2：特征路径（本机的主路径）因此**不需要** opencv，
+    只有真的要看像素时才要求它。
+    """
+    try:
+        import cv2
+    except ImportError as exc:  # pragma: no cover - 本机已装
+        raise CaptureError(
+            "合成像素路径需要 opencv。请安装 opencv-contrib-python，"
+            "或改用 read_features() 走特征路径（不需要 opencv）。"
+        ) from exc
+
+    w, h = cfg.width, cfg.height
+    img = np.full((h, w, 3), _bg_level(spec.quality.illumination), dtype=np.uint8)
+
+    if spec.has_face:
+        ear, _ = eye_values(spec, t_local)
+        cx, cy = int(w * 0.5), int(h * 0.45)
+        axes = (int(w * 0.16), int(h * 0.22))
+        # 椭圆按 roll 旋转：肉眼即可看出"头歪了"，便于人工排查。
+        cv2.ellipse(img, (cx, cy), axes, spec.roll, 0, 360, (170, 165, 160), -1)
+        # 眼睛：按 EAR 决定开口高度（EAR 越小越闭）。
+        openness = _clamp01((ear - 0.10) / 0.20)
+        eye_h = max(1, int(axes[1] * 0.10 * openness))
+        for dx in (-axes[0] // 2, axes[0] // 2):
+            cv2.ellipse(
+                img, (cx + dx, cy - axes[1] // 4), (axes[0] // 6, eye_h),
+                0, 0, 360, (40, 40, 45), -1,
+            )
+
+    if spec.quality.blur in (Blur.MEDIUM, Blur.HIGH):
+        k = 7 if spec.quality.blur is Blur.MEDIUM else 21
+        img = cv2.GaussianBlur(img, (k, k), 0)
+
+    if spec.quality.occlusion is Occlusion.SEVERE:
+        # 遮挡：糊成一团近似的纯色，与 "no_face"（画面正常但没人）区分开。
+        img = np.full_like(img, 90)
+    return img
 
 
 def _bg_level(illumination: Illumination) -> int:
@@ -616,6 +740,9 @@ __all__ = [
     "Segment",
     "StateSpec",
     "SyntheticFeatureSource",
+    "SyntheticPixelSource",
     "SyntheticSource",
+    "eye_values",
     "parse_timeline",
+    "render_toy_frame",
 ]

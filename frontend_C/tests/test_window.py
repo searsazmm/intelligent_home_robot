@@ -215,12 +215,19 @@ class TestRendering(unittest.TestCase):
         self.assertEqual(window._font_point_size(), 42)
 
     def test_auto_font_size_scales_with_height(self):
-        """自适应字号必须真的随窗口高度变 —— 全屏时要看得清。"""
+        """自适应字号必须真的随窗口高度变 —— 全屏时要看得清。
+
+        ⚠️ 窗口**必须给得足够宽**（2600 而不是 800）：左右分栏之后字号
+        同时受宽度约束（见 ``ui/window.py`` 的 ``EDGE_MARGIN`` 与
+        ``_largest_fitting_point_size``）。窄窗口下宽度是那个约束，
+        再高也不会变大 —— 那时这条断言测的就不是"随高度变"了。
+        2600 宽是为了让它在任何字体度量下都不成为瓶颈。
+        """
         window = make_window()
         self.addCleanup(window.close)
-        window.resize(800, 400)
+        window.resize(2600, 400)
         small = window._font_point_size()
-        window.resize(800, 1200)
+        window.resize(2600, 1200)
         self.assertGreater(window._font_point_size(), small)
 
     def test_auto_font_size_has_a_floor(self):

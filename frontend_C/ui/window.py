@@ -67,8 +67,27 @@ CYCLE_MS = 7000
 #: 状态切换时的淡入时长（毫秒）
 FADE_MS = 180
 
-#: 通道名 → 中文。BackendLink 传的是 "chat"/"status"，直接显示不好读。
-LINK_LABELS = {"chat": "对话通道", "status": "状态通道"}
+#: 通道名 → 中文。BackendLink 传的是 "chat"/"status"；"stream" 是画面通道
+#: （A 侧 MJPEG，步骤② 才真的连上，但标签先在这里定好，
+#: 免得 ``link_label`` 把它原样打成一行英文）。
+#: ⚠️ ``c_core/display_text.py`` 里有一张**并行的**表（右栏文本块用），
+#: 加新通道时两边都要加 —— 两张表的键必须一致。
+LINK_LABELS = {"chat": "对话通道", "status": "状态通道", "stream": "画面通道"}
+
+#: 颜文字左右两侧留出的空白（像素）。字号会被钳到"最宽的颜文字 + 这些留白
+#: 刚好塞得进栏宽"为止。
+#:
+#: 为什么原来没有这一项：单脸窗口的宽度总是远大于高度，按高度取的字号横向够用。
+#: 左右分栏之后左栏只剩一半宽，最长的那几个颜文字（``(∪.∪ )...zzz``）
+#: 就会**横向顶出栏外**被右栏盖住 —— 而且只在个别表情上出现、切换时一闪而过，
+#: 很容易被当成"偶尔的花屏"。
+#:
+#: ⚠️ 这里**不写"字号 ÷ 系数"那种经验值**。我先试过 ``width / 7.0``，实测是错的：
+#: 96pt 下那个最宽的颜文字要 1035px，也就是每磅约 10.8px（字体自己的宽度是
+#: 程序的常量猜不准的东西 —— 它随字体、全角字形数量、DPI 缩放一起变）。
+#: 所以改成 :meth:`FaceWindow._largest_fitting_point_size` 用 ``QFontMetrics``
+#: 真量一次再按比例缩放。换了字体也不用回来改这个数。
+EDGE_MARGIN = 16
 
 
 def link_label(source: str) -> str:
@@ -132,6 +151,21 @@ class StateBridge(QObject):
     linkChanged = pyqtSignal(str, bool)     # 通道名, 是否已连接
     replyArrived = pyqtSignal(str)          # 机器人回复文本（仅记日志用）
     proactiveArrived = pyqtSignal(str)      # 主动关怀文本（仅记日志用）
+
+    #: 状态 + 判定原因。**与上面的 stateChanged 并存，不是替代它。**
+    #:
+    #: 脸只需要状态（四态表决定表情），右栏的文本块却想显示"为什么"
+    #: （「状态 疲惫（连续打哈欠 3 次）」）。让 stateChanged 多带一个参数
+    #: 会改掉 ``FaceWindow.set_state`` 的签名 —— 那是本模块对外的公开接口，
+    #: 而且它已经有一批用例按单参数在用。所以另开一条带原因的信号给右栏，
+    #: 两条互不干扰。
+    stateReasonChanged = pyqtSignal(str, str)   # 状态, 原因
+
+    #: 专注度展示报文（B→C，api_doc §5.6）。**payload 是整个报文 dict。**
+    #: 用 ``object`` 而不是 ``dict`` 作参数类型：PyQt5 的 ``pyqtSignal(dict)``
+    #: 在跨线程排队时要把 dict 转成 QVariant，边界情况（None、嵌套）容易出岔子；
+    #: ``object`` 是原样投递引用，而 dict 本身在 emit 之后不再被线程写。
+    vaiArrived = pyqtSignal(object)
 
 
 class FaceWindow(QWidget):
@@ -283,12 +317,52 @@ class FaceWindow(QWidget):
         """算出字号。
 
         颜文字的「视觉大小」取决于窗口高度而不是宽度，所以按高度取比例。
-        0.16 是实测试出来的：全屏 1080p 下约 170pt，三四米外也看得清，
-        且最长的那几个（``(∪.∪ )...zzz``）不会顶到边缘。
+        0.16 是实测试出来的：全屏 1080p 下约 170pt，三四米外也看得清。
+
+        **宽度那一项是左右分栏之后加的**（原来只按高度）：分栏把这张脸挤到
+        半宽，宽表情就会横向溢出。两者取小 —— 只要栏够宽，尺寸还是由高度
+        决定，即分栏对排版的影响仅限"窄到会溢出时"。
+
+        ``--font-size`` 显式指定时**不做任何钳制**：那是用户的明确要求，
+        溢出是他的选择（也免得调参时被这里悄悄改回去）。
         """
         if self._fixed_font_size:
             return self._fixed_font_size
-        return max(24, int(self.height() * 0.16))
+        by_height = int(self.height() * 0.16)
+        by_width = self._largest_fitting_point_size()
+        if by_width is None:             # 量不出宽度就别钳制
+            return max(24, by_height)
+        return max(24, min(by_height, by_width))
+
+    def _largest_fitting_point_size(self) -> Optional[int]:
+        """用**字体实际度量**算出"最宽的颜文字 + 两侧留白刚好放得下"的字号。
+
+        量不出来时返回 ``None``（**不是**某个猜测值）：字体库为空的平台上
+        度量全是 0，那时钳制只会平白把字号按一个假上限压住，而画出来的
+        本来就是空白。
+
+        为什么要真量：字体的宽度是程序的常量猜不准的东西（见
+        :data:`EDGE_MARGIN` 里记的那次实测 —— 手调的 ``width / 7.0``
+        在真机上偏大了一半）。这里在 100pt 上量一次再按比例缩放 ——
+        字形宽度与字号成正比，所以一次测量就够，不用二分。
+
+        取的是 ``all_faces()``（四态全部，含眨眼帧）里最宽的那个：
+        脸会在同状态的几个表情之间轮换、也会跟着状态换组，只要有一个放不下，
+        它就会在某个时刻溢出。32 个短字符串量一遍是微秒级的事，而本方法
+        只在重绘时调用（状态切换 / 眨眼时，每秒几次），不值得为它做缓存。
+
+        **按字符数挑"最宽的"是不行的**：全角字符的宽度是半角的两倍，
+        ``(￣o￣) zzZ``（9 个字符）就比某些 11 个字符的还宽。所以老老实实量。
+        """
+        available = self.width() - 2 * EDGE_MARGIN
+        if available <= 0:
+            return None
+        probe = 100                      # 探测字号：宽度与字号成正比，量一次即可
+        metrics = QFontMetrics(build_font(self._family, probe))
+        needed = max(metrics.horizontalAdvance(face) for face in all_faces())
+        if needed <= 0:
+            return None
+        return int(probe * available / needed)
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)

@@ -5,6 +5,7 @@
     python -m module_a_vision.main --source camera          # 真实摄像头
     python -m module_a_vision.main --source video --video a.mp4
     python -m module_a_vision.main --source csv --csv export.csv
+    python -m module_a_vision.main --source synthetic-pixels --stream   # 展示流演示
     python -m module_a_vision.main --dry-run                # 不起服务，只打印报文
     python -m module_a_vision.main --emit v2                # 换成原生的 10 秒窗口
 
@@ -17,6 +18,17 @@
 
 * ``v1`` —— api_doc §3.2 的逐帧平铺 8 字段，团队仓库里 ``backend_B`` 认的格式。
 * ``v2`` —— 原生的 10 秒嵌套 :class:`WindowState`。
+
+``--stream`` 开一条给前端右栏看的展示流（**默认关**）
+----------------------------------------------------
+
+它是「像素不出模块 A」那条红线**唯一的窄例外**，边界写在
+:mod:`module_a_vision.stream` 的模块文档里：只绑 ``127.0.0.1``、不落盘、
+不做 HTML 首页、用完即毁。**默认关**：不给 ``--stream`` 时 8010 上没有
+任何监听，这是"默认关"唯一有意义的验证方式。
+
+本机没有摄像头，所以演示时要配 ``--source synthetic-pixels`` —— 它是唯一
+一个"像素与特征同源同帧"的源（见 ``capture/synthetic.py``）。
 """
 
 from __future__ import annotations
@@ -37,6 +49,7 @@ from .server import (
     build_server,
     describe_hints,
 )
+from .stream import DEFAULT_STREAM_PORT, BIND_HOST, FrameHub, MjpegStreamServer, StreamError
 from .wire import (
     check_contract,
     describe_typed,
@@ -72,8 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--source",
         default="synthetic",
-        choices=("synthetic", "camera", "video", "csv"),
-        help="采集源种类（默认合成源，本机无摄像头时的主路径）",
+        choices=("synthetic", "synthetic-pixels", "camera", "video", "csv"),
+        help=(
+            "采集源种类（默认合成源，本机无摄像头时的主路径）。"
+            "synthetic-pixels 与 synthetic 同剧本，额外给一路玩具像素，"
+            "给 --stream 的展示流用"
+        ),
     )
     p.add_argument("--scenario", default="normal", help="合成剧本名（--source synthetic）")
     p.add_argument("--video", default=None, help="视频文件路径（--source video）")
@@ -148,6 +165,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--stream",
+        action="store_true",
+        help=(
+            "开一条展示用的 MJPEG 流给前端右栏看（**默认关**）。"
+            "只绑 127.0.0.1、不落盘、不做 HTML 首页；"
+            "这是「像素不出模块 A」唯一的窄例外，边界见 module_a_vision/stream.py"
+        ),
+    )
+    p.add_argument(
+        "--stream-port",
+        type=int,
+        default=DEFAULT_STREAM_PORT,
+        help=(
+            f"展示流端口（默认 {DEFAULT_STREAM_PORT}，刻意避开给 B 预留的 8020）。"
+            f"监听地址**固定 {BIND_HOST}，不提供覆盖** —— 让例外无法被命令行放宽"
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="不起 TCP 服务，只把窗口打到标准输出（用于验证数据契约）",
@@ -166,6 +201,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_scenarios:
         return _list_scenarios()
+
+    # 展示流的帧缓存。**--dry-run 时根本不需要**（不起服务、也没有像素
+    # 经手），所以这里就不建。给了 --stream 也不代表它会起来 —— 源若没有
+    # 像素，下面会打印一行说明并跳过（见 _open_stream）。
+    hub = FrameHub() if (args.stream and not args.dry_run) else None
 
     try:
         server = build_server(
@@ -188,16 +228,21 @@ def main(argv: list[str] | None = None) -> int:
             emit_mode=args.emit,
             vitals=args.vitals,
             focus=args.focus,
+            stream=hub,
         )
     except (ValueError, RuntimeError, ImportError) as exc:
         print(f"[A] 启动失败：{exc}", file=sys.stderr)
         return 2
 
+    stream_server = None
     try:
         if args.dry_run:
+            if args.stream:
+                print("[A] --dry-run 不起任何服务，展示流已忽略")
             return _dry_run(server, every=max(1, args.every))
 
         server.serve()
+        stream_server = _open_stream(hub, args.stream_port, server)
         server.run()
     except KeyboardInterrupt:
         print("\n[A] 收到中断信号，正在收摊……")
@@ -213,9 +258,49 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     finally:
         server.stop()
+        if stream_server is not None:
+            stream_server.stop()
 
     print(f"[A] 已退出（{_summarize_sent(server)}）")
     return 0
+
+
+def _open_stream(hub, port: int, server: VisionServer):
+    """需要时把展示流起起来，返回服务对象；不起就返回 ``None``。
+
+    三种"不起"各自的理由不同，打印的话也不同：
+
+    * ``hub is None`` —— 没给 ``--stream``。沉默是对的。
+    * 源没有像素 —— 起了也没有画面可发。**宁可没有监听**，也不要让前端
+      连上一个永远不出一帧的地址（那边会显示"已连接、等待第一帧"，
+      看起来像 A 卡住了）。
+    * 端口绑不上 / 没装 opencv —— 打印提示后继续。**视觉主链路不因此失败**：
+      把"能不能看到画面"做成"状态判定能不能跑"的前提，是反过来的取舍。
+    """
+    if hub is None:
+        return None
+
+    if not is_frame_source(server.source):
+        print(
+            f"[A] ⚠ 当前采集源（{_describe(server.source)}）没有像素，"
+            f"展示流不会有画面，未启动；要看画面请用 "
+            f"--source synthetic-pixels / camera / video"
+        )
+        return None
+
+    stream_server = MjpegStreamServer(hub, port=port)
+    try:
+        stream_server.start()
+    except StreamError as exc:
+        print(f"[A] ⚠ 展示流未启动：{exc}")
+        return None
+    except OSError as exc:
+        print(
+            f"[A] ⚠ 展示流未启动（{BIND_HOST}:{port} 绑不上）：{exc}\n"
+            f"    视觉主链路不受影响；端口被占用时用 --stream-port 换一个"
+        )
+        return None
+    return stream_server
 
 
 def _summarize_sent(server: VisionServer) -> str:
@@ -245,8 +330,19 @@ def _summarize_sent(server: VisionServer) -> str:
                 f"\n[A] ⚠ 视线报文数与帧报文数不一致 —— 有帧没走到视线通道，"
                 f"B 的专注度指数不会出来"
             )
-        return line
-    return f"共推送 {server.stats['windows']} 个窗口"
+        return line + _summarize_stream(server)
+    return f"共推送 {server.stats['windows']} 个窗口" + _summarize_stream(server)
+
+
+def _summarize_stream(server: VisionServer) -> str:
+    """展示流那一行收尾摘要。**清零的帧数是"用完即毁"唯一的现场证据**：
+    它平时只在代码里写着，只有这个数字能证明那条路径真的跑过。"""
+    if server.stream is None:
+        return ""
+    return (
+        f"\n[A] 展示流：就地清零 {server.stats['frames_scrubbed']} 帧"
+        f"（清不掉 {server.stats['scrub_skipped']} 帧）"
+    )
 
 
 # ================================================================ 子模式

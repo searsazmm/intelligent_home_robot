@@ -9,15 +9,21 @@
    │  模块 A        │ ────────► │   模块 B       │ ─────► │   模块 C       │
    │  视觉感知      │  JSON     │   交互决策     │ 状态串 │   前端界面     │
    │  摄像头+MediaPipe│          │   核心交互     │ ◄───── │   PyQt5       │
-   └───────────────┘           └───────────────┘  8002  └───────────────┘
-                                  A→B 是 B 去连 A      JSON    纯黑底 + 白色颜文字
+   └───────┬───────┘           └───────────────┘  8002  └───────▲───────┘
+           │                        A→B 是 B 去连 A      JSON    │  左表情 / 右画面+识别结果
+           └────────── 8010 HTTP：MJPEG 展示流（默认关，仅回环）────┘
 ```
 
 | 模块 | 做什么 | 端口 | 详细文档 |
 | ---- | ------ | ---- | -------- |
-| **backend_A** 视觉感知 | 摄像头采集 + MediaPipe 人脸状态识别，判断眼神呆滞 / 情绪低落，实时发特征给 B | 8000 服务端 | [backend_A/README.md](backend_A/README.md) |
+| **backend_A** 视觉感知 | 摄像头采集 + MediaPipe 人脸状态识别，判断眼神呆滞 / 情绪低落，实时发特征给 B | 8000 服务端<br>8010 服务端（可选） | [backend_A/README.md](backend_A/README.md) |
 | **backend_B** 交互决策 | 接收视觉状态、麦克风语音识别、决策（主动关心 / 日常问候 / 正常应答）、语音合成、驱动前端表情 | 8000 客户端<br>8001 / 8002 服务端 | [backend_B/README.md](backend_B/README.md) |
-| **frontend_C** 前端界面 | 纯黑背景窗口 + 白色颜文字表情，按 B 的指令动态切换 | 8002 客户端 | [frontend_C/README.md](frontend_C/README.md) |
+| **frontend_C** 前端界面 | 纯黑背景窗口，**左右对半分**：左栏白色颜文字表情（按 B 的指令切换），右栏摄像头画面 + 识别结果（状态文字、专注度 VAI） | 8002 客户端<br>8010 客户端（可选） | [frontend_C/README.md](frontend_C/README.md) |
+
+⚠️ 最后那条 **8010** 是「A 与 C 无直接通信」的**唯一例外**：默认关闭、
+**只能绑 `127.0.0.1`**（地址不可配置）、不落盘、不承载任何协议字段，
+且 C 对它**零依赖**（不给地址就显示占位框）。规格见 api_doc §3.6，
+**必须与 api_doc §1 成对阅读** —— 状态、专注度、对话一如既往只走 B。
 
 接口规范（**改端口和字段前必读**）：[api_doc.md](api_doc.md)。
 四个人机状态的取值固定为 `normal` / `sad` / `tired` / `absent`（api_doc §4.2，禁止自造）。
@@ -42,13 +48,26 @@ cd frontend_C && python main.py
 顺序反了也不会坏：B 会指数退避重连 A（1s→10s 封顶，永不放弃），
 C 也会自己重连 B，重连期间照常显示 `normal` 表情。
 
+**右栏的画面默认不拉**（不给 `--stream-url` 就只有文字与占位框）。要开：
+
+```bash
+# 终端 1：A 加上展示流。没摄像头时用 synthetic-pixels（玩具像素，见 backend_A/README §11.3）
+cd backend_A && python main.py --scenario drowsy --source synthetic-pixels --stream
+
+# 终端 3：C 加上 --stream-url
+cd frontend_C && python main.py --stream-url http://127.0.0.1:8010/stream.mjpeg
+```
+
 ### 常用参数
 
 ```bash
 cd backend_A && python main.py --list-scenarios    # 看有哪些合成剧本
 cd backend_A && python main.py --source camera     # 用真实摄像头
+cd backend_A && python main.py --source camera --stream   # 真像素 + 展示流
 cd frontend_C && python main.py --fullscreen       # 全屏无边框（答辩用，ESC 退出）
+cd frontend_C && python main.py --no-camera        # 退回单脸窗口（不分栏）
 cd frontend_C && python main.py --dump-glyphs      # 字形自检：看不到方块即为正常
+curl -s http://127.0.0.1:8010/healthz              # 展示流的一行统计
 ```
 
 ---
@@ -115,18 +134,18 @@ pip install -r backend_B/requirements-voice.txt   # 可选：语音（不装也�
 ## 测试
 
 ```bash
-python -m pytest              # 仓库根跑全部三个模块：456 passed, 7 skipped
+python -m pytest              # 仓库根跑全部三个模块：1002 passed, 8 skipped
 ```
 
 分模块跑：
 
 ```bash
-cd backend_A && python -m unittest discover -s tests   # 40 个（标准库 unittest）
-cd backend_B && python -m pytest tests/                # 340 个
-cd frontend_C && python -m pytest tests/               # 76 个
+cd backend_A && python -m unittest discover -s tests   # 136 个（标准库 unittest）
+cd backend_B && python -m pytest tests/                # 668 个
+cd frontend_C && python -m pytest tests/               # 206 个（离屏下其中 8 个字体用例跳过）
 ```
 
-### 关于那 7 个 skipped
+### 关于那 8 个 skipped
 
 它们全是前端窗口测试里的**字形断言**，跳过原因是**离屏平台的字体库是空的**
 （`QFontDatabase().families()` 返回 0 个字体族，Qt 在该平台一个字都画不出来）。
@@ -135,7 +154,7 @@ cd frontend_C && python -m pytest tests/               # 76 个
 所以那些用例宁可**跳过并说明原因**，也不假装通过。想看它们真的执行：
 
 ```bash
-QT_QPA_PLATFORM=windows python -m pytest        # 463 passed, 0 skipped
+QT_QPA_PLATFORM=windows python -m pytest        # 1010 passed, 0 skipped
 ```
 
 **答辩前建议在演示机上跑这一条** —— 它才是能发现「字体选错导致满屏豆腐块」
@@ -197,20 +216,33 @@ QT_QPA_PLATFORM=windows python -m pytest        # 463 passed, 0 skipped
   **没有豆腐块**；字体正确解析到 `Microsoft YaHei UI`
   （网上常见的写法 `Microsoft YaHei` 在本机不存在，会静默回退）。
   另有一条单元测试用"缺字样板"逐字比对渲染结果，把这件事钉住。
+- **右栏画面链路（A 的 8010 展示流 → C）**：A 用 `--source synthetic-pixels --stream`
+  起流，C 用 `--stream-url` 拉，**4 秒内画上 40 帧、0 次解码失败**，
+  抓到的窗口图里有 A 烧进画面的绿框；`curl` 能取到含 `--frame` 与
+  `Content-Type: image/jpeg` 的分区，`/healthz` 返 200。
+  **杀掉 A** → 右栏切「画面未接入（未连接，正在重连）」、四态循环照跑、无 traceback；
+  **重启 A** → 退避 3s→4s→6s→9s 后自己连回来，**不用重启 C**。
+  默认关与只绑回环都用 `netstat` 核实过（不加 `--stream` 时 8010 查无监听；
+  监听地址是 `127.0.0.1:8010` 而非 `0.0.0.0:8010`）。
+  ⚠️ 这一趟用的**不是真摄像头**，是玩具像素（见下面「没有验证」）。
 - **语音识别链路跑通（用合成语音）**：本机装了 vosk 0.3.45 +
   `vosk-model-small-cn-0.22`，喂进去的中文语音 → 16kHz PCM → vosk → 文本，
   三句话全部识别正确。
   ⚠️ 模型必须放在**不含中文的路径**下（本仓库路径含中文，vosk 加载不了），
   本机放在 `%LOCALAPPDATA%\vosk\`；详见
   [backend_B/README.md §4.8](backend_B/README.md)。
-- 全部 456 个测试通过（真机平台 463 个，0 跳过）。
-  这里跳过的 7 个都是 frontend_C 的字体测试：offscreen 平台渲染不出任何字形，
+- 全部 1002 个测试通过（真机平台 1010 个，0 跳过）。
+  这里跳过的 8 个都是 frontend_C 的字体测试：offscreen 平台渲染不出任何字形，
   它们会自己跳过（`QT_QPA_PLATFORM=windows` 下正常运行）。
 
 **没有验证（需要你在真机上看一眼）：**
 
 - **摄像头 + MediaPipe 真实采集**：本机跑的是合成源与离线 CSV，
   真实摄像头这条路没有验过。
+  **右栏画面也一样**：展示流的验收全程用的是 `--source synthetic-pixels`
+  的**玩具像素**（像素→JPEG→HTTP→C 解码上屏这条链子通了，但那张图不是人脸、
+  绿框也是画上去的）。真机上看一眼：`A --source camera --stream` +
+  `C --stream-url …`，确认人脸占比、绿框贴合、叠加层字号可读。
 - **真人对着麦克风说话**：语音识别只用 SAPI 合成的语音验证过，
   真人说话的口音、语速、环境噪声都还没试。想看这一条行不行：
   `cd backend_B && python main.py --voice`，对麦克风说一句，

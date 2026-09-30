@@ -49,6 +49,7 @@ class BackendLink:
 
     回调（全部在 socket 线程里执行，上层负责切回 GUI 线程）：
         on_state(state, reason, source)  状态变化时调用；断开时也会调用（回落 normal）
+        on_vai(msg)                      收到 B 的专注度展示报文（api_doc §5.6）
         on_reply(msg)                    收到 B 的对话回复报文
         on_proactive(msg)                收到 B 的主动关怀报文（api_doc §5 V1.2）
         on_link(source, connected)       连接建立/断开时调用，供界面显示
@@ -60,6 +61,7 @@ class BackendLink:
         chat_port: int = 8002,
         status_port: Optional[int] = None,
         on_state: Optional[Callable[[str, str, str], None]] = None,
+        on_vai: Optional[Callable[[dict], None]] = None,
         on_reply: Optional[Callable[[dict], None]] = None,
         on_proactive: Optional[Callable[[dict], None]] = None,
         on_link: Optional[Callable[[str, bool], None]] = None,
@@ -72,6 +74,7 @@ class BackendLink:
         self.status_port = status_port  # None 表示不连 8001
 
         self._on_state = on_state or _noop
+        self._on_vai = on_vai or _noop
         self._on_reply = on_reply or _noop
         self._on_proactive = on_proactive or _noop
         self._on_link = on_link or _noop
@@ -178,6 +181,11 @@ class BackendLink:
                 str(msg.get("reason") or ""),
                 SOURCE_CHAT,
             )
+        elif msg_type == "vai":
+            # 专注度展示报文（api_doc §5.6）。**只派发、不改状态** ——
+            # 它刻意不带 state 字段，就是不让它变成第二个状态源。
+            # 去重由 B 侧做（变了才发 + 心跳），这里收到几条就报几条。
+            self._on_vai(msg)
         elif msg_type == "reply":
             self._on_reply(msg)
         elif msg_type == "proactive":
