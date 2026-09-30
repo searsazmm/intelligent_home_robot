@@ -108,7 +108,10 @@ class BackendB:
         # 构造里可能有一次探针请求（probe），所以放在最前面，好让启动日志
         # 的顺序和用户读日志的顺序一致。
         self.chatter = build_chatter(args.llm, probe=args.llm_probe)
-        self.dialogue = DialogueEngine(history=self.history, llm=self.chatter)
+        self.dialogue = DialogueEngine(
+            history=self.history, llm=self.chatter,
+            care_interval=self._care_interval(),
+        )
 
         self.status_server = StatusBroadcaster(
             host=args.status_host, port=args.status_port
@@ -181,6 +184,25 @@ class BackendB:
         if not self.args.offline or self.args.speed <= 0:
             return seconds
         return seconds / max(0.01, self.args.speed)
+
+    def _care_interval(self) -> float:
+        """「应答里追加关怀」的最小间隔（墙钟秒）。
+
+        默认 180 秒。两条演示路径都要压短，否则这个功能在演示里看不见：
+
+        - ``--demo``：主动关怀被压到 20 秒一次，而这个还是 180 秒，
+          一段几分钟的演示根本等不到第二次追加。用 config §10 的预设值。
+        - ``--offline --speed N``：数据时间跑得比墙钟快。追加关怀读的是
+          ``time.monotonic()``（墙钟），不缩放的话 5 倍速下就变成
+          "每 900 数据秒才追一次"，和另外那些缩放过的阈值完全脱节。
+
+        两条同时成立（``--demo --speed 5``）时：先用 demo 那个值再缩放，
+        即 20/5 = 4 秒。顺序反过来的话结果是 180/5 = 36 秒 —— 演示里照样
+        看不见，所以 demo 必须**先**替换再缩放。
+        """
+        interval = (config.CARE_DEMO_FOLLOWUP_INTERVAL if self.args.demo
+                    else config.CARE_FOLLOWUP_INTERVAL)
+        return self._scale_for_speed(interval)
 
     def _build_proactive_policy(self) -> proactive_lib.ProactivePolicy:
         """按运行模式挑一组阈值。
@@ -423,6 +445,28 @@ class BackendB:
         if self.speaker is not None and text:
             self.speaker.say(text)
 
+    def _say_all(self, reply: DialogueReply) -> None:
+        """把一条回复的全部内容念出来：回复一段，追加的关怀一段。
+
+        走 ``say_all`` 而不是连着两次 ``_say``，是为了让两段落在**同一个**
+        忙碌窗口里 —— 中间那道缝里半双工静音是开的，机器人会去听自己。
+        见 :meth:`Speaker.say_all`。
+
+        属性用 ``isinstance`` 卡死而不是 ``getattr(..., "")``：这里的
+        ``reply`` 都来自 :meth:`handle_chat`，类型是确定的，但把这个读法
+        和 :meth:`VoiceLoop._speak_reply` 保持一致，将来谁把 Mock 传进来
+        都不会多念一段。
+        """
+        if self.speaker is None:
+            return
+        parts = []
+        for attr in ("reply", "follow_up"):
+            value = getattr(reply, attr, None)
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+        if parts:
+            self.speaker.say_all(parts)
+
     # ==================================================================
     # 启动 / 停止
     # ==================================================================
@@ -621,7 +665,9 @@ class BackendB:
         )
 
         logger.info("用户：%s", text)
-        logger.info("机器人：%s  [%s]", reply.reply, reply.reason)
+        logger.info("机器人：%s%s  [%s]", reply.reply,
+                    f"  [+关怀：{reply.follow_up}]" if reply.follow_up else "",
+                    reply.reason)
 
         # 落盘历史（任务要求 4 的另一半：写进去，之后才读得出来）
         if self.history is not None:
@@ -634,8 +680,32 @@ class BackendB:
                     emotion_score=reply.emotion_score,
                     intent=reply.intent,
                 )
+                # 追加的关怀**另起一行**，绝不和回复拼成一行。
+                #
+                # history_store.last_robot_replies() 返回的是整行原文，
+                # 而 dialogue.py 里三处"避开最近说过的"去重全是**精确相等**
+                # 判断。拼成一行的话，那句关怀永远不等于一句干净的
+                # PROACTIVE_TEMPLATES 文案 —— 于是它永远进不了去重，
+                # 而每个 kind 只有 4 句，隔几轮必然重播；
+                # 连主回复的去重也被一起废掉。
+                if reply.follow_up:
+                    self.history.append_record(TurnRecord(
+                        session_id=self.history.session_id,
+                        role="robot",
+                        text=reply.follow_up,
+                        vision_state=reply.state,
+                        # 写 kind 而不是 intent：主动开口那一行写的也是 kind
+                        # （见 _fire_proactive），两处一致，CSV 里才分得出
+                        # 哪几行是关怀。写 intent（= chat）的话分不出来。
+                        intent=reply.care_kind or reply.intent,
+                    ))
             except OSError:
                 logger.exception("写入历史记录失败（不影响本次回复）")
+
+        # 追加了关怀就通知主动关怀调度器：推 min_interval 那道门，避免
+        # t=60 时主动关怀又把同一句话说一遍。**不占**每小时配额。
+        if reply.follow_up:
+            self.proactive.note_care()
 
         # 对话结论比纯视觉更准，限时覆盖一下，避免前端状态和对话内容对不上。
         # 走 _publish_state 而不是直接 publish：C 端要**立刻**看到这次覆盖，
@@ -694,8 +764,10 @@ class BackendB:
                 self._stop.set()
                 break
             reply = self.handle_chat(line)
-            print(f"  → {reply.reply}   [状态={reply.state} 意图={reply.intent}]\n")
-            self._say(reply.reply)
+            follow = f"\n  + {reply.follow_up}" if reply.follow_up else ""
+            print(f"  → {reply.reply}{follow}   "
+                  f"[状态={reply.state} 意图={reply.intent}]\n")
+            self._say_all(reply)
 
     # ==================================================================
     # 杂项

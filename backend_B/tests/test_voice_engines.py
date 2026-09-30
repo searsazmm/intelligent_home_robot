@@ -864,6 +864,58 @@ class TestSpeaker(unittest.TestCase):
         self.speaker.say("你好")
         self.assertEqual(self.busy_log, [True, False])
 
+    def test_say_all_speaks_every_part_in_order(self):
+        self.assertTrue(self.speaker.say_all(["嗯嗯，然后呢？", "您先歇会儿吧。"]))
+        self.assertEqual([c[0] for c in self.synth.calls],
+                         ["嗯嗯，然后呢？", "您先歇会儿吧。"])
+        self.assertEqual(len(self.player.played), 2)
+
+    def test_say_all_opens_exactly_one_busy_window(self):
+        """⚠️ 两段话必须在**同一个**忙碌窗口里。
+
+        连着调两次 ``say()`` 会各开一次窗口，中间那一瞬间半双工静音是
+        **开**的 —— 机器人会在这道缝里听见自己（甚至是老人插的一句话），
+        而主动关怀的 speaking 门禁也在这时候放行，于是抢自己的话。
+        """
+        self.speaker.say_all(["第一段", "第二段"])
+        self.assertEqual(self.busy_log, [True, False],
+                         "两段之间多开了一个忙碌窗口")
+        self.assertFalse(self.speaker.busy)
+
+    def test_say_all_skips_empty_parts(self):
+        """``follow_up`` 为空是常态，不能因此多合成一次空串。"""
+        self.assertTrue(self.speaker.say_all(["我听着呢", ""]))
+        self.assertEqual([c[0] for c in self.synth.calls], ["我听着呢"])
+
+    def test_say_all_of_nothing_is_a_no_op(self):
+        self.assertFalse(self.speaker.say_all([]))
+        self.assertFalse(self.speaker.say_all(["", "   "]))
+        self.assertFalse(self.speaker.say_all(None))
+        self.assertEqual(self.synth.calls, [])
+        self.assertEqual(self.busy_log, [])
+
+    def test_say_all_last_text_is_the_whole_utterance(self):
+        """``last_text`` 必须是整段。
+
+        只留最后一段的话，回声去重就认不出第一段的回声了 ——
+        第二段播完的瞬间，环境里还飘着第一段的声音。
+        """
+        self.speaker.say_all(["嗯嗯，然后呢？", "您先歇会儿吧。"])
+        self.assertIn("嗯嗯，然后呢？", self.speaker.last_text)
+        self.assertIn("您先歇会儿吧。", self.speaker.last_text)
+
+    def test_say_all_clears_busy_when_a_part_fails(self):
+        """中间一段合成失败不影响后面几段，忙碌标记照样要清掉。"""
+        synth = FakeSynthesizer(succeed=False)
+        speaker = Speaker(synthesizer=synth, player=self.player,
+                          on_busy_change=self.busy_log.append)
+        try:
+            self.assertFalse(speaker.say_all(["第一段", "第二段"]))
+            self.assertEqual(self.busy_log, [True, False])
+            self.assertFalse(speaker.busy)
+        finally:
+            speaker.close()
+
     def test_busy_flag_clears_even_when_synthesis_fails(self):
         """合成失败也必须把 busy 清掉，否则机器人会永远"以为自己正在说话"，
         主动关怀再也不会触发。"""
@@ -1415,6 +1467,23 @@ class TestEchoSuppression(unittest.TestCase):
         other = "二三"
         self.assertFalse(looks_like_echo(text, other, threshold=0.9))
 
+    def test_multi_part_last_text_is_compared_part_by_part(self):
+        """``last_text`` 是"回复 + 追加关怀"两段拼的，要按段比。
+
+        拿整段去比会把每一段都稀释：一段 15 字、一段 20 字拼成 36 字，
+        只回声了前一段时相似度只有 2×15/(15+36)≈0.59 —— **刚好掉到
+        0.6 的门槛以下**，于是回声没被认出来，机器人对着自己的话再答一轮。
+        """
+        reply = "嗯嗯，今天天气不错——然后呢？"
+        care = "我看您眼皮都沉了，先歇会儿吧。"
+        combined = " ".join([reply, care])
+
+        self.assertTrue(looks_like_echo(reply, combined),
+                        "只回声了回复那一段，没认出来")
+        self.assertTrue(looks_like_echo(care, combined),
+                        "只回声了关怀那一段，没认出来")
+        self.assertFalse(looks_like_echo("我今天有点累", combined))
+
 
 class TestMeaningfulFilter(unittest.TestCase):
 
@@ -1539,6 +1608,67 @@ class TestVoiceLoop(unittest.TestCase):
                                            reason="silence"))
         self.assertEqual(synth.calls[0][0], "您先歇一会")
         self.assertEqual(len(player.played), 1)
+
+    def test_mock_reply_does_not_trigger_an_extra_utterance(self):
+        """⚠️ ``mock.Mock`` 会自动造属性，``getattr(..., "")`` 挡不住它。
+
+        ``on_text`` 的类型契约是 ``object``，上面那些用例传的就是
+        ``mock.Mock(reply="…")``。读 ``follow_up`` 时拿到的是一个**新造的
+        Mock 对象**，真拿它去合成就会多播一段、``len(player.played) == 1``
+        立刻挂掉。所以必须 ``isinstance(x, str)`` 卡死。
+        """
+        synth, player = FakeSynthesizer(), FakePlayer()
+        speaker = Speaker(synthesizer=synth, player=player)
+        loop = VoiceLoop(
+            on_text=lambda text: mock.Mock(reply="您先歇一会"),
+            speaker=speaker,
+            recognizer=FakeRecognizer("我有点累"),
+            recorder=None,
+        )
+        from core.voice.vad import SpeechSegment
+
+        loop._handle_segment(SpeechSegment(pcm=b"\x00" * 100, sample_rate=16000,
+                                           reason="silence"))
+        self.assertEqual(len(synth.calls), 1)
+        self.assertEqual(len(player.played), 1)
+
+    def test_follow_up_is_spoken_after_the_reply(self):
+        """回复 + 追加关怀要**按顺序**念出来。"""
+        synth, player = FakeSynthesizer(), FakePlayer()
+        speaker = Speaker(synthesizer=synth, player=player)
+        reply = mock.Mock(reply="嗯嗯，今天天气不错——然后呢？")
+        reply.follow_up = "我看您眼皮都沉了，先歇会儿吧。"     # 真实 str
+        loop = VoiceLoop(
+            on_text=lambda text: reply,
+            speaker=speaker,
+            recognizer=FakeRecognizer("今天天气不错"),
+            recorder=None,
+        )
+        from core.voice.vad import SpeechSegment
+
+        loop._handle_segment(SpeechSegment(pcm=b"\x00" * 100, sample_rate=16000,
+                                           reason="silence"))
+        self.assertEqual([c[0] for c in synth.calls],
+                         ["嗯嗯，今天天气不错——然后呢？",
+                          "我看您眼皮都沉了，先歇会儿吧。"])
+
+    def test_empty_follow_up_is_skipped(self):
+        """``follow_up`` 为空是常态，不能因此多合成一次空串。"""
+        synth, player = FakeSynthesizer(), FakePlayer()
+        speaker = Speaker(synthesizer=synth, player=player)
+        reply = mock.Mock(reply="我听着呢")
+        reply.follow_up = ""
+        loop = VoiceLoop(
+            on_text=lambda text: reply,
+            speaker=speaker,
+            recognizer=FakeRecognizer("我有点累"),
+            recorder=None,
+        )
+        from core.voice.vad import SpeechSegment
+
+        loop._handle_segment(SpeechSegment(pcm=b"\x00" * 100, sample_rate=16000,
+                                           reason="silence"))
+        self.assertEqual(len(synth.calls), 1)
 
     def test_callback_exception_does_not_kill_the_loop(self):
         """对话逻辑抛异常时录/识别的循环要继续。

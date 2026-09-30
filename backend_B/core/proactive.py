@@ -239,6 +239,25 @@ class ProactiveScheduler:
         self._last_proactive_at = moment
         self._proactive_times.append(moment)
 
+    def note_care(self, now: Optional[float] = None) -> None:
+        """记一次「应答里追加了一句关怀」。
+
+        和 :meth:`note_proactive` **刻意不一样**：这里只推 ``last_proactive_at``
+        （也就是 ``min_interval`` 那道"别刚说完又开口"的门），
+        **不往 ``_proactive_times`` 里记**，所以不占 ``max_per_hour``
+        那每小时 4 次的名额。
+
+        为什么必须调：不推的话会撞车 —— t=0 的应答里追加一句 care_sad，
+        ``user_cooldown`` 60 秒一过，主动关怀在 t=60 又来说同一句 care_sad。
+        两句话隔一分钟说两遍，比不说更像个坏掉的复读机。
+
+        为什么不占配额：这是**两笔预算**。``max_per_hour`` 管的是"机器人
+        主动抢话头"，那是越少越好的东西；应答里附带的一句是跟着用户的话
+        走的，用户自己开的口，不该因此少掉一次真正的主动关怀。
+        """
+        moment = self._clock() if now is None else now
+        self._last_proactive_at = moment
+
     @property
     def last_proactive_at(self) -> float:
         return self._last_proactive_at

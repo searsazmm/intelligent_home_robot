@@ -135,6 +135,13 @@ class ChatClient:
         if msg_type == "reply":
             emotion = msg.get("emotion") or {}
             print(f"[8002] 机器人：{msg.get('text')}")
+            # text 是**整段**（内容 + 追加的关怀拼接的，见 api_doc §5）。
+            # 所以追加的那句要单独再打一行 —— 不然看不出这一轮到底追没追加。
+            # ⚠️ 只有这个工具（对话的发起方）看得到 reply 报文：
+            # B 只把它回给发起连接，而 watch_8002 是被动监听，收不到。
+            if msg.get("follow_up"):
+                print(f"       └ 追加关怀（{msg.get('care_kind', '?')}）："
+                      f"{msg.get('follow_up')}")
             print(f"       └ 状态={msg.get('state')} 意图={msg.get('intent')} "
                   f"情绪={emotion.get('label')}/{emotion.get('detail')}")
             return True

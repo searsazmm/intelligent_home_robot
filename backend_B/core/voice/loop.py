@@ -88,11 +88,20 @@ def looks_like_echo(text: str, last_reply: str, threshold: float = ECHO_SIMILARI
     用 ``difflib.SequenceMatcher``（标准库）做字符级相似度。
     它不需要任何依赖，对中文按字符比较也合适 —— 中文里"字"就是最小的
     有意义的单位，不像英文那样需要先分词。
+
+    ``last_reply`` 可能是**几段拼起来的**（见 :meth:`Speaker.say_all`：
+    回复 + 追加关怀，中间用空格分隔）。拿整段去比会让每一段都被稀释 ——
+    一段 15 字、一段 20 字拼成 36 字，只回声了前一段时相似度只有
+    2×15/(15+36)≈0.59，**刚好掉到 0.6 的门槛以下**，于是没认出来。
+    所以按空格拆开，取其中最像的那一段来比。
     """
     if not text or not last_reply:
         return False
-    ratio = difflib.SequenceMatcher(None, text, last_reply).ratio()
-    return ratio >= threshold
+    segments = last_reply.split() or [last_reply]
+    return any(
+        difflib.SequenceMatcher(None, text, segment).ratio() >= threshold
+        for segment in segments
+    )
 
 
 def is_meaningful(text: str) -> bool:
@@ -196,6 +205,61 @@ class Speaker:
         见 :meth:`say_async`。
         """
         return self._say(text, join_async=True)
+
+    def say_all(self, parts) -> bool:
+        """按顺序念几段话，但**只开一个忙碌窗口**。
+
+        用于"回复 + 追加关怀"这种一句话分两段合成的场景。
+
+        **为什么不直接连着调两次 say()：**
+
+        1. 每调一次 ``say()`` 都会 set/clear 一次 ``_busy`` 并各触发一次
+           ``on_busy_change``。两段之间那一瞬间，主动关怀的 ``speaking``
+           门禁和半双工静音都是**开**的 —— 正好是机器人刚说完"……然后呢？"
+           到"我看您今天心情不太好"之间那道缝，机器会在这时候跑去听自己。
+        2. ``_last_text`` 会被第二段覆盖，回声去重就认不出第一段的回声了
+           （第二段播完的瞬间，环境里还飘着第一段的声音）。
+           所以最后存的是**整段**。
+
+        **为什么是分两次合成、而不是拼成一句：** 拼起来会让
+        :class:`SpeechCache` 必然不命中 —— 那句关怀语本来是预合成好的，
+        拼进去就得连回复一起重新联网合成（本机实测 +1.2 秒），
+        正好把预合成想省的时间全花回去。所以这里宁可多进一次
+        :meth:`_speak_locked`，也不要拼。
+
+        ``parts`` 里的空串会被跳过（``follow_up`` 为空是常态）。
+        返回是否至少真的发出了**一段**声音。
+        """
+        texts = [p.strip() for p in (parts or ()) if isinstance(p, str) and p.strip()]
+        if not texts:
+            return False
+
+        # 和 say() 一样，先等应声词说完再排队（必须在取 _lock 之前）。
+        self._join_async()
+
+        with self._lock:
+            # 用空格拼 —— looks_like_echo 靠这个分隔符把两段拆回去比。
+            # 中文回复本身不含空格，所以这个分隔符是安全的。
+            self._last_text = " ".join(texts)
+            self._busy.set()
+            if self.on_busy_change:
+                self.on_busy_change(True)
+
+            spoke = False
+            try:
+                # 逐段走同一套缓存/合成/流式判断。一段失败不影响后面几段 ——
+                # 回复出声了、关怀没出声，也远比整句吞掉好。
+                for text in texts:
+                    try:
+                        if self._speak_locked(text):
+                            spoke = True
+                    except Exception:
+                        logger.exception("播报「%s」失败，继续念下一段", _brief(text))
+                return spoke
+            finally:
+                self._busy.clear()
+                if self.on_busy_change:
+                    self.on_busy_change(False)
 
     def say_async(self, text: str) -> bool:
         """异步说一句：立刻返回，播报在后台线程里做。
@@ -629,9 +693,24 @@ class VoiceLoop:
             logger.exception("对话处理失败")
             return
 
-        reply_text = getattr(reply, "reply", None)
-        if reply_text:
-            self.speaker.say(reply_text)
+        self._speak_reply(reply)
+
+    def _speak_reply(self, reply) -> None:
+        """把 ``on_text`` 返回的东西念出来：内容一段，追加的关怀一段。
+
+        ⚠️ ``on_text`` 的类型契约是 ``object`` —— 测试里传的是
+        ``mock.Mock(reply="…")``。**Mock 会自动造出任何属性**，所以
+        ``getattr(reply, "follow_up", "")`` 拿到的不是默认值，而是一个新的
+        Mock 对象，于是会多念一段、``len(player.played) == 1`` 这类断言就挂。
+        必须用 ``isinstance(..., str)`` 卡死。
+        """
+        parts = []
+        for attr in ("reply", "follow_up"):
+            value = getattr(reply, attr, None)
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+        if parts:
+            self.speaker.say_all(parts)
 
     # ------------------------------------------------------------------
 

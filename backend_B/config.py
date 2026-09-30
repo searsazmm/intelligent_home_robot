@@ -210,6 +210,17 @@ PROACTIVE_GREETING_ABSENT = _env_float("B_PROACTIVE_GREETING_ABSENT", 60.0)
 # 而且启动初期视觉状态本来就在 absent→normal 之间抖。
 PROACTIVE_STARTUP_GRACE = _env_float("B_PROACTIVE_STARTUP_GRACE", 15.0)
 
+# 回答完之后**追加**关怀语的最小间隔（墙钟秒）。
+#
+# 和 PROACTIVE_MIN_INTERVAL 分开是刻意的：那个管「机器人主动开口」，
+# 这个管「应答里附带一句」。两件事的合理密度不一样 —— 主动开口抢的是
+# 话头（越少越好），应答里的追加只是把摄像头看到的事说一声。
+#
+# 180 秒 ≈ 连续聊天时每三分钟提一次。调小 = 更唠叨。
+# 第一次对话必然追加（计数器从 0 起算）。
+# 见 core/dialogue.py 的 DialogueEngine.respond()。
+CARE_FOLLOWUP_INTERVAL = _env_float("B_CARE_FOLLOWUP_INTERVAL", 180.0)
+
 # 静默时段：这段时间内**不主动开口**。
 # ⚠️ 注意只静默"主动"，**绝不静默应答** —— 凌晨两点的「我不舒服」必须回答。
 # 这是安全属性，不是体验偏好。
@@ -234,6 +245,10 @@ PROACTIVE_DEMO_MIN_INTERVAL = _env_float("B_PROACTIVE_DEMO_MIN_INTERVAL", 20.0)
 PROACTIVE_DEMO_MAX_PER_HOUR = _env_int("B_PROACTIVE_DEMO_MAX_PER_HOUR", 60)
 PROACTIVE_DEMO_GREETING_ABSENT = _env_float("B_PROACTIVE_DEMO_GREETING_ABSENT", 5.0)
 PROACTIVE_DEMO_STARTUP_GRACE = _env_float("B_PROACTIVE_DEMO_STARTUP_GRACE", 3.0)
+
+# 追加关怀的间隔同样要压短。默认 180 秒在演示里等于「看不出来」——
+# 而这一条正是演示时要展示的东西，比主动关怀更不能被门槛藏起来。
+CARE_DEMO_FOLLOWUP_INTERVAL = _env_float("B_CARE_DEMO_FOLLOWUP_INTERVAL", 20.0)
 
 # --------------------------------------------------------------------------
 # 11. 语音（听与说）

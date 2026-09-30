@@ -441,6 +441,46 @@ class TestScheduler(unittest.TestCase):
         """确认调度器真的用了注入的时钟，而不是偷偷读 time.monotonic()。"""
         self.assertEqual(self.scheduler._started_at, T0)
 
+    # ---- 应答里追加的关怀（第②步） ----
+
+    def test_note_care_blocks_the_immediate_proactive_repeat(self):
+        """⚠️ 不推这道门就会撞车。
+
+        t=0 的应答里追加一句 care_sad，``user_cooldown`` 60 秒一过，
+        主动关怀在 t=60 又来说同一句 —— 两句话隔一分钟说两遍，
+        比不说更像个坏掉的复读机。
+        """
+        self.establish(config.STATE_SAD)
+        self.scheduler.note_care()
+        self.clock.advance(61.0)                        # 越过 user_cooldown
+        self.assertIsNone(self.scheduler.tick(config.STATE_SAD),
+                          "追加过关怀之后紧接着又主动开口了")
+        self.clock.advance(30.0)                        # 越过 min_interval(90s)
+        self.assertIsNotNone(self.scheduler.tick(config.STATE_SAD))
+
+    def test_note_care_does_not_consume_the_hourly_quota(self):
+        """两笔预算要分开。
+
+        ``max_per_hour`` 管的是"机器人主动抢话头"，越少越好；应答里附带的
+        一句是跟着用户的话走的 —— 老人自己开的口，不该因此少掉一次
+        真正的主动关怀。
+        """
+        self.establish(config.STATE_SAD)
+        for _ in range(20):                             # 远超每小时 4 次
+            self.scheduler.note_care()
+            self.clock.advance(0.1)
+
+        self.assertEqual(len(self.scheduler._proactive_times), 0,
+                         "追加关怀不该写进主动开口的小时配额")
+
+        # 配额一次没用过，所以第一次主动开口不会被上限挡住
+        self.clock.advance(self.policy.min_interval + 1.0)
+        self.assertIsNotNone(self.scheduler.tick(config.STATE_SAD))
+
+    def test_note_care_uses_the_injected_clock(self):
+        self.scheduler.note_care()
+        self.assertEqual(self.scheduler.last_proactive_at, self.clock.now)
+
 
 class TestDemoScaling(unittest.TestCase):
     """倍速缩放的验收点（计划里那条第 5 项）。

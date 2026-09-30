@@ -31,11 +31,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from core import llm
-from core.dialogue import ACK_REPLIES, DialogueEngine
-from core.history_store import CsvHistoryStore
+from core.dialogue import ACK_REPLIES, PROACTIVE_TEMPLATES, DialogueEngine
+from core.history_store import CsvHistoryStore, TurnRecord
 from core.llm import (DeepSeekClient, NullChatClient, build_chat_headers,
                       build_chat_request, build_chatter, build_system_prompt,
                       parse_chat_response, sanitize_reply)
+from core.vision_state import VisionState
 
 
 def header_of(request, name: str):
@@ -970,9 +971,10 @@ class TestLlmDoesNotChangeRuleJudgements(unittest.TestCase):
 class TestLlmContext(unittest.TestCase):
     """发给模型的消息数组怎么拼。"""
 
-    def build(self, history=None):
+    def build(self, history=None, care_interval=None):
         fake = FakeLlm()
-        return DialogueEngine(history=history, llm=fake), fake
+        return DialogueEngine(history=history, llm=fake,
+                              care_interval=care_interval), fake
 
     def test_message_roles_and_order(self):
         engine, fake = self.build()
@@ -1053,13 +1055,79 @@ class TestLlmContext(unittest.TestCase):
         self.assertEqual(len(fake.calls[0]), 2)
 
     def test_system_prompt_carries_the_state(self):
-        """状态要进提示词 —— 不然模型的话和视觉判定的状态对不上。"""
-        from core.vision_state import VisionState
+        """不追加关怀的那几轮：状态照旧进提示词，语气才贴得住。
+
+        ⚠️ 这条测试的覆盖面在第②步被**收窄过**，不是被"修绿"的。
+
+        改之前它是无条件断言 —— 只要视觉判了 tired，提示词里就必须有
+        ``STATE_HINTS[TIRED]``。第②步加了"要追加关怀的那一轮对模型隐去状态"
+        之后，那个断言就不再是契约了：它描述的行为只在**不追加**的时候成立。
+
+        所以这里换成"不追加"的那一侧：视觉说累、但这句自己已经说了累
+        → 不追加关怀 → 状态照常告诉模型。
+        另一侧（要追加 → 隐去）见 test_system_prompt_hides_the_state_...
+        """
         engine, fake = self.build()
-        engine.respond("我年轻时候在东北待过",
-                       VisionState(state=config.STATE_TIRED))
+        reply = engine.respond("我有点累，想歇会儿",
+                               VisionState(state=config.STATE_TIRED))
+        self.assertEqual(reply.follow_up, "")     # 他自己说了，不追加
         system = fake.calls[0][0]["content"]
         self.assertIn(llm.STATE_HINTS[config.STATE_TIRED], system)
+
+    def test_system_prompt_hides_the_state_when_care_follows(self):
+        """要追加关怀的那一轮：对模型隐去视觉状态，免得它自己先关怀一遍。
+
+        老人这句话没提累（"我年轻时候在东北待过"），但摄像头看到了
+        → 这一轮要追加 care_tired。追加的那句话是本地模板定的，
+        模型要是也知道状态，它八成会自己先共情一遍 —— 老人于是听到
+        同一件事说两遍。所以这一轮把状态换成 normal 再交给它。
+
+        注意"隐去"只影响状态那一项：情绪和意图照旧。
+        """
+        engine, fake = self.build()
+        reply = engine.respond("我年轻时候在东北待过",
+                               VisionState(state=config.STATE_TIRED))
+        self.assertTrue(reply.follow_up)          # 摄像头看到了，追加
+        self.assertEqual(reply.state, config.STATE_TIRED)   # 回复对象里仍是真实状态
+        system = fake.calls[0][0]["content"]
+        self.assertNotIn(llm.STATE_HINTS[config.STATE_TIRED], system)
+        self.assertIn(llm.STATE_HINTS[config.STATE_NORMAL], system)
+
+    def test_care_line_is_deduped_as_a_clean_row(self):
+        """关怀语必须以**干净的一行**进历史，去重才认得出它。
+
+        这就是"另起一行、不跟回复拼接"的全部意义：
+        ``_recent_replies()`` 拿回来的是整行原文，而
+        :meth:`DialogueEngine.proactive_reply` 的"避开最近说过的"是
+        **精确相等**判断。拼进回复那一行的话，历史里存的是
+        ``"……然后呢？我看您今天心情不太好。"``，永远不等于一句干净的
+        ``PROACTIVE_TEMPLATES`` 文案 —— 于是同一句关怀接下来会一直重播。
+
+        这里把"上一次真的追加过的那句话"按 main.handle_chat 的写法
+        （独立一行 role=robot）落进历史，然后验证它**不会再被挑出来**。
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = CsvHistoryStore(os.path.join(directory, "history.csv"),
+                                    session_id="care")
+            # care_interval=0：这里要验的是**去重**，不是节流。
+            engine, fake = self.build(history=store, care_interval=0.0)
+
+            first = engine.respond("我年轻时候在东北待过",
+                                   VisionState(state=config.STATE_TIRED))
+            self.assertTrue(first.follow_up, "摄像头看到累、他没自己说，应当追加")
+            store.append_record(TurnRecord(
+                session_id=store.session_id, role="robot", text=first.follow_up,
+                vision_state=config.STATE_TIRED, intent="chat"))
+
+            # 只占掉这一句，剩下三句是新鲜的 —— 于是第二次必然挑到别的。
+            # （不要把剩下三句也占掉：那时候选池会退化成"全都说过"、
+            #   允许重复，随机挑回同一句的概率 1/4，测试会变成偶发红。）
+            second = engine.respond("那后来呢",
+                                    VisionState(state=config.STATE_TIRED))
+            self.assertTrue(second.follow_up)
+            self.assertNotEqual(second.follow_up, first.follow_up)
+            self.assertIn(second.follow_up, PROACTIVE_TEMPLATES["care_tired"])
+
 
 
 class TestRecentDialogueSessionFilter(unittest.TestCase):

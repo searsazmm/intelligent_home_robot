@@ -11,19 +11,41 @@
 规则引擎的好处没有丢：每条回复为什么被选中，仍然能指着代码说清楚 ——
 联调时看日志里的 (intent, state, emotion, 来源) 就知道该去改哪条模板。
 
-一次 respond() 做四件事：
+一次 respond() 做的事，是**三步**：
+
+    第一步  先答内容   回答老人**说的那件事**，就像朋友接话
+    第二步  判断状态   结合人脸数据（vision.state）看要不要关心
+    第三步  追加关怀   要关心才追一句；状态正常、或他自己已经说了，就不打扰
+
+三步的顺序是硬约束。第③步是**追加**，不是**替换** —— 早先的实现让
+``STATE_FALLBACK[state]`` 顶替掉内容回答（老人说「今天天气不错」、
+脸上有点乏，答的是「您看着有点累了」），那等于把第一步和第三步并成了
+一步。见 :data:`CONTENT_INTENTS` 和 :meth:`DialogueEngine._candidates`。
+
+具体到一次 respond()：
     1. 识别意图        recognize_intent()
     2. 融合状态        fuse_state()  —— 视觉状态 与 文本情绪 合并成 4 态之一
     3. 生成回复        大模型（若可用且适用）否则挑模板，避开最近说过的
-    4. 落库/给上下文    交给外部（main.py）写历史，这里只返回结果
+    4. 追加关怀        见 :meth:`DialogueEngine._care_kind`
+    5. 落库/给上下文    交给外部（main.py）写历史，这里只返回结果
 
 ⚠️ 第 3 步里，**大模型只负责产出「回复文本」这一件事**。
    state / intent / emotion_* / discomfort 全部保持规则判定，一行都不动 ——
    它们驱动 8001 状态机、CSV 的列、以及前端 C 的显示，不能让模型改写。
 
-融合状态会同时用于两处：
-    - 决定回复的语气和内容（也会写进系统提示词，让模型的话对得上状态）
+融合状态（``fuse_state``）用于两处：
     - 作为 B→C 推送的状态（api_doc §4.2 只允许 normal/sad/tired/absent）
+    - 决定回复的语气和内容
+
+⚠️ 但**追加关怀不用融合状态，只用 ``vision.state``**（摄像头那一份）。
+   理由见 :meth:`DialogueEngine._care_kind`：关怀语说的是"我看见了
+   您没说的那件事"，只能来自摄像头。文字里说「我有点累」而摄像头什么都没
+   看到时，回答本身就接住了，再追一句「我看您眼睛都快睁不开了」就是瞎编。
+
+融合状态还会写进系统提示词，让模型的话对得上状态 —— **但正在追加关怀
+的那一轮除外**：那一轮的状态被隐去，模型只答内容，关怀完全由固定文案
+负责（否则模型和文案会把同一件事说两遍）。见 ``respond()`` 里的
+``speech_state``。
 """
 
 from __future__ import annotations
@@ -35,6 +57,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import config
+from core import proactive as proactive_lib
 from core.llm import build_system_prompt, sanitize_reply
 from core.text_emotion import TextEmotion, TextEmotionAnalyzer
 from core.vision_state import VisionState
@@ -48,6 +71,19 @@ TEXT_PRESENCE_WINDOW = 30.0
 # 回答内容与用户状态无关的意图：不管用户是累还是低落，问"你是谁"都得答身份。
 # 这些意图的模板优先级要高于"状态通用兜底"。
 STATE_INDEPENDENT_INTENTS = frozenset({"identity", "time", "question"})
+
+# 这些意图的回答**必须**是"接住老人说的那件事"，状态只决定要不要追加关怀，
+# 不能顶替内容。
+#
+# 只有 chat 一个意图在这里，理由是它是唯一一个"用户跟我讲了一件事，而回答里
+# 没有任何对状态敏感的社交成分"的意图。其余意图（问候 / 道别 / 道谢 / 夸奖 /
+# 倾诉）本来就是对状态敏感的社交应答，状态参与选词是对的 —— 累的时候说
+# 「那您早点休息」比说「有空再聊」好。
+#
+# 效果：老人说「今天天气不错」，不管他脸上乏不乏，答的都是 (normal, chat)
+# 那三句带 {topic} 回指的接话（「嗯嗯，{topic}——然后呢？」）；乏不乏只决定
+# 后面要不要再追一句关怀。
+CONTENT_INTENTS = frozenset({"chat"})
 
 # 回声模板里最少要有多长的"话题"才值得回显。
 # 用户只发"嗯""哦""好"这种语气词时，回一句"嗯嗯，嗯——然后呢？"很傻，
@@ -125,7 +161,7 @@ INTENT_RULES: List[tuple] = [
 class DialogueReply:
     """一次对话的完整结果。"""
 
-    reply: str                                  # 要发给用户的回复文本
+    reply: str                                  # 先答的内容 —— 回答老人说的那件事
     state: str                                  # 融合后的四态之一，用于推送 C
     intent: str = "chat"                        # 识别到的意图
     emotion_label: str = "neutral"              # 文本情绪三分类
@@ -133,12 +169,47 @@ class DialogueReply:
     emotion_detail: str = "neutral"             # 细粒度情绪
     discomfort: bool = False                    # 是否提到身体不适
     reason: str = ""                            # 为什么这么回（调试用）
+    #: 答完之后**追加**的关怀语；空串 = 这一轮不追加。
+    #:
+    #: 和 reply 是**两句话**，不是一句话的两半：朗读时要分两次合成
+    #: （见 Speaker.say_all）。拼成一个字符串会让预合成缓存必然不命中，
+    #: 整句重新合成，白等一秒多。文案来自 PROACTIVE_TEMPLATES，全部预合成过。
+    follow_up: str = ""
+    #: 追加的那句属于哪一类（``care_sad`` / ``care_tired``）；空串 = 没追加。
+    #:
+    #: 独立于 ``intent`` 存在，因为写历史 CSV 时它是更准确的那一列：
+    #: ``_fire_proactive`` 给主动开口写的 intent 就是 kind，应答里的追加
+    #: 理应一致。只写 ``intent``（= chat）的话，CSV 里分不出哪几行是关怀。
+    care_kind: str = ""
+
+    def spoken_parts(self) -> Tuple[str, ...]:
+        """要**念出来**的全部文本，按顺序。空串自动略过。
+
+        朗读点和写日志都用它，这样"说了什么"只有这一个定义。
+        注意它不等于 :meth:`to_dict` 的 text —— 那个是给 8002 的报文，
+        两者恰好一致（都是整段），但用途不同，改的时候要一起改。
+        """
+        return tuple(part for part in (self.reply, self.follow_up) if part)
 
     def to_dict(self) -> dict:
-        """转为发给 C 端 8002 的 JSON 结构。"""
+        """转为发给 C 端 8002 的 JSON 结构。
+
+        ``text`` 是**整段**要念的话（内容 + 追加的关怀），因为 C 端的气泡
+        （frontend_C/main.py 的 on_reply）显示的就是这一句，它必须和老人
+        实际听到的对得上。``follow_up`` 和 ``care_kind`` 再单独给一份，
+        让排错工具能分清哪半句是关怀 —— 注意 8002 这条通道**本身不发声**，
+        "对得上"说的是 C 的界面显示。
+
+        ⚠️ 这个报文 B 只回给**发起对话的那个连接**（ui_channel 用的是
+        ``_send(client, ...)``，不是广播）。所以被动监听的
+        tools/watch_8002.py 收不到它 —— 要看这两行得用
+        tools/mock_c_client.py，那才是发起方。
+        """
         return {
             "type": "reply",
-            "text": self.reply,
+            "text": "".join(self.spoken_parts()),
+            "follow_up": self.follow_up,
+            "care_kind": self.care_kind,
             "state": self.state,
             "intent": self.intent,
             "emotion": {
@@ -161,13 +232,20 @@ class DialogueEngine:
     """
 
     def __init__(self, history=None, rng: Optional[random.Random] = None,
-                 llm=None) -> None:
+                 llm=None, care_interval: Optional[float] = None) -> None:
         """``llm`` 是大模型客户端（见 :mod:`core.llm`），**默认 None**。
 
         ⚠️ 默认值必须是 None，不能是"从 config 建一个"：
         那样的话每个 ``DialogueEngine()`` 都会去打网络 —— 包括测试里
         那几十处构造。任何 ``available`` 为假的客户端都等价于"没有大模型"，
         所以传 NullChatClient 进来也是安全的。
+
+        ``care_interval`` 是**追加关怀**的最小间隔（秒），默认取
+        ``config.CARE_FOLLOWUP_INTERVAL``。做成构造参数而不是直接读常量，
+        是因为它必须能被 ``main.py`` 按 ``--demo`` / ``--offline --speed``
+        改写 —— 和 :class:`core.proactive.ProactivePolicy` 接收阈值的方式
+        一致。固定 180 秒在演示里等于"看不出来"，在 5 倍速回放下等于
+        每 900「数据秒」一次。测试也靠它注入一个很小的值。
         """
         self.analyzer = TextEmotionAnalyzer()
         self.history = history                  # CsvHistoryStore 或 None
@@ -176,6 +254,11 @@ class DialogueEngine:
         self._llm = llm                         # Chatter 或 None
         #: 上一次说过的应声词，用来避开连着两次说同一句。
         self._last_ack: str = ""
+        #: 追加关怀的最小间隔（秒）与**上次真的追加**的时刻。
+        #: 用 time.monotonic()，和 _last_user_text_at 同一个时钟。
+        self._care_interval: float = (
+            config.CARE_FOLLOWUP_INTERVAL if care_interval is None else care_interval)
+        self._last_care_at: float = 0.0
 
     # ------------------------------------------------------------------
     # 主入口
@@ -224,15 +307,44 @@ class DialogueEngine:
         intent = self.recognize_intent(user_text, emotion)
         state = self.fuse_state(vision, emotion)
 
+        # ⚠️ 这一步必须在生成回复**之前**：它决定这一轮要不要对"内容部分"
+        # 隐去视觉状态（见下）。它只需要 vision 和 emotion，不需要等回复
+        # 生成出来，所以拿得到。
+        care_kind = self._care_kind(vision, emotion)
+
+        # 要追加关怀的这一轮，**内容部分一律按"状态正常"来生成**。
+        #
+        # 理由：追加的那句关怀说什么，是本地 PROACTIVE_TEMPLATES 定的。
+        # 生成内容的一方（大模型或状态模板）要是也知道状态，它八成会自己
+        # 先关怀一遍，老人于是听到同一件事说两遍 ——「您看着有点累」
+        # 接「我看您眼皮都沉了」。
+        #
+        # 只换这**一个**变量，意图和情绪照旧（情绪是用户自己说出口的，
+        # 答不答都得接住）。也正因为只有一个变量，模板兜底这条路同样受
+        # 约束 —— 否则大模型一失败，模板立刻又把状态关怀加回来。
+        #
+        # 注意 DialogueReply.state 里放的仍是**真实**状态，被隐去的只是
+        # 生成内容时看到的那份。
+        speech_state = config.STATE_NORMAL if care_kind is not None else state
+
         # 大模型只产出「回复文本」。上面那三行（意图 / 状态 / 情绪）已经是
         # 最终结果，不会因为走了大模型而变 —— 见模块 docstring 的说明。
         source = "llm"
-        reply_text = self._online_reply(state, intent, emotion, user_text,
+        reply_text = self._online_reply(speech_state, intent, emotion, user_text,
                                         on_thinking=on_thinking)
         if reply_text is None:
             # 不适用（危机 / 不适 / 问候这类）或调用失败，一律落回模板。
             source = "template"
-            reply_text = self._compose_reply(state, intent, emotion, user_text, vision)
+            reply_text = self._compose_reply(speech_state, intent, emotion,
+                                             user_text, vision)
+
+        # 第三步：追加关怀。文案复用主动关怀那一套（已预合成，追加零延迟）。
+        follow_up = ""
+        if care_kind is not None:
+            follow_up = self.proactive_reply(care_kind, vision)
+            # 只有**真的追加了**才记账。否则一次被别的分支挡下的判定
+            # 也会白扣掉这 180 秒的额度。
+            self._last_care_at = time.monotonic()
 
         return DialogueReply(
             reply=reply_text,
@@ -242,8 +354,75 @@ class DialogueEngine:
             emotion_score=emotion.score,
             emotion_detail=emotion.emotion,
             discomfort=emotion.discomfort,
-            reason=f"视觉={vision.state}({vision.reason}) 文本={emotion.label}/{emotion.emotion} 意图={intent} 来源={source}",
+            follow_up=follow_up,
+            care_kind=care_kind or "",
+            reason=f"视觉={vision.state}({vision.reason}) 文本={emotion.label}/{emotion.emotion} "
+                   f"意图={intent} 来源={source} 关怀={self._care_note(care_kind, vision, emotion)}",
         )
+
+    # ------------------------------------------------------------------
+    # 第三步：追加关怀
+    # ------------------------------------------------------------------
+
+    def _care_kind(self, vision: VisionState, emotion: TextEmotion) -> Optional[str]:
+        """这一轮该不该追加关怀；该则返回 kind（``care_sad`` / ``care_tired``）。
+
+        **只看 ``vision.state``，不看融合状态。** 这一条是整个设计的支点：
+
+        追加的关怀，说的是「**摄像头看到了、而老人这句话自己没说**」的事。
+        所以两个条件缺一不可 ——
+
+        1. 摄像头真的看到了（``vision.state`` 在 :data:`proactive.CARE_KINDS`
+           里）。只看文字说「我有点累」而摄像头什么都没看到时，回答本身
+           （``(tired, venting)`` 那几句，或大模型的共情）就已经接住了，
+           这时候再蹦一句「我看您眼睛都快睁不开了」是在瞎编 —— 没人看到
+           他的眼睛。关怀语里全是这种**关于身体的断言**，只能来自摄像头。
+        2. 他自己没说（:meth:`_text_already_says`）。否则同一件事说两遍。
+
+        另外还受 :attr:`_care_interval` 节流，见 :meth:`_care_due`。
+        """
+        kind = proactive_lib.CARE_KINDS.get(vision.state)
+        if kind is None:
+            return None                 # normal / absent：不需要关心，不打扰
+        if self._text_already_says(kind, emotion):
+            return None
+        if not self._care_due():
+            return None
+        return kind
+
+    @staticmethod
+    def _text_already_says(kind: str, emotion: TextEmotion) -> bool:
+        """老人这句话**自己**已经说了这件事吗。
+
+        说过了就不再追加 —— 回答已经接住了，再追一句就是重复。
+        这也是"关怀只报告他没说的那部分"的直接落地。
+        """
+        if kind == "care_tired":
+            return emotion.emotion == "tired"
+        if kind == "care_sad":
+            return emotion.is_negative()
+        return False
+
+    def _care_due(self) -> bool:
+        """距上次真的追加是否已经够久。见 :attr:`_care_interval`。"""
+        return (time.monotonic() - self._last_care_at) >= self._care_interval
+
+    @staticmethod
+    def _care_note(kind: Optional[str], vision: VisionState,
+                   emotion: TextEmotion) -> str:
+        """给日志用的「这轮为什么追加/没追加」。
+
+        答辩时被问"为什么这次没关心我"，看这一行就知道是视觉没看到、
+        还是他自己说了、还是没到间隔。刻意写成好读的中文而不是布尔值。
+        """
+        if kind is not None:
+            return kind
+        if vision.state not in proactive_lib.CARE_KINDS:
+            return f"无(视觉={vision.state}不需关心)"
+        care_kind = proactive_lib.CARE_KINDS[vision.state]
+        if DialogueEngine._text_already_says(care_kind, emotion):
+            return "无(他自己说了)"
+        return "无(未到间隔)"
 
     # ------------------------------------------------------------------
     # 主动开口（机器人先说话，用户什么都没说）
@@ -262,6 +441,15 @@ class DialogueEngine:
         注意这里**不调用** :meth:`respond`：那条路会更新 ``_last_user_text_at``
         （见 :meth:`respond` 的 ``from_user`` 参数说明）。主动开口是「机器人
         说给用户听」，不是「用户说了话」，两者的副作用必须分开。
+
+        ⚠️ 除了主动开口，**追加关怀也走这里**（见 :meth:`_care_kind`）——
+        两处要说的是同一批话，去重也必须共用一套，否则同一句关怀会在
+        "追加"和"主动"两条线上各说一遍。
+
+        于是有一个**隐含要求**：调用方写历史时，关怀语必须是**独立的一行**、
+        内容是干净的文案本身。去重（:meth:`_recent_replies`）是**精确相等**
+        判断，把关怀和主回复拼成一行写进去的话，这一句就永远匹配不上了。
+        main.py 的 ``handle_chat`` 按这个要求分两行写。
         """
         candidates = list(PROACTIVE_TEMPLATES.get(kind) or PROACTIVE_TEMPLATES["greeting"])
 
@@ -377,10 +565,12 @@ class DialogueEngine:
         user_text: str,
         vision: VisionState,
     ) -> str:
-        """按优先级挑模板。
+        """按优先级挑模板。完整顺序见 :meth:`_candidates`。
 
-        优先级：(状态, 意图) 精确匹配 → (状态) 通用 → 全局兜底
-        这样既能对"疲劳 + 告别"说"那您早点休息"，也能对没预设过的组合兜底。
+        一句话概括：(状态, 意图) 精确匹配（内容意图除外）→ 与状态无关的意图
+        → (normal, 意图) 内容池 → 意图通用 → 状态通用 → 全局兜底。
+        既能对"疲劳 + 告别"说"那您早点休息"，又保证内容意图**永远**答的是
+        内容而不是状态套话。
         """
         candidates = self._candidates(state, intent, emotion)
 
@@ -399,7 +589,15 @@ class DialogueEngine:
         return self._fill(template, user_text, vision, emotion)
 
     def _candidates(self, state: str, intent: str, emotion: TextEmotion) -> List[str]:
-        """收集候选回复。"""
+        """收集候选回复。
+
+        **顺序就是这套对话的第一条设计约束：状态不能顶替内容。**
+
+        改之前 ``STATE_FALLBACK[state]`` 排在 ``INTENT_FALLBACK`` **之前**，
+        于是老人说「今天天气不错」、脸上有点乏，答的是「您看着有点累了，
+        先歇一会吧」—— 状态句顶替了内容回答。现在它降到最后，只在连
+        ``(normal, 意图)`` 的内容兜底都没有时才用。
+        """
         # 危机信号优先级最高，排在身体不适**之前** —— 这两件事会同时出现
         # （"我疼得不想活了"），而这时候该回应的是"不想活"，不是"疼"。
         #
@@ -416,9 +614,12 @@ class DialogueEngine:
         if emotion.discomfort or intent == "discomfort":
             return list(DISCOMFORT_REPLIES)
 
-        # (状态, 意图) 精确匹配
+        # (状态, 意图) 精确匹配 —— 状态敏感的社交应答在这里，是**对的**
+        # （累的时候道别，说「那您早点休息」比说「有空再聊」好）。
+        # 但 CONTENT_INTENTS 例外：那几个意图的回答必须是在接用户说的那件事，
+        # 状态不参与选词，直接跳到下面的 (normal, 意图) 内容池。
         key = (state, intent)
-        if key in REPLY_TEMPLATES:
+        if intent not in CONTENT_INTENTS and key in REPLY_TEMPLATES:
             return list(REPLY_TEMPLATES[key])
 
         # 有些意图的回答内容和用户状态无关，问"你是谁"时不管他累不累，
@@ -426,13 +627,29 @@ class DialogueEngine:
         if intent in STATE_INDEPENDENT_INTENTS and intent in INTENT_FALLBACK:
             return list(INTENT_FALLBACK[intent])
 
-        # 状态通用
-        if state in STATE_FALLBACK:
-            return list(STATE_FALLBACK[state])
+        # 内容兜底：答内容就用"状态正常"那套话。
+        #
+        # 状态不决定**怎么答**，只决定答完之后要不要追加一句关怀 ——
+        # 这正是 (normal, chat) 那几句的性质：它们本来就是状态中性的
+        # （「嗯嗯，{topic}——然后呢？」），换个状态照样成立。所以不用为
+        # 每种状态各写一套内容模板。见 CONTENT_INTENTS。
+        normal_key = (config.STATE_NORMAL, intent)
+        if normal_key in REPLY_TEMPLATES:
+            return list(REPLY_TEMPLATES[normal_key])
 
         # 意图通用
         if intent in INTENT_FALLBACK:
             return list(INTENT_FALLBACK[intent])
+
+        # 状态通用。
+        #
+        # ⚠️ 当前位置**不可达** —— recognize_intent 只会返回十个意图，
+        # 上面各条已经把它们全覆盖了（identity/time/question 走意图无关那条，
+        # discomfort 在身体不适那条就返回了）。留着是**安全网**：将来加了新
+        # 意图、又忘了配 (normal, 新意图) 模板时，退到这里至少还说人话，
+        # 而不是掉到下面的通用兜底。看到这里"没人走"不要删。
+        if state in STATE_FALLBACK:
+            return list(STATE_FALLBACK[state])
 
         return list(DEFAULT_REPLIES)
 
@@ -519,6 +736,10 @@ class DialogueEngine:
 
         契约：**只可能返回一句洗干净的、非空的文本，或者 None**。
         绝不抛异常 —— 调用方拿到 None 就落回模板，那条路永远是好的。
+
+        ``state`` 由调用方决定给哪一个：``respond()`` 在"这一轮要追加关怀"时
+        传的是 ``STATE_NORMAL``（隐去视觉状态），否则传真实状态。判断依据和
+        理由都在那边，这里不再重复。
         """
         eligible, why = self.llm_eligible(intent, emotion, user_text)
         if not eligible:
@@ -648,19 +869,16 @@ REPLY_TEMPLATES: Dict[tuple, List[str]] = {
         "不用谢。您愿意跟我说话，我就挺高兴的。",
         "别跟我客气。您心情好一点，我就踏实了。",
     ],
-    (config.STATE_SAD, "chat"): [
-        "嗯，我听着呢。您接着说。",
-        "这事您别一个人扛着，说出来轻快点。",
-    ],
+    # 这里**刻意没有** (sad,"chat") / (absent,"chat") —— 曾经有，已删。
+    # chat 属于 CONTENT_INTENTS，_candidates() 会跳过精确匹配直接走
+    # (normal,"chat") 的内容池，所以那两条永远选不到。留着是死数据，
+    # 而且会误导后来人以为"低落时闲聊有专门的答法"。
+    # 测试 test_only_normal_chat_template_exists 会守住这条不变量。
 
     # ---- 走神/无人 absent ----
     (config.STATE_ABSENT, "greeting"): [
         "哎，我在呢。刚才没看见您，您去哪里了？",
         "您好呀，可算听见您说话了。",
-    ],
-    (config.STATE_ABSENT, "chat"): [
-        "我在听，您说。",
-        "您说话我就听得见，不用管我看没看见您。",
     ],
 
     # ---- 正常 normal ----

@@ -573,6 +573,302 @@ class TestDialogue(unittest.TestCase):
 
 
 # ==========================================================================
+# 第②步：先答内容，再追加关怀
+#
+# 总逻辑是三步：① 先回答用户说的内容 → ② 结合视觉判断状态 →
+# ③ 需要关心就**追加**一句，正常就不打扰。
+#
+# 这一族测试守的就是"①不能被②顶替、③只能是追加"。
+# ==========================================================================
+
+class TestContentOutranksState(unittest.TestCase):
+    """内容回答不能被状态套话顶替。"""
+
+    def setUp(self):
+        self.engine = DialogueEngine()
+
+    def test_tired_chat_answers_the_content_not_the_state(self):
+        """回归测试：整个第②步就是为这一条做的。
+
+        改之前 ``STATE_FALLBACK[tired]`` 排在意图兜底**之前**，于是老人说
+        「今天天气不错」、摄像头看他有点乏，答的是「您看着有点累了，
+        先歇一会吧」—— 老人说的话被完全无视了。
+        """
+        from core.dialogue import PROACTIVE_TEMPLATES, STATE_FALLBACK
+        from core.vision_state import VisionState
+        reply = self.engine.respond("今天天气不错",
+                                    VisionState(state=config.STATE_TIRED))
+        self.assertEqual(reply.intent, "chat")
+        self.assertNotIn(reply.reply, STATE_FALLBACK[config.STATE_TIRED])
+        # 追加的那句才是状态相关的内容，且来自预合成文案
+        self.assertIn(reply.follow_up, PROACTIVE_TEMPLATES["care_tired"])
+
+    def test_chat_always_uses_the_content_pool(self):
+        """表驱动：chat 在**每个**状态下都走 (normal, chat) 的内容池。"""
+        from core.dialogue import REPLY_TEMPLATES
+        from core.vision_state import VisionState
+        pool = REPLY_TEMPLATES[(config.STATE_NORMAL, "chat")]
+        for state in config.VALID_STATES:
+            with self.subTest(state=state):
+                reply = self.engine.respond("今天天气不错",
+                                            VisionState(state=state))
+                if reply.intent != "chat":
+                    continue        # 视觉没改意图，这里不该发生
+                filled = [t.replace("{topic}", "今天天气不错") for t in pool]
+                self.assertIn(reply.reply, filled,
+                              "%s 状态下的闲聊没走内容池：%s" % (state, reply.reply))
+
+    def test_only_normal_chat_template_exists(self):
+        """不变量：REPLY_TEMPLATES 里只允许有 (normal, chat)。
+
+        曾经还有 (sad, chat) 和 (absent, chat)，它们现在**永远选不到**
+        （chat 属于 CONTENT_INTENTS，_candidates 会跳过精确匹配）。
+        留着是死数据，还会让人以为"低落时闲聊有专门的答法"，所以删了。
+        这条测试守住它不被重新加回来。
+        """
+        from core.dialogue import CONTENT_INTENTS
+        from core.dialogue import REPLY_TEMPLATES
+        chat_keys = sorted(state for (state, intent) in REPLY_TEMPLATES
+                           if intent == "chat")
+        self.assertEqual(chat_keys, [config.STATE_NORMAL])
+        self.assertEqual(CONTENT_INTENTS, frozenset({"chat"}))
+
+    def test_state_sensitive_intents_still_flavor_by_state(self):
+        """反过来说：**不追加**的那些轮次里，状态照旧参与选词。
+
+        "累的时候道别"就该说「那您早点休息」，这是对的状态敏感，
+        和第②步要改的那件事不是一回事。
+
+        注意它只在**不追加**时生效 —— 要追加的那一轮内容按 normal 生成
+        （关怀交给追加句，免得同一件事说两遍）。这里先把额度用掉，
+        于是第二轮被节流、不追加，状态敏感那两句才轮到。
+        """
+        from core.dialogue import REPLY_TEMPLATES
+        from core.vision_state import VisionState
+        engine = DialogueEngine(care_interval=180.0)
+        engine.respond("今天天气不错",
+                       VisionState(state=config.STATE_TIRED))    # 用掉额度
+        reply = engine.respond("那先这样吧，再见",
+                               VisionState(state=config.STATE_TIRED))
+        self.assertEqual(reply.follow_up, "")
+        self.assertEqual(reply.intent, "farewell")
+        self.assertIn(reply.reply,
+                      REPLY_TEMPLATES[(config.STATE_TIRED, "farewell")])
+
+    def test_content_goes_plain_when_care_is_appended(self):
+        """要追加的那一轮，内容按 normal 生成 —— 这是"不重复"的保证。
+
+        反例（改之前的样子）：视觉判 tired、老人说「那先这样吧，再见」，
+        回答是 (tired,farewell) 的「那您早点休息，睡够了精神就好了。晚安。」，
+        再追一句 care_tired 的「您先躺下歇会儿」—— 同一件事说了两遍。
+
+        所以追加的那一轮，内容一律从 normal 那套里挑：告别就说「有空再聊」，
+        关心由追加句专门负责。两段各说各的，不打架。
+        """
+        from core.dialogue import REPLY_TEMPLATES
+        from core.vision_state import VisionState
+        reply = DialogueEngine(care_interval=0.0).respond(
+            "那先这样吧，再见", VisionState(state=config.STATE_TIRED))
+        self.assertTrue(reply.follow_up, "这一轮应当追加")
+        self.assertIn(reply.reply,
+                      REPLY_TEMPLATES[(config.STATE_NORMAL, "farewell")])
+
+
+class TestCareFollowUp(unittest.TestCase):
+    """第三步：追加关怀的判定。"""
+
+    def build(self, care_interval=0.0):
+        # care_interval=0：这些用例验的是"该不该追加"，不是节流。
+        # 节流单独在 TestCareThrottle 里测。
+        return DialogueEngine(care_interval=care_interval)
+
+    @staticmethod
+    def vision(state):
+        from core.vision_state import VisionState
+        return VisionState(state=state)
+
+    def test_care_only_when_the_camera_saw_it(self):
+        """摄像头看到才算 —— 光凭文字说累不追加。
+
+        追加的关怀里全是**关于身体的断言**（「我看您眼皮都沉了」），
+        只能在摄像头真看到的时候说。老人打字说"我有点累"而画面里什么都
+        没看出来，回答本身就已经接住了，再蹦一句身体断言就是瞎编。
+        """
+        from core.dialogue import PROACTIVE_TEMPLATES
+        engine = self.build()
+        reply = engine.respond("我有点累", self.vision(config.STATE_NORMAL))
+        self.assertEqual(reply.follow_up, "",
+                         "视觉没看到，不该追加身体断言式的关怀")
+        # 但内容/共情该接的还得接住
+        self.assertTrue(reply.reply.strip())
+        self.assertNotIn(reply.reply, PROACTIVE_TEMPLATES["care_tired"])
+
+    def test_no_care_when_the_elder_already_said_it(self):
+        """他自己已经说了累，就不再追一句 —— 那是同一件事说两遍。"""
+        engine = self.build()
+        reply = engine.respond("我有点累，想歇会儿",
+                               self.vision(config.STATE_TIRED))
+        self.assertEqual(reply.follow_up, "")
+
+    def test_no_care_for_normal_or_absent(self):
+        """正常/无人不打扰。absent **刻意**不在 CARE_KINDS 里。"""
+        from core.proactive import CARE_KINDS
+        self.assertNotIn(config.STATE_NORMAL, CARE_KINDS)
+        self.assertNotIn(config.STATE_ABSENT, CARE_KINDS)
+        for state in (config.STATE_NORMAL, config.STATE_ABSENT):
+            with self.subTest(state=state):
+                reply = self.build().respond("今天天气不错", self.vision(state))
+                self.assertEqual(reply.follow_up, "")
+
+    def test_care_kinds_cover_sad_and_tired(self):
+        """摄像头判低落/疲劳时要追加，且文案来自主动关怀那张表。"""
+        from core.dialogue import PROACTIVE_TEMPLATES
+        for state, kind in ((config.STATE_SAD, "care_sad"),
+                            (config.STATE_TIRED, "care_tired")):
+            with self.subTest(state=state):
+                reply = self.build().respond("今天天气不错", self.vision(state))
+                self.assertIn(reply.follow_up, PROACTIVE_TEMPLATES[kind])
+
+    def test_crisis_never_gets_a_follow_up(self):
+        """危机语句绝不追加。
+
+        那句话要走的是逐句审过的确定性回复，而且追加的关怀文案是
+        「您今天心情不太好」这种**轻描淡写**的口吻 —— 接在"不想活了"
+        后面是严重的降级。crisis 分支在 _candidates 里就返回了，
+        追加必须同样让路。
+        """
+        engine = self.build()
+        reply = engine.respond("活着没意思，不想活了",
+                               self.vision(config.STATE_SAD))
+        self.assertTrue(reply.reply)
+        self.assertEqual(reply.follow_up, "")
+
+    def test_discomfort_never_gets_a_follow_up(self):
+        """身体不适同理：先在答"疼"，别急着说"您心情不好"。"""
+        reply = self.build().respond("头疼得厉害",
+                                     self.vision(config.STATE_SAD))
+        self.assertEqual(reply.follow_up, "")
+
+    def test_care_shows_up_in_reason_for_defence(self):
+        """答辩时要能一眼看出这轮为什么追加/没追加。"""
+        engine = self.build()
+        said = engine.respond("我有点累", self.vision(config.STATE_TIRED))
+        self.assertIn("关怀=无(他自己说了)", said.reason)
+
+        not_seen = self.build().respond("今天天气不错",
+                                        self.vision(config.STATE_NORMAL))
+        self.assertIn("关怀=无(视觉=normal不需关心)", not_seen.reason)
+
+        added = self.build().respond("今天天气不错",
+                                     self.vision(config.STATE_TIRED))
+        self.assertIn("关怀=care_tired", added.reason)
+
+    def test_vision_none_does_not_append(self):
+        """不传 vision（默认 normal）时不追加 —— 离线回放/单测的默认行为。"""
+        self.assertEqual(DialogueEngine(care_interval=0.0).respond("你好").follow_up, "")
+
+
+class TestCareThrottle(unittest.TestCase):
+    """追加关怀的节流：省的是"唠叨"，不是"该说不说"。"""
+
+    @staticmethod
+    def vision(state):
+        from core.vision_state import VisionState
+        return VisionState(state=state)
+
+    def test_repeat_within_the_interval_is_suppressed(self):
+        engine = DialogueEngine(care_interval=180.0)
+        first = engine.respond("今天天气不错", self.vision(config.STATE_TIRED))
+        second = engine.respond("刚才那事挺有意思", self.vision(config.STATE_TIRED))
+        self.assertTrue(first.follow_up, "第一次必然追加（计数器从 0 起算）")
+        self.assertEqual(second.follow_up, "", "间隔内的第二次不该再追")
+        self.assertIn("关怀=无(未到间隔)", second.reason)
+
+    def test_zero_interval_always_appends(self):
+        engine = DialogueEngine(care_interval=0.0)
+        for text in ("今天天气不错", "刚才那事挺有意思", "我孙子来了"):
+            with self.subTest(text=text):
+                self.assertTrue(engine.respond(
+                    text, self.vision(config.STATE_TIRED)).follow_up)
+
+    def test_blocked_round_does_not_consume_the_budget(self):
+        """⚠️ 只有**真的追加了**才该记账。
+
+        不然"视觉判了 tired、但他自己已经说了累"这种被别处挡下的轮次
+        也会白扣掉这 180 秒 —— 老人接着聊十句，一句关怀都等不到。
+        """
+        engine = DialogueEngine(care_interval=180.0)
+        engine.respond("我有点累", self.vision(config.STATE_TIRED))   # 被挡，不记账
+        engine.respond("今天天气不错", self.vision(config.STATE_NORMAL))  # 视觉没看到
+        reply = engine.respond("刚才那事挺有意思",
+                               self.vision(config.STATE_TIRED))
+        self.assertTrue(reply.follow_up,
+                        "前面两轮都没有真的追加，不该把额度用掉")
+
+    def test_per_instance_not_class_level(self):
+        """计时是**实例**状态：两台会话不该互相节流。"""
+        a = DialogueEngine(care_interval=180.0)
+        b = DialogueEngine(care_interval=180.0)
+        self.assertTrue(a.respond("今天天气不错",
+                                  self.vision(config.STATE_TIRED)).follow_up)
+        self.assertTrue(b.respond("今天天气不错",
+                                  self.vision(config.STATE_TIRED)).follow_up)
+
+
+class TestSpokenParts(unittest.TestCase):
+    """一次回复要说出来的全部内容。"""
+
+    @staticmethod
+    def vision(state):
+        from core.vision_state import VisionState
+        return VisionState(state=state)
+
+    def test_parts_are_reply_then_follow_up(self):
+        reply = DialogueEngine(care_interval=0.0).respond(
+            "今天天气不错", self.vision(config.STATE_TIRED))
+        self.assertEqual(reply.spoken_parts(), (reply.reply, reply.follow_up))
+
+    def test_parts_skip_the_empty_follow_up(self):
+        reply = DialogueEngine(care_interval=0.0).respond(
+            "今天天气不错", self.vision(config.STATE_NORMAL))
+        self.assertEqual(reply.follow_up, "")
+        self.assertEqual(reply.spoken_parts(), (reply.reply,))
+
+    def test_to_dict_text_is_the_whole_utterance(self):
+        """``text`` 是合成一句（8002 的消费方拿它整段显示/朗读）。"""
+        reply = DialogueEngine(care_interval=0.0).respond(
+            "今天天气不错", self.vision(config.STATE_TIRED))
+        payload = reply.to_dict()
+        self.assertEqual(payload["text"], reply.reply + reply.follow_up)
+        self.assertEqual(payload["follow_up"], reply.follow_up)
+
+    def test_to_dict_keeps_the_existing_keys(self):
+        """纯新增字段，别顺手把老键改名 —— 8002 的消费方在按老键读。"""
+        reply = DialogueEngine(care_interval=0.0).respond("你好")
+        payload = reply.to_dict()
+        for key in ("type", "text", "state", "intent", "emotion", "timestamp"):
+            with self.subTest(key=key):
+                self.assertIn(key, payload)
+
+    def test_care_kind_names_the_appended_line(self):
+        """``care_kind`` 是写历史 CSV 那一列用的（比 intent 准）。
+
+        主动开口那一行写的 intent 就是 kind（见 main._fire_proactive），
+        应答里的追加理应一致 —— 否则 CSV 里分不出哪几行是关怀。
+        """
+        reply = DialogueEngine(care_interval=0.0).respond(
+            "今天天气不错", self.vision(config.STATE_TIRED))
+        self.assertEqual(reply.care_kind, "care_tired")
+        self.assertEqual(reply.to_dict()["care_kind"], "care_tired")
+
+    def test_care_kind_is_empty_when_nothing_is_appended(self):
+        reply = DialogueEngine(care_interval=0.0).respond(
+            "今天天气不错", self.vision(config.STATE_NORMAL))
+        self.assertEqual(reply.care_kind, "")
+        self.assertEqual(reply.to_dict()["care_kind"], "")
+
+
+# ==========================================================================
 # 历史记录
 # ==========================================================================
 
