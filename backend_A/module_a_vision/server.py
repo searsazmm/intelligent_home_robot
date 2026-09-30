@@ -66,7 +66,7 @@ from shared.schema import WindowState
 from .aggregate.window import AggregatorConfig, WindowAggregator
 from .capture.base import CaptureConfig, is_feature_source, is_frame_source
 from .privacy.guard import PrivacyViolationError, assert_clean
-from .wire import KIND_FRAME, check_contract, to_v1_sample
+from .wire import KIND_FRAME, check_contract, to_focus_payload, to_v1_sample
 
 #: 默认监听地址与端口（《系统总接口文档》§2.2：8000）。
 DEFAULT_HOST = "127.0.0.1"
@@ -102,6 +102,11 @@ class VisionServer:
     :param vitals: 体征通道（:class:`~module_a_vision.vitals.RppgMonitor`）。
         给了它，v1 模式就会在帧报文之外**另发** §3.5 的 ``rppg`` 报文。
         ``None`` 表示这条通道关闭 —— 例如 CSV 回放（没有 RGB 也没有像素）。
+    :param focus: 是否发 §3.5 的 ``focus`` 视线报文（**逐帧**）。
+        默认开。它不需要任何额外数据源——视线就在每一帧的
+        ``gaze_off_ratio`` 里——所以没有"挂不上"的情况。
+        关掉它会让 B 的 VAI 校准**永远做不完且不报错**，只应在排查
+        "B 到底有没有被类型化报文影响"时临时关掉。
     """
 
     def __init__(
@@ -115,6 +120,7 @@ class VisionServer:
         max_clients: int = 4,
         emit_mode: str = EMIT_V1,
         vitals: Any = None,
+        focus: bool = True,
     ) -> None:
         if emit_mode not in EMIT_MODES:
             raise ValueError(
@@ -129,6 +135,7 @@ class VisionServer:
         self.max_clients = max_clients
         self.emit_mode = emit_mode
         self.vitals = vitals
+        self.focus = focus
 
         self.aggregator = aggregator or WindowAggregator()
 
@@ -150,6 +157,12 @@ class VisionServer:
             #: 已发出的体征报文数（§3.5）。**0 就说明体征通道是死的** ——
             #: 演示时它应该以 1Hz 稳定增长。
             "rppg_packets": 0,
+            #: 已发出的视线报文数（§3.5）。它与帧**同频**，所以
+            #: ``focus_packets`` 与 ``v1_frames`` 在 ``focus=True`` 时应当
+            #: **完全相等**（两者都只在真发出去之后才自增）。对不上就是
+            #: 有帧没走到 :meth:`_emit_focus` —— 那是一个静默故障，
+            #: 靠这两个数相减才看得见。
+            "focus_packets": 0,
             #: 被契约闸拦下的**帧**报文数。**非零就是 bug**，不是可调参数。
             #:
             #: ⚠️ 引入 §3.5 类型化报文后，这个计数器**只统计帧报文**。
@@ -193,6 +206,10 @@ class VisionServer:
             # 体征通道**单独打一行**，而且把"这是自检不是测量"写在上面：
             # 它平时只在日志里出现一次，却是最容易被截图当结论的一行。
             print(f"[A] 体征：{_describe(self.vitals) if self.vitals else '关闭'}")
+            # 视线通道单独一行，并且**把速率写出来**：它是 B 侧 VAI 能否
+            # 出指数的前提，"关掉了"这句话必须当场可见，而不是等半小时后
+            # 从 B 的日志里反推。
+            print(f"[A] 视线：{'逐帧（§3.5 focus）' if self.focus else '关闭'}")
         return sock
 
     def run(self) -> None:
@@ -278,7 +295,8 @@ class VisionServer:
         if sent:
             self.stats["v1_frames"] += 1
 
-        self._emit_side_channels(frame)
+        self._emit_vitals(frame)
+        self._emit_focus(frame)
 
         # **缓冲必须照常排空。** v1 不消费窗口，可 `add_frame` 每一帧都往
         # `_buffer.frames` 里追加：不排空它就是一个只涨不落的内存泄漏，
@@ -290,8 +308,8 @@ class VisionServer:
         if self.aggregator.should_close(frame.ts):
             self.aggregator.close_window(frame.ts)
 
-    def _emit_side_channels(self, frame: Any) -> None:
-        """帧报文之外的通道。目前只有体征（api_doc §3.5 的 ``rppg``）。
+    def _emit_vitals(self, frame: Any) -> None:
+        """体征通道（api_doc §3.5 的 ``rppg``）。
 
         **必须挂在逐帧路径上，而且必须与帧共用一个时间轴。**
         :class:`~module_a_vision.vitals.RppgMonitor` 内部按**帧时间戳**
@@ -299,6 +317,13 @@ class VisionServer:
         ``frame.ts``，不能是墙钟 —— 合成源与 CSV 回放的时间轴都从 0 开始，
         混进墙钟会让 ``Rppg`` 算出一个跨越两套时钟的帧率，然后
         **一直**走置灰分支（``fs < 5.0``），表现是"体征一直出不来"。
+
+        ⚠️ **这里的 ``self.vitals is None`` 只关掉自己。** 原先两条通道
+        共用 :meth:`_emit_side_channels`、由 ``vitals is None`` 一并早退；
+        视线通道挂进来之后那个写法就成了一个静默陷阱：CSV 回放与 camera
+        源都没有体征（``build_server`` 只给合成源挂），于是**每帧都被那道
+        早退挡在视线通道之外**，表现是"VAI 一直不工作"，而"体征没开"
+        看起来完全正常。两条通道各自守各自的门，谁也不替谁决定。
         """
         if self.vitals is None:
             return
@@ -307,6 +332,22 @@ class VisionServer:
             return
         if self.broadcast(payload):
             self.stats["rppg_packets"] += 1
+
+    def _emit_focus(self, frame: Any) -> None:
+        """视线通道（api_doc §3.5 的 ``focus``）。**逐帧，与帧报文同频。**
+
+        速率与判据都写在 :func:`~module_a_vision.wire.to_focus_payload`：
+        掉到 1Hz 以下会让 B 的 ``PassiveCalibrator`` 每次 ``update()`` 都
+        ``reset()``，"校准永远做不完"且不报错。所以这里**不做任何抽稀**
+        （不要因为"每帧都发是不是太密"给它加个 ``every`` 计数器）。
+
+        时间戳同样取 ``frame.ts`` —— 这条流的两个消费者（校准用的头姿窗口
+        与视线窗口）都会跨帧做差，混进墙钟等于让一个窗口横跨两套时钟。
+        """
+        if not self.focus:
+            return
+        if self.broadcast(to_focus_payload(frame)):
+            self.stats["focus_packets"] += 1
 
     def _emit(self, window: WindowState) -> None:
         """广播一个窗口。"""
@@ -494,6 +535,7 @@ def build_server(
     real_time: bool = True,
     emit_mode: str = EMIT_V1,
     vitals: bool = True,
+    focus: bool = True,
     **kwargs: Any,
 ) -> VisionServer:
     """按种类装配一个服务端。供 ``main.py`` 与 ``tools/`` 使用。
@@ -511,6 +553,10 @@ def build_server(
         它是目前唯一能给出 RGB 的源（合成体征直出 ``(t, R, G, B)``）。
         CSV 回放既没有 RGB 列也没有像素；camera / video 的真像素取色
         本步尚未实现。传 ``False`` 可以要一条只发帧的干净流（排查用）。
+    :param focus: 是否发 §3.5 的视线报文。**所有源都发得起**（视线来自
+        每一帧自己的 ``gaze_off_ratio``，不需要额外数据源），所以默认开，
+        而且**与 ``vitals`` 无关** —— 想得到"只含帧报文"的干净流，
+        两个都要传 ``False``。
     """
     cfg = CaptureConfig(real_time=real_time, **kwargs)
 
@@ -525,6 +571,7 @@ def build_server(
             port=port,
             emit_mode=emit_mode,
             vitals=RppgMonitor(SyntheticVitalsSource()) if vitals else None,
+            focus=focus,
         )
 
     if source_kind == "csv":
@@ -538,6 +585,9 @@ def build_server(
             host=host,
             port=port,
             emit_mode=emit_mode,
+            # CSV 回放没有体征（没有 RGB 列也没有像素），**但有视线**：
+            # 若 CSV 带 ``gaze_off_ratio`` 列，这一路就是真实的视线数据。
+            focus=focus,
         )
 
     # camera 与 video 都要走像素 → 人脸后端。
@@ -569,6 +619,7 @@ def build_server(
         host=host,
         port=port,
         emit_mode=emit_mode,
+        focus=focus,
     )
 
 

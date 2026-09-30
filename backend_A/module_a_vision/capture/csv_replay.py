@@ -21,9 +21,16 @@ V1 只有 8 列，这里有两个**必须显式处理的缺口**（不处理会�
    这里的做法是把 EAR 反推的闭眼度同时写进 ``eyeBlink`` 通道，使
    ``fuse_closure`` 的两个通道一致（0.6c + 0.4c = c）。这是刻意的补全，
    不是伪造：V1 数据本来就只有 EAR 一个眼部信号。
-2. **没有视线列**。``gaze_off_ratio`` 只能恒为 0，因此**回放数据的注意力
-   判定不可信**（会一律判成"专注"）。CSV 回放只覆盖头姿、眼部、疲劳、
-   表情四条链路，注意力必须在真机联调阶段验证。
+2. **没有视线列**。``gaze_off_ratio`` 只能是 ``None``（"估不出来"），
+   因此**回放数据的注意力判定不可信**（会一律判成"专注"）。CSV 回放只覆盖
+   头姿、眼部、疲劳、表情四条链路，注意力必须在真机联调阶段验证。
+
+   这里**刻意不填 ``0.0``**。``0.0`` 的意思是"视线完全对正前方"，也就是
+   **专注满分** —— 拿它去顶替"这一列不存在"，就是在伪造一个"老人一直很专注"
+   的结论，而且没有任何东西会报错。填 ``None`` 至少让这件事显式：
+   :attr:`~module_a_vision.metrics.attention.AttentionMetrics.gaze_frames`
+   会等于 0，看到 ``label=FOCUSED`` 配 ``gaze_frames=0`` 就该读成
+   "这一窗没有测量"，而不是"很专注"。
 
 ``emo_feature`` 的取值
 ----------------------
@@ -401,8 +408,17 @@ class CsvReplaySource(BaseFeatureSource):
             yaw_deg=r.yaw,
             roll_deg=r.roll,
             blendshapes=bl,
-            # V1 无视线列：只能填 0，注意力链路在回放模式下不可信（见模块文档）。
-            gaze_off_ratio=_clamp01(r.gaze_off_ratio or 0.0),
+            # V1 CSV **没有**视线列（见模块文档第 2 条）：那就如实给 `None`。
+            #
+            # ⚠️ 这里原先写的是 `_clamp01(r.gaze_off_ratio or 0.0)`。
+            # `or 0.0` 会把刚在 §7 建立起来的 `None` 又抹平成 `0.0`，
+            # 而 `0.0` 在这条链路上的意思是**视线完全对正**（专注满分）——
+            # 于是"没有视线这一列"被读成"一直很专注"，且全程无提示。
+            # 现在 `None` 一路传到 `metrics/attention.py`，由那里的
+            # `gaze_frames` 把"这一窗没有视线信息"显式暴露出来。
+            gaze_off_ratio=(
+                None if r.gaze_off_ratio is None else _clamp01(r.gaze_off_ratio)
+            ),
             quality=self._quality(),
         )
 

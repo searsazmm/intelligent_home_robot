@@ -76,8 +76,16 @@ class FrameFeatures:
     blendshapes: dict[str, float] = field(default_factory=dict)
 
     # ---- 注意力 ----
-    #: 视线偏离正前方的程度 [0,1]，越大越偏离。
-    gaze_off_ratio: float = 0.0
+    #: 视线偏离正前方的程度 ``[0,1]``，越大越偏离。``None`` = **这一帧估不出来**。
+    #:
+    #: ``None`` 与 ``0.0`` 语义完全不同，**别把两者揉成一个**：``0.0`` 是
+    #: "正对着镜头"（最专注），``None`` 是"不知道"。虹膜关键点缺失（468 点
+    #: 模型）、画面质量不合格时都会走到 ``None``。
+    #:
+    #: 这个区分是**下游正确性的前提**：判"失神"时分母若把"不知道"的帧也算
+    #: 进去，偏离占比会被系统性压低 → 结论整体偏向 FOCUSED，不报错、不告警。
+    #: 见 :meth:`~module_a_vision.metrics.attention.AttentionTracker.snapshot`。
+    gaze_off_ratio: float | None = None
 
     # ---- 质量 ----
     quality: FrameQuality = field(default_factory=FrameQuality)
@@ -87,12 +95,18 @@ class FrameFeatures:
     landmarks: tuple[tuple[float, float, float], ...] | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - 仅为避免误打印敏感字段
-        """刻意不打印 bbox 与 landmarks，防止它们经日志外泄。"""
+        """刻意不打印 bbox 与 landmarks，防止它们经日志外泄。
+
+        ``gaze_off`` 要单独判一次 ``None``：格式说明符 ``:.2f`` 会直接对
+        ``None`` 调 ``__format__`` 并抛 ``TypeError`` —— 而 ``repr()`` 是
+        排错路径，**在排错时崩掉**比打不出这个字段糟得多。
+        """
+        gaze = "None" if self.gaze_off_ratio is None else f"{self.gaze_off_ratio:.2f}"
         return (
             f"FrameFeatures(ts={self.ts:.2f}, has_face={self.has_face}, "
             f"closure={self.closure_ratio:.2f}, "
             f"pose=({self.pitch_deg:.1f},{self.yaw_deg:.1f},{self.roll_deg:.1f}), "
-            f"gaze_off={self.gaze_off_ratio:.2f}, valid={self.quality.valid})"
+            f"gaze_off={gaze}, valid={self.quality.valid})"
         )
 
     def blend(self, name: str, default: float = 0.0) -> float:

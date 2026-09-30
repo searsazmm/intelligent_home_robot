@@ -32,6 +32,22 @@
    全部输入从 :class:`ProactiveContext` 进来。于是「静默时段」「防骚扰间隔」
    「一小时内上限」这些最容易写错、又最难在真机上复现的规则，
    可以用假时钟表驱动测试（见 tests/test_proactive.py）。
+
+--------------------------------------------------------------------------
+门禁 8：专注静默（VAI）
+--------------------------------------------------------------------------
+需求文档 §4 B2 的 ``focus``：老人正专注于某件事时**暂不主动开口**。
+它是**第八道**门禁（见 :meth:`ProactivePolicy.assess` 里的位置说明），
+压住问候与关怀两者，**但绝不压应答**。
+
+两个刻意的分工：
+
+    谁算出"在专注"  core/focus.py（三合一：有指数 + 状态有效 + 数据够新）
+    谁决定"因此沉默"  本模块的门禁 8，只认 ``ctx.focused`` 这**一个布尔量**
+
+分成两处是因为"多新算新"必须只有一个答案。本模块连带**总时长上限**
+（:meth:`ProactiveScheduler._apply_focus_cap`）—— 那是时间记账，
+而本模块的定位就是"持有会变的时间记账"。
 """
 
 from __future__ import annotations
@@ -59,6 +75,19 @@ CARE_KINDS = {
 #: 它是「一小时」这个语义本身，不是可调参数。
 CAP_WINDOW_SECONDS = 3600.0
 
+#: 判定被**哪一道门**挡住的标识。**只是日志与测试的锚点，不是给用户看的文案** ——
+#: 用户看到的是 dialogue.proactive_reply() 挑的那句话。
+#: 有了它，「为什么机器人不说话」才有个可查的答案：``evaluate`` 的 ``None``
+#: 把六种沉默混成了一个值。
+GATE_SPEAKING = "speaking"
+GATE_STARTUP_GRACE = "startup_grace"
+GATE_QUIET_HOURS = "quiet_hours"
+GATE_USER_COOLDOWN = "user_cooldown"
+GATE_MIN_INTERVAL = "min_interval"
+GATE_HOURLY_CAP = "hourly_cap"
+GATE_FOCUS = "focus"
+GATE_NO_TRIGGER = "no_trigger"
+
 
 @dataclass(frozen=True)
 class ProactiveContext:
@@ -74,6 +103,7 @@ class ProactiveContext:
     greeting_pending: bool      #: 是否刚经历一次「离开很久后回来」
     speaking: bool              #: 机器正在采集或播报中
     started_at: float           #: 进程启动时刻（宽限期用）
+    focused: bool               #: 老人正在专注（VAI，见 core/focus.py）
 
 
 @dataclass(frozen=True)
@@ -86,6 +116,27 @@ class ProactiveDecision:
 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "state": self.state, "reason": self.reason}
+
+
+@dataclass(frozen=True)
+class ProactiveAssessment:
+    """一次判定的**完整**结果：开口的决定 + **沉默的原因**。
+
+    为什么要在 ``Optional[ProactiveDecision]`` 之外再要一个类型：
+    ``None`` 把七种沉默混成了一个值（正在说话／宽限期／深夜／用户刚说完话／
+    刚主动过／超配额／没到 sustain／**正在专注**）。联调时最高频的问题
+    恰恰是"它为什么不说话"，而只看 ``None`` 无从回答。
+
+    所以判定把原因一并交出来，:meth:`ProactivePolicy.evaluate` 保持只返回决定
+    —— 既有调用方（含测试）一个字都不用改。
+    """
+
+    decision: Optional[ProactiveDecision]
+    suppressed_by: str = ""
+
+    @property
+    def suppressed(self) -> bool:
+        return self.decision is None
 
 
 class ProactivePolicy:
@@ -134,43 +185,71 @@ class ProactivePolicy:
 
         门禁按「先便宜后昂贵、先硬性后柔性」排列，
         每一条的失败都直接沉默，不做补救。
+
+        想知道**为什么**沉默就用 :meth:`assess` —— 本方法只是它的一层薄包装，
+        保留下来是因为调用方（含 29 处测试）只关心决定。
+        """
+        return self.assess(ctx).decision
+
+    def assess(self, ctx: ProactiveContext) -> ProactiveAssessment:
+        """与 :meth:`evaluate` 同一套判定，但把**被哪道门挡住**一起交出来。
+
+        门禁的**顺序与语义一个字没动**，只是在最后、触发选择之前
+        插了第 8 道（专注）—— 见该处的注释。
         """
         # ---- 门禁 1：正在说话就别插嘴 ----
         # TTS 播放中开口 = 自己盖住自己；STT 采集中开口 = 录进自己的声音。
         if ctx.speaking:
-            return None
+            return ProactiveAssessment(None, GATE_SPEAKING)
 
         # ---- 门禁 2：启动宽限期 ----
         # 刚开机那一小段时间，视觉状态还在 absent→normal 之间抖，
         # 而且一上来就热情打招呼会吓人一跳。
         if ctx.now - ctx.started_at < self.startup_grace:
-            return None
+            return ProactiveAssessment(None, GATE_STARTUP_GRACE)
 
         # ---- 门禁 3：静默时段 ----
         # 只静默**主动**开口，绝不静默应答（应答在别处，不受本模块影响）。
         # 凌晨两点的「我不舒服」必须回答 —— 这是安全属性，不是体验偏好。
         if self.in_quiet_hours(ctx.hour):
-            return None
+            return ProactiveAssessment(None, GATE_QUIET_HOURS)
 
         # ---- 门禁 4：用户刚说过话，别抢话头 ----
         # **这是防骚扰最重要的一条。** 用户说了半句停下来想词，
         # 机器人立刻接话，是最让人恼火的失败模式。
         # 顺带保证用 --stdin 打字自测时机器人不插嘴。
         if ctx.last_user_at > 0 and ctx.now - ctx.last_user_at < self.user_cooldown:
-            return None
+            return ProactiveAssessment(None, GATE_USER_COOLDOWN)
 
         # ---- 门禁 5：两次主动之间要有间隔 ----
         if ctx.last_proactive_at > 0 and ctx.now - ctx.last_proactive_at < self.min_interval:
-            return None
+            return ProactiveAssessment(None, GATE_MIN_INTERVAL)
 
         # ---- 门禁 6：一小时内的次数上限 ----
         if len(ctx.recent_proactive) >= self.max_per_hour:
-            return None
+            return ProactiveAssessment(None, GATE_HOURLY_CAP)
 
         # ---- 门禁 7：状态要真的稳住了一段时间 ----
         # 顺序上放在最后：前面的门禁都能在常数时间内否掉，
         # 不必先算持续时长。
         held = ctx.now - ctx.state_since
+
+        # ---- 门禁 8：老人正在专注，别打扰 ----
+        #
+        # 放在这里（而不是和 1~6 并排）有两个理由：
+        #   1. 前面几道都是"不用想就该沉默"，专注是唯一一条**以用户意愿为由**
+        #      的沉默，语义上离触发选择更近；
+        #   2. 它同时压住问候与关怀 —— 一位刚回到座位就埋头看报的长者，
+        #      不适合被"您回来啦"打断，所以必须在下面选触发**之前**。
+        #
+        # ⚠️ 这道门只认 ``ctx.focused`` 这**一个布尔量**。"指数可信 且 够专注"
+        # （有指数 + 状态有效 + 数据够新 + 指数 ≥ 门槛）在 core/focus.py 的
+        # should_stay_silent() 里判完才传进来，这里不做二次判断 ——
+        # 否则"多新算新"与"多高算专注"会各有两个答案。
+        #
+        # ⚠️ 它**不压应答**。「老人先说了话」走 handle_chat，根本不经过这里。
+        if ctx.focused:
+            return ProactiveAssessment(None, GATE_FOCUS)
 
         # 优先级：问候 > 关怀。
         # 理由：「刚回来」是一个**事件**（边沿），而「一直低落」是一个**状态**。
@@ -178,21 +257,21 @@ class ProactivePolicy:
         if ctx.greeting_pending and ctx.state != config.STATE_ABSENT:
             # greeting_pending 已经在调度器里按「离开 ≥ greeting_absent」筛过，
             # 这里不再重复判断离开时长。
-            return ProactiveDecision(
+            return ProactiveAssessment(ProactiveDecision(
                 kind="greeting",
                 state=ctx.state,
                 reason="离开一段时间后回到画面内",
-            )
+            ))
 
         kind = CARE_KINDS.get(ctx.state)
         if kind is not None and held >= self.sustain:
-            return ProactiveDecision(
+            return ProactiveAssessment(ProactiveDecision(
                 kind=kind,
                 state=ctx.state,
                 reason=f"「{ctx.state}」已持续 {held:.0f} 秒（阈值 {self.sustain:.0f} 秒）",
-            )
+            ))
 
-        return None
+        return ProactiveAssessment(None, GATE_NO_TRIGGER)
 
 
 class ProactiveScheduler:
@@ -209,8 +288,13 @@ class ProactiveScheduler:
         policy: Optional[ProactivePolicy] = None,
         clock: Callable[[], float] = time.monotonic,
         hour_provider: Optional[Callable[[], int]] = None,
+        focus_suppress_max: float = config.FOCUS_SUPPRESS_MAX_SECONDS,
     ) -> None:
         self.policy = policy or ProactivePolicy()
+        #: 专注静默的总时长上限。做成参数而不是直接读 config，
+        #: 是为了让 main.py 在 --demo 下换成演示值（30 秒）；
+        #: 15 分钟在演示里等于"看不出来"。
+        self.focus_suppress_max = focus_suppress_max
         self._clock = clock
         # 静默时段要的是**本地墙钟小时**，不能用单调时钟换算。
         # 单独注入是为了测试能固定到凌晨 3 点。
@@ -226,6 +310,13 @@ class ProactiveScheduler:
         self._proactive_times: Deque[float] = deque()
 
         self._speaking = False
+
+        #: 专注静默这一轮的起点。**到点放行一次之后会重开**，见 :meth:`_apply_focus_cap`。
+        self._focus_since: Optional[float] = None
+        #: 最近一次判定的**完整**结果（决定 + 被哪道门挡住）。
+        #: 给联调与测试用：``tick`` 只返回决定，而"为什么没说话"在
+        #: :class:`ProactiveAssessment` 里。默认 ``None`` = 还没 tick 过。
+        self.last_assessment: Optional[ProactiveAssessment] = None
 
     # ------------------------------------------------------------------
 
@@ -267,8 +358,20 @@ class ProactiveScheduler:
         state: str,
         last_user_at: float = 0.0,
         now: Optional[float] = None,
+        focused: bool = False,
     ) -> Optional[ProactiveDecision]:
-        """一个节拍。返回决定开口的内容，或 None。"""
+        """一个节拍。返回决定开口的内容，或 None。
+
+        ``focused`` 由调用方按 ``core/focus.py`` 的 :func:`should_stay_silent`
+        算好传进来（可信：有指数 + 状态有效 + 数据够新；且指数 ≥ 门槛）。
+        调度器**不自己去问** FocusTracker —— 那会让本模块依赖视觉层，
+        也会让"多新算新 / 多高算专注"出现两个答案。
+
+        ⚠️ **本方法一定要被调用**，哪怕调用方已经知道要静默：
+        :meth:`_track_state` 维护 ``_state_since``（``sustain`` 的判据就靠它），
+        而下面会把 ``_greeting_pending`` 清掉。调用方在外层"提前 return"
+        会让这台状态机停在原地 —— 状态一稳下来反而永远算不出持续时长。
+        """
         moment = self._clock() if now is None else now
 
         self._track_state(state, moment)
@@ -285,15 +388,53 @@ class ProactiveScheduler:
             greeting_pending=self._greeting_pending,
             speaking=self._speaking,
             started_at=self._started_at,
+            focused=self._apply_focus_cap(focused, moment),
         )
 
-        decision = self.policy.evaluate(ctx)
+        assessment = self.policy.assess(ctx)
+        self.last_assessment = assessment
 
-        # 问候是**一次性**的：不管这次有没有真的说出口（可能正赶上静默时段
-        # 或用户刚说完话），这个边沿都算用掉了。
+        # 问候是**一次性**的：不管这次有没有真的说出口（可能正赶上静默时段、
+        # 用户刚说完话，或者老人正在专注），这个边沿都算用掉了。
         # 否则会出现「您回来啦」迟到一分钟才说 —— 比不说更奇怪。
         self._greeting_pending = False
-        return decision
+        return assessment.decision
+
+    # ------------------------------------------------------------------
+
+    def _apply_focus_cap(self, focused: bool, moment: float) -> bool:
+        """专注静默的**总时长上限**：连续专注够久就放行一次，并打日志。
+
+        记账放在调度器里而不是策略里，理由与其它时间记账相同 ——
+        策略是纯函数（模块开头第 3 条），而"已经连续专注了多久"必须跨节拍记住。
+
+        为什么必须有这个上限：``focus_is_live`` 的新鲜度只管"数据还活着"，
+        管不了"这个人真的连续专注了 40 分钟"。没有上限的话，一位一直埋头
+        看书的长者会得到**无限期**的静默，而日志里一片安静 ——
+        "把功能关掉了但不留痕迹"是最难查的一类失效。
+
+        放行之后窗口**重开**，所以语义是"每连续专注 N 秒最多放行一次"，
+        而不是"专注够久就永久恢复"：后者会让一个真正专注的下午
+        变成不断被打扰的下午。
+        """
+        if not focused:
+            self._focus_since = None
+            return False
+        if self._focus_since is None:
+            self._focus_since = moment
+            return True
+
+        held = moment - self._focus_since
+        if held < self.focus_suppress_max:
+            return True
+
+        logger.info(
+            "专注静默已连续 %.0f 秒（上限 %.0f 秒），这一拍放行一次主动关怀，"
+            "随后重新计时",
+            held, self.focus_suppress_max,
+        )
+        self._focus_since = moment
+        return False
 
     # ------------------------------------------------------------------
 

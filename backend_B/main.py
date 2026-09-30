@@ -52,6 +52,7 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
+from core import focus as focus_lib
 from core import proactive as proactive_lib
 from core.dialogue import DialogueEngine, DialogueReply, static_replies
 from core.history_store import CsvHistoryStore, TurnRecord
@@ -126,6 +127,14 @@ class BackendB:
             host=args.chat_host, port=args.chat_port,
         )
 
+        # ---- 专注度（VAI）----
+        # 挂在视觉客户端上而不是 evaluator 上（理由见 core/vision_client.py）。
+        # 关掉时传 None：tracker 整个不存在，于是 focus 报文照收照计数、
+        # 只是没人消费 —— 与 ③a 阶段 rppg 的处境相同，是**计了数的丢弃**。
+        self.focus_tracker = focus_lib.FocusTracker() if args.focus_silence else None
+        #: 静默模式进出各打一条日志（只在边沿上打，否则 0.2 秒一条刷屏）。
+        self._focus_logged = False
+
         # 视觉数据来源：实时 socket 或离线 CSV
         if args.offline:
             self.vision_source = OfflineVisionFeeder(
@@ -133,6 +142,7 @@ class BackendB:
                 evaluator=self.evaluator,
                 speed=args.speed,
                 loop=args.loop,
+                focus=self.focus_tracker,
             )
             logger.info("离线模式：回放 %s（%.1fx 倍速，loop=%s）",
                         args.offline, args.speed, args.loop)
@@ -140,6 +150,7 @@ class BackendB:
             self.vision_source = VisionClient(
                 evaluator=self.evaluator,
                 host=args.vision_host, port=args.vision_port,
+                focus=self.focus_tracker,
             )
 
         # ---- 状态覆盖 ----
@@ -157,7 +168,13 @@ class BackendB:
 
         # ---- 主动关怀 ----
         # 挂在 _state_publish_loop 的 0.2 秒节拍上，不新增线程（见该方法的注释）。
-        self.proactive = proactive_lib.ProactiveScheduler(self._build_proactive_policy())
+        self.proactive = proactive_lib.ProactiveScheduler(
+            self._build_proactive_policy(),
+            focus_suppress_max=(
+                config.FOCUS_DEMO_SUPPRESS_MAX_SECONDS if args.demo
+                else config.FOCUS_SUPPRESS_MAX_SECONDS
+            ),
+        )
 
         # ---- 语音 ----
         self.speaker: Optional[Speaker] = None
@@ -615,18 +632,61 @@ class BackendB:
                 logger.exception("状态发布出错")
             self._stop.wait(0.2)
 
+    def _focus_liveness(self) -> bool:
+        """老人是不是**正专注**（可以据此静默）。顺带在进出静默模式时各打一条日志。
+
+        判定在 ``core/focus.py`` 的 :func:`should_stay_silent` 里（可信 **且**
+        够专注），这里只做两件它做不了的事：拿本机的 tracker、打日志。
+        理由（尤其是"为什么除了可信还要有门槛"）见该函数的文档。
+
+        日志只在**边沿**上打：静默一旦成立会持续几分钟，而节拍是 0.2 秒 ——
+        逐拍打就是几千行，真正的问题会被自己的日志淹掉。
+        """
+        if self.focus_tracker is None:
+            return False
+
+        silent, why = focus_lib.should_stay_silent(
+            self.focus_tracker,
+            stale_seconds=config.FOCUS_STALE_SECONDS,
+            min_index=config.FOCUS_SILENT_MIN_INDEX,
+        )
+
+        if silent and not self._focus_logged:
+            self._focus_logged = True
+            snapshot = self.focus_tracker.snapshot()
+            logger.info(
+                "进入静默模式：老人正在专注（VAI %.1f，模态 %s），暂不主动开口。"
+                "应答不受影响",
+                snapshot.index,
+                "+".join(snapshot.available_modalities) or "无",
+            )
+        elif not silent and self._focus_logged:
+            self._focus_logged = False
+            logger.info("退出静默模式，恢复主动关怀（%s）", why)
+        return silent
+
     def _tick_proactive(self, state: str) -> None:
         """一个主动关怀节拍。判定放在 core/proactive.py，这里只负责执行。
 
         ``last_user_at`` 取自 ``dialogue.last_user_text_at`` —— 那是**唯一**
         的「用户在场证据」。麦克风、8002、``--stdin`` 三条输入路径都经由
         ``handle_chat`` 汇到它，所以这里读一个字段就够了。
+
+        ⚠️ **本方法绝不能因为"反正要静默"而提前 return。**
+        ``tick()`` 除了取决策还无条件做两件记账：:meth:`_track_state` 维护
+        ``_state_since``（``sustain`` 的判据就靠它），以及把
+        ``_greeting_pending`` 清掉。跳过 tick 会让这台状态机停在原地 ——
+        表现是"老人一专注，状态持续时长就永远算不出来"，而恢复之后
+        关怀要重新等一整个 sustain 才可能触发。
         """
         if not self.args.proactive:
             return
 
         decision = self.proactive.tick(
-            state, last_user_at=self.dialogue.last_user_text_at)
+            state,
+            last_user_at=self.dialogue.last_user_text_at,
+            focused=self._focus_liveness(),
+        )
         if decision is not None:
             self._fire_proactive(decision)
 
@@ -818,6 +878,18 @@ class BackendB:
             start, end = self.proactive.policy.quiet_hours
             proactive += f"（{start}:00–{end}:00 静默，仅静默主动开口）"
 
+        # 专注静默单独一行：它默认是开的，而且**只有在 A 真的发了 §3.5
+        # focus 报文时才可能生效**。这一行让"校准还没做完 / A 没发"与
+        # "老人没有专注"在开机就能分辨 —— 否则两者在日志里长得一样。
+        if not self.args.focus_silence:
+            focus_line = "已关闭（--no-focus-silence）"
+        else:
+            focus_line = (
+                f"已开启（VAI ≥ {config.FOCUS_SILENT_MIN_INDEX:g}，"
+                f"数据超过 {config.FOCUS_STALE_SECONDS:g}s 未更新即视为无效，"
+                f"抑制上限 {self.proactive.focus_suppress_max:.0f}s）"
+            )
+
         print("=" * 62)
         print("  居家陪伴机器人 · 后端 B")
         print("-" * 62)
@@ -828,6 +900,7 @@ class BackendB:
         print(f"  语音        {voice}")
         print(f"  大模型对话  {llm_line}")
         print(f"  主动关怀    {proactive}")
+        print(f"  专注静默    {focus_line}")
         print("-" * 62)
         print("  Ctrl+C 退出")
         print("=" * 62)
@@ -897,6 +970,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-quiet-hours", action="store_true",
                         help="关闭 22:00–07:00 的静默时段。"
                              "注意静默时段只静默**主动**开口，应答永远不受影响")
+    parser.add_argument("--focus-silence", action=argparse.BooleanOptionalAction,
+                        default=config.FOCUS_SILENT_ENABLED,
+                        help="专注静默：老人正专注时暂不主动开口（--no-focus-silence 关闭）。"
+                             "指数由 core/focus.py 从 A 的 §3.5 focus 报文选出来，"
+                             "**B 内部使用，不下发 C**；应答永远不受影响")
 
     # ---- 语音 ----
     parser.add_argument("--voice", action=argparse.BooleanOptionalAction,

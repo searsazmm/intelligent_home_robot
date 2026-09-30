@@ -548,12 +548,26 @@ class MediaPipeFaceBackend(BaseFaceBackend):
 
     # ------------------------------------------------------------ 视线
 
-    def _gaze_off(self, landmarks) -> float:
-        """粗略的视线偏离度 [0,1]。
+    def _gaze_off(self, landmarks) -> float | None:
+        """粗略的视线偏离度 ``[0,1]``；**估不出来时返回 ``None``**。
 
         做法：虹膜中心相对于两眼内/外角中点的水平偏移 ÷ 眼宽。
         单目、无标定，**只做趋势用**（方案里注意力判定本来也要求
         "偏离持续 6 秒以上"，单帧噪声会被时间维度滤掉）。
+
+        ⚠️ **"估不出来"必须是 ``None``，不能是 ``0.0``。**
+        ``0.0`` 在这条链路上是"视线完全对正前方"，也就是**专注度满分**。
+        早先这里在两处返回 ``0.0``（468 点模型没有虹膜点、两眼都量不出眼宽），
+        于是一条"根本看不见眼睛"的帧会被读成"非常专注"。
+        两个方向的后果都很坏，而且都不报错：
+
+        * 对判"失神"而言，这些帧还留在分母里 → 偏离占比被系统性压低 →
+          结论偏向 FOCUSED（见 ``metrics/attention.py`` 的 ``snapshot``）；
+        * 对 ③b 的 VAI 而言，相当于给"不知道"打满分。
+
+        出站那一层不受影响：``wire.to_v1_sample`` 用的是 :data:`_NO_FACE`
+        兜的 8 字段报文，本来就不带视线；视线只走 §3.5 的 ``focus`` 报文，
+        那里 ``None`` 是一等公民。
         """
         offs = []
         for eye_idx, iris_idx in (
@@ -562,7 +576,7 @@ class MediaPipeFaceBackend(BaseFaceBackend):
         ):
             if len(landmarks) <= max(iris_idx):
                 # 478 点模型才有虹膜；468 点模型上直接放弃估计。
-                return 0.0
+                return None
             p1 = landmarks[eye_idx[0]]
             p4 = landmarks[eye_idx[3]]
             width = abs(p4.x - p1.x)
@@ -571,7 +585,8 @@ class MediaPipeFaceBackend(BaseFaceBackend):
             iris_x = sum(landmarks[i].x for i in iris_idx) / len(iris_idx)
             offs.append(abs(iris_x - (p1.x + p4.x) / 2.0) / width)
         if not offs:
-            return 0.0
+            # 两眼都没有可用眼宽 —— 同样是"估不出来"，不是"很专注"。
+            return None
         return _clamp01(max(offs) * GAZE_OFFSET_GAIN)
 
     # ------------------------------------------------------------ 质量

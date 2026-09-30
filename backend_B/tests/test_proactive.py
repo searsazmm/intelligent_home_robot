@@ -18,6 +18,9 @@ from core.dialogue import DialogueEngine                         # noqa: E402
 from core.proactive import (                                     # noqa: E402
     CARE_KINDS,
     CAP_WINDOW_SECONDS,
+    GATE_FOCUS,
+    GATE_NO_TRIGGER,
+    GATE_SPEAKING,
     ProactiveContext,
     ProactiveDecision,
     ProactivePolicy,
@@ -41,6 +44,7 @@ def open_context(**overrides) -> ProactiveContext:
         greeting_pending=False,
         speaking=False,
         started_at=T0 - 1000.0,        # 早过了宽限期
+        focused=False,                 # 老人没有在专注（门禁 8）
     )
     base.update(overrides)
     return ProactiveContext(**base)
@@ -628,6 +632,187 @@ class TestDialogueIntegration(unittest.TestCase):
     def test_respond_with_from_user_false_does_not_record(self):
         self.engine.respond("我陪着您", from_user=False)
         self.assertEqual(self.engine.last_user_text_at, 0.0)
+
+
+class TestFocusGate(unittest.TestCase):
+    """门禁 8：老人正在专注 → 不主动开口（需求文档 §4 B2 的 focus）。
+
+    这一组的重点是**它压什么、不压什么**，以及"被它挡住"这件事是可观测的。
+    """
+
+    def setUp(self):
+        self.policy = ProactivePolicy(
+            sustain=20.0, min_interval=90.0, max_per_hour=4,
+            user_cooldown=60.0, greeting_absent=60.0, startup_grace=15.0,
+            quiet_hours=(22, 7), quiet_enabled=True,
+        )
+
+    def test_silent_while_focused(self):
+        ctx = open_context(focused=True)
+        self.assertIsNone(self.policy.evaluate(ctx))
+        # 光看 None 分不出它和"深夜""没到 sustain"，所以要能问出原因。
+        self.assertEqual(self.policy.assess(ctx).suppressed_by, GATE_FOCUS)
+
+    def test_fires_when_not_focused(self):
+        """对照组：同一份输入，只把 focused 翻过来，就该开口。
+
+        没有这一条，上面那条测试在"整个策略坏掉、永远返回 None"时也会绿。
+        """
+        decision = self.policy.evaluate(open_context(focused=False))
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "care_sad")
+
+    def test_focus_suppresses_greeting_too(self):
+        """**问候也压**：刚回到座位就埋头看报的人，不该被"您回来啦"打断。
+
+        所以门禁 8 必须在"选触发"**之前**（见 assess 里的位置说明）。
+        它压的是**主动**开口；老人先开口说话的那条路走 handle_chat，
+        根本不经过这里。
+        """
+        ctx = open_context(focused=True, greeting_pending=True,
+                           state=config.STATE_NORMAL)
+        self.assertIsNone(self.policy.evaluate(ctx))
+        self.assertEqual(self.policy.assess(ctx).suppressed_by, GATE_FOCUS)
+
+    def test_focus_sits_after_the_other_gates(self):
+        """专注不是"最先被检查"的那条 —— 更硬的门禁仍然先报自己。
+
+        为什么值得钉：门禁顺序决定了日志里看到的原因。把专注插到最前面
+        也能让行为"正确"（一样是沉默），但联调时会看到"因为专注而沉默"
+        却掩盖了"其实它正在说话"。顺序本身是诊断信息的一部分。
+        """
+        ctx = open_context(speaking=True, focused=True)
+        self.assertEqual(self.policy.assess(ctx).suppressed_by, GATE_SPEAKING)
+        # 一切正常但没到 sustain 时，报的是 no_trigger 而不是 focus。
+        ctx = open_context(focused=False, state_since=T0)
+        self.assertEqual(self.policy.assess(ctx).suppressed_by, GATE_NO_TRIGGER)
+
+    def test_focus_does_not_leak_into_the_decision(self):
+        """专注是**判决的输入**，不是判决的一部分：它不该出现在对外文案里。
+
+        ``ProactiveDecision`` 会给 C 端（``to_dict``）与对话引擎用，
+        多带一个 focus 字段就等于把 B 的内部信号泄出去 ——
+        需求文档 §4 B2 明确要求 focus **不下发 C**。
+        """
+        decision = self.policy.evaluate(open_context(focused=False))
+        self.assertEqual(set(decision.to_dict()), {"kind", "state", "reason"})
+
+
+class TestFocusSuppression(unittest.TestCase):
+    """调度器上的专注静默：时长上限、记账不能停。"""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.policy = ProactivePolicy(
+            sustain=20.0, min_interval=90.0, max_per_hour=4,
+            user_cooldown=60.0, greeting_absent=60.0, startup_grace=15.0,
+            quiet_hours=(22, 7), quiet_enabled=True,
+        )
+
+    def _scheduler(self, focus_suppress_max=30.0):
+        return ProactiveScheduler(
+            policy=self.policy, clock=self.clock, hour_provider=lambda: 15,
+            focus_suppress_max=focus_suppress_max,
+        )
+
+    def _establish(self, scheduler, state, settle=True):
+        self.clock.advance(self.policy.startup_grace + 1.0)
+        scheduler.tick(state, focused=False)
+        if settle:
+            self.clock.advance(self.policy.sustain + 1.0)
+
+    def test_silent_while_focused(self):
+        scheduler = self._scheduler()
+        self._establish(scheduler, config.STATE_SAD)
+        for _ in range(10):
+            self.clock.advance(0.2)
+            self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True))
+        self.assertEqual(scheduler.last_assessment.suppressed_by, GATE_FOCUS)
+
+    def test_cap_releases_within_the_limit(self):
+        """连续专注超过上限 → 放行一次，随后重新计时。
+
+        这条是"关掉一个功能但不留痕迹"的解药：没有它，一位一直看书的老人
+        会得到**无限期**的静默，而日志里一片安静。
+        """
+        scheduler = self._scheduler(focus_suppress_max=30.0)
+        self._establish(scheduler, config.STATE_SAD)
+
+        self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True))
+        self.clock.advance(29.0)
+        self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True),
+                          "还没到上限，仍应沉默")
+
+        self.clock.advance(2.0)                       # 累计 31 秒 > 30
+        decision = scheduler.tick(config.STATE_SAD, focused=True)
+        self.assertIsNotNone(decision, "到了上限就该放行一次")
+        self.assertEqual(decision.kind, "care_sad")
+
+        # 放行之后窗口重开：紧接着的下一次仍然沉默（而不是永久恢复）。
+        self.clock.advance(0.2)
+        self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True))
+
+    def test_cap_window_restarts_when_focus_ends(self):
+        """专注中断一次就重新计时 —— 不能把前后两段拼成一段。
+
+        拼起来的话，"专注 20 秒 → 走开 1 秒 → 再专注 20 秒"会累计到 40 秒
+        而提前放行；对老人来说那是两回事。
+        """
+        scheduler = self._scheduler(focus_suppress_max=30.0)
+        self._establish(scheduler, config.STATE_SAD)
+
+        self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True))
+        self.clock.advance(25.0)
+        self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True))
+
+        # 中断。这一拍**本来就该开口**（专注结束了，sustain 早满了），
+        # 与窗口记账无关，所以这里不断言返回值 —— 而且 tick 不会自己
+        # 调 note_proactive，所以它也不影响后面几拍。
+        self.clock.advance(0.2)
+        scheduler.tick(config.STATE_SAD, focused=False)
+
+        self.clock.advance(0.2)
+        self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True))   # 重新计时
+        self.clock.advance(25.0)
+        self.assertIsNone(scheduler.tick(config.STATE_SAD, focused=True),
+                          "重新计时后 25 秒还不该放行（累计的话早过了）")
+
+    def test_state_tracking_does_not_stop_while_focused(self):
+        """专注期间 ``_state_since`` 照常维护（于是也照常被"状态变了"重置）。
+
+        这条守的是 main.py 那边的用法：**绝不能因为反正要静默就跳过 tick**。
+        跳过的话这台状态机停在原地，恢复之后关怀要重新等一整个 sustain。
+        这里能直接观察的后果就是 `_state_since` 不再跟着状态变。
+        """
+        scheduler = self._scheduler(focus_suppress_max=1e9)   # 关掉上限这条线
+        self._establish(scheduler, config.STATE_TIRED)
+
+        self.clock.advance(5.0)
+        scheduler.tick(config.STATE_TIRED, focused=True)
+        since = scheduler._state_since
+
+        self.clock.advance(5.0)
+        scheduler.tick(config.STATE_SAD, focused=True)        # 状态变了
+        self.assertGreater(scheduler._state_since, since,
+                           "专注期间状态计时也必须归零")
+
+    def test_greeting_edge_is_consumed_even_when_suppressed(self):
+        """被专注挡掉的问候**算用掉了**，不会等专注结束再补说一句。
+
+        老实说这是个有得有失的选择：那位老人确实永远听不到那句「您回来啦」。
+        但迟到的问候比不说更奇怪（"您回来啦"——在三分钟后），
+        而且这与静默时段下的既有行为一致（见 tick 的注释）。
+        写下这条是为了让它成为一个**有意的**行为，而不是某天被人发现。
+        """
+        scheduler = self._scheduler()
+        self._establish(scheduler, config.STATE_ABSENT, settle=False)
+        self.clock.advance(120.0)                                   # 离开 2 分钟
+        self.assertIsNone(scheduler.tick(config.STATE_NORMAL, focused=True))
+
+        self.clock.advance(0.2)
+        decision = scheduler.tick(config.STATE_NORMAL, focused=False)
+        self.assertTrue(decision is None or decision.kind != "greeting",
+                        "问候是一次性的边沿，被挡掉就该算用掉")
 
 
 if __name__ == "__main__":

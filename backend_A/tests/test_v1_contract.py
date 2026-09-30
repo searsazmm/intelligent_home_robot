@@ -47,6 +47,7 @@ from module_a_vision.wire import (  # noqa: E402
     build_focus_payload,
     build_rppg_payload,
     check_contract,
+    to_focus_payload,
     to_v1_sample,
 )
 
@@ -61,12 +62,18 @@ def make_frame(
     pitch: float = 1.0,
     yaw: float = -2.0,
     roll: float = 3.0,
+    gaze: float | None = None,
 ) -> FrameFeatures:
     """造一帧特征。只填投影层关心的字段，其余走默认值。
 
     注意用的是 :class:`FrameQuality`（字段名 ``valid``），不是
     ``shared.schema.Quality``（字段名 ``usable``）—— 后者是**窗口级**质量。
     这两个类名字像、语义不同，混用会得到一个非常难查的 TypeError。
+
+    ``gaze`` 默认 ``None``（"估不出来"），这是 :class:`FrameFeatures` 的
+    默认值，也是 CSV 回放的真实取值。要在 ``focus`` 投影里得到一条可用
+    视线就必须显式传它 —— 这个"必须显式"正是我们要的：默认值不能是
+    ``0.0``，那会静默伪造"视线完全对正"。
     """
     return FrameFeatures(
         ts=ts,
@@ -76,6 +83,7 @@ def make_frame(
         pitch_deg=pitch,
         yaw_deg=yaw,
         roll_deg=roll,
+        gaze_off_ratio=gaze,
         quality=FrameQuality(valid=usable),
     )
 
@@ -471,6 +479,86 @@ class TestFocusContract(unittest.TestCase):
         payload = self.clean()
         payload["target_roi_probability"] = 0.7
         self.assertIn("多余", " ".join(assert_focus_contract(payload)))
+
+
+class TestFocusFromFrame(unittest.TestCase):
+    """``to_focus_payload``：一帧特征 → §3.5 视线报文。
+
+    这是 ``focus`` 通道的**唯一**构造点（``server._emit_focus`` 与
+    ``main._dry_run_v1`` 都调它）。两条路径共用它，是为了让"实跑的流"
+    与"--dry-run 打出来的流"不可能分叉。
+    """
+
+    def test_usable_gaze_becomes_measured(self) -> None:
+        payload = to_focus_payload(make_frame(ts=3.0, gaze=0.25))
+        self.assertEqual(set(payload), set(FOCUS_FIELDS))
+        self.assertEqual(payload["type"], MSG_FOCUS)
+        self.assertAlmostEqual(payload["gaze"], 0.25, places=4)
+        self.assertEqual(payload["gaze_quality"], 1.0)
+        self.assertEqual(assert_focus_contract(payload), [])
+
+    def test_frame_without_gaze_is_null_not_zero(self) -> None:
+        """没有视线信息 → ``gaze=null``，**不是** ``0.0``。
+
+        ``0.0`` 在这条链路上是"视线完全对正前方"（专注满分）。拿它当
+        "估不出来"的哨兵值，等于对每一帧看不见眼睛的画面宣布专注满分。
+        """
+        payload = to_focus_payload(make_frame(ts=3.0, gaze=None))
+        self.assertIsNone(payload["gaze"])
+        self.assertEqual(payload["gaze_quality"], 0.0)
+        self.assertEqual(assert_focus_contract(payload), [])
+
+    def test_every_frame_produces_a_packet_even_without_gaze(self) -> None:
+        """**不可用也要照发。** 跳过会让 B 的样本间隔凭空拉长。
+
+        ``PassiveCalibrator`` 按 ``max_sample_gap_seconds`` 判定"这段观察
+        时间还算不算数"，间隔超限就 ``reset()``。所以"这一帧没量到"必须
+        是一条**报文**，而不是一条**空白**。
+        """
+        for frame in (
+            make_frame(gaze=None),
+            make_frame(has_face=False, gaze=0.3),
+            make_frame(usable=False, gaze=0.3),
+        ):
+            with self.subTest(frame=repr(frame)[:60]):
+                payload = to_focus_payload(frame)
+                self.assertEqual(set(payload), set(FOCUS_FIELDS))
+                self.assertIsNone(payload["gaze"])
+                self.assertEqual(payload["gaze_quality"], 0.0)
+
+    def test_gaze_never_contradicts_the_frame_message(self) -> None:
+        """**单向**不变式：有视线 ⟹ 帧报文里有人脸。
+
+        注意**不是等价**。反过来不成立，而且不成立才是对的：
+        "看得见人"与"量得到视线"是两件事，CSV 回放里前者为真、后者恒假
+        （V1 CSV 没有视线列）。
+
+        单看代码不会觉得这里有什么问题，但**方向搞反就是一条真缺陷**：
+        若视线报文在"帧报文说没人脸"的时候给出一个数，B 就会拿一条
+        根本不存在的观测去做校准，而且两边各自的日志都干干净净。
+        所以这条只钉一个方向：**帧说没人，视线必须是 null**。
+        """
+        cases = (
+            (make_frame(gaze=0.4), True, True),
+            (make_frame(gaze=None), True, False),
+            (make_frame(has_face=False, gaze=0.4), False, False),
+            (make_frame(usable=False, gaze=0.4), False, False),
+            (make_frame(has_face=False, usable=False, gaze=None), False, False),
+        )
+        for frame, expect_face, expect_gaze in cases:
+            with self.subTest(frame=repr(frame)[:60]):
+                frame_payload = to_v1_sample(
+                    frame, blink_total=0, emotion=Emotion.NORMAL
+                )
+                focus_payload = to_focus_payload(frame)
+                self.assertEqual(frame_payload["has_face"], expect_face)
+                self.assertEqual(focus_payload["gaze"] is not None, expect_gaze)
+                if focus_payload["gaze"] is not None:
+                    self.assertTrue(
+                        frame_payload["has_face"],
+                        "帧报文说没人脸，视线报文却给了一个数 —— "
+                        "B 会拿这条不存在的观测去做校准",
+                    )
 
 
 class TestBlinkCounter(unittest.TestCase):

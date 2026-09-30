@@ -289,6 +289,50 @@ class TestWireShape(unittest.TestCase):
             f"体征通道是死的？检查 build_server 有没有给合成源挂 vitals",
         )
 
+    def test_focus_packets_actually_flow(self) -> None:
+        """**观察窗内必须收到视线报文，而且要与帧数同量级。**
+
+        与上面那条体征断言同一个理由，但**更硬**：视线报文与帧**同频**，
+        所以它的条数应当和帧数相当（10fps 跑 6 秒 ≈ 60 条）。B 的
+        ``PassiveCalibrator`` 要求 ``≥30 个样本``且相邻样本间隔 ≤1 秒，
+        掉到 1Hz 以下它就每次 ``update()`` 都 ``reset()`` ——
+        **"校准永远做不完"而不报任何错**。
+
+        下限取帧数的**一半**而不是相等：裸 socket 的收发与拆包会丢一点
+        边角（观察窗的头尾各切一刀），而"是不是同频"这个判断在 30 与 60
+        之间已经足够清楚。真正的"一个不差"由 ``--dry-run`` 的收尾断言看着
+        （那里没有 socket，数得清）。
+        """
+        focus = [p for p in self.typed if p["type"] == "focus"]
+        self.assertGreaterEqual(
+            len(focus),
+            len(self.frames) // 2,
+            f"{OBSERVE_SEC:.0f} 秒收到 {len(focus)} 条视线报文，"
+            f"而帧有 {len(self.frames)} 条 —— 视线通道被抽稀了？"
+            f"B 的 VAI 校准会因此永远做不完，且不报错",
+        )
+
+    def test_focus_gaze_is_null_exactly_when_quality_is_zero(self) -> None:
+        """钉住 §3.5.3 的不变式：``gaze is None ⟺ gaze_quality == 0``。
+
+        这条契约已经在 ``wire.assert_focus_contract`` 里查过一遍（上面
+        ``test_every_message_passes_the_contract_gate`` 会跑），这里再在
+        真实流上单独钉一次，是因为**它是对端唯一能拿到的"这一帧有没有量到"
+        的信号**：B 只据 ``gaze is None`` 决定要不要把这一帧算进校准窗口，
+        而**刻意不去看那个质量分**（那是 A 给自己打的分）。两者不一致时，
+        B 采信哪一半都会算错。
+        """
+        focus = [p for p in self.typed if p["type"] == "focus"]
+        self.assertTrue(focus, "一条视线报文都没有")
+        for i, payload in enumerate(focus):
+            with self.subTest(index=i):
+                self.assertEqual(
+                    payload["gaze"] is None,
+                    payload["gaze_quality"] == 0.0,
+                    f"gaze={payload['gaze']!r} 与 "
+                    f"gaze_quality={payload['gaze_quality']!r} 不一致",
+                )
+
     def test_vitals_hr_may_be_null(self) -> None:
         """``hr`` 允许是 ``null`` —— 那是**正常态**，不是错误。
 
@@ -376,6 +420,21 @@ class TestAgainstRealEvaluator(unittest.TestCase):
         )
         self.assertEqual(self.client.typed.unknown, 0, "出现了白名单外的报文类型")
         self.assertEqual(self.client.typed.malformed, 0, "有报文没通过 B 侧的 §3.5 校验")
+
+    def test_focus_packets_reached_the_real_client(self) -> None:
+        """真实 B 客户端也认得出 ``focus`` 报文。
+
+        与体征那条分开写，是因为两者在 B 侧走的是**两条独立的解析分支**
+        （``_parse_rppg`` / ``_parse_focus``）。体征通了完全不能推出视线也通 ——
+        而视线的失效方式恰恰是最安静的那种：B 把不认识的类型**丢弃并计数**，
+        于是 A 这边照发不误，B 那边一条都没收到，谁的日志也不难看。
+        """
+        self.assertGreaterEqual(
+            self.client.typed.counts.get("focus", 0),
+            30,
+            f"真实 B 客户端几乎没有收到 focus（计数={self.client.typed.counts}）——"
+            f" 两项里有一侧没接上，或者视线通道根本没在跑",
+        )
 
     def test_state_becomes_normal(self) -> None:
         """**字段名对上了没有，这一条说了算。**

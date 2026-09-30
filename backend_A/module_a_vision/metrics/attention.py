@@ -34,6 +34,20 @@ class AttentionMetrics:
     gaze_off_sec: float = 0.0
     stable_sec: float = 0.0
     frames_ratio: float = 0.0
+    #: 本窗口里**真的带视线信息**的帧数（``gaze_off_ratio is not None``）。
+    #:
+    #: 存在的理由是让"没有视线信息"这件事**看得出来**。``Attention`` 只有
+    #: FOCUSED / ABSENT 两态，没有"无数据"，所以整窗都没有视线信息时
+    #: ``frames_ratio`` 会算出 0.0、``label`` 是 ``FOCUSED`` —— 与"确实一直
+    #: 很专注"在结构上无法区分。``gaze_frames == 0`` 就是那个区分的把手：
+    #: **看到 ``label=FOCUSED`` 且 ``gaze_frames == 0``，应当读成"这一窗没有
+    #: 测量"，而不是"老人很专注"。**
+    #:
+    #: 实测会走到这里的两条路：CSV 回放（api_doc §3.4 的 V1 CSV **没有视线
+    #: 列**，于是每帧都是 ``None``）、以及两眼都量不出眼宽的退化检测。
+    #: A-包实跑用的 ``face_landmarker.task`` 是 478 点（带虹膜），正常帧上
+    #: 这个数等于本窗口的有效帧数。
+    gaze_frames: int = 0
 
 
 class AttentionTracker:
@@ -60,7 +74,11 @@ class AttentionTracker:
             self._confirmed = False
             return
 
-        off = frame.gaze_off_ratio >= self._gaze_th
+        # `gaze_off_ratio is None` = 这一帧没有视线信息。**当作"不偏离"处理，
+        # 并断开偏离段** —— 与上面"无人脸"那条同一个道理：看不见不是失神。
+        # 不能拿 0.0 去顶替（那是"完全对正"），也不能让它参与 `>=` 比较
+        # （`None >= float` 抛 TypeError，会打死聚合主循环）。
+        off = frame.gaze_off_ratio is not None and frame.gaze_off_ratio >= self._gaze_th
         if off:
             if self._off_start is None:
                 self._off_start = frame.ts
@@ -91,10 +109,25 @@ class AttentionTracker:
             for f in window_frames
             if f.has_face
             and f.quality.valid
+            and f.gaze_off_ratio is not None
             and f.gaze_off_ratio >= self._gaze_th
         )
+        # ⚠️ 分母**必须**把"有脸但没视线信息"的帧排除掉。这是这次改动里
+        # 唯一会**静默**出错的地方：只给 `off_frames` 加 None 守卫、不动分母，
+        # 代码不会崩、测试全绿、日志干净，但分母被那些永远进不了分子的帧
+        # 撑大 → `ratio` 被系统性压低 → 失神初判整体偏向 FOCUSED。
+        #
+        # 实况（会真的走到的一条）：**CSV 回放**里 api_doc §3.4 的 V1 CSV
+        # 没有视线列，于是每一帧的 `gaze_off_ratio` 都是 `None`；分母曾经是
+        # "所有有脸的帧"而分子恒为 0。混合行（有些行有视线列、有些没有）时
+        # 更隐蔽：ratio 被那些行压低，失神的初判整体偏向 FOCUSED，
+        # 而分子分母各自单看都没毛病。
         valid_frames = sum(
-            1 for f in window_frames if f.has_face and f.quality.valid
+            1
+            for f in window_frames
+            if f.has_face
+            and f.quality.valid
+            and f.gaze_off_ratio is not None
         )
         ratio = off_frames / valid_frames if valid_frames else 0.0
 
@@ -120,6 +153,7 @@ class AttentionTracker:
                 gaze_off_sec=off_sec,
                 stable_sec=off_sec,
                 frames_ratio=ratio,
+                gaze_frames=valid_frames,
             )
 
         return AttentionMetrics(
@@ -128,4 +162,5 @@ class AttentionTracker:
             gaze_off_sec=off_sec,
             stable_sec=0.0,
             frames_ratio=ratio,
+            gaze_frames=valid_frames,
         )

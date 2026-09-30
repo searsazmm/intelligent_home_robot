@@ -37,7 +37,13 @@ from .server import (
     build_server,
     describe_hints,
 )
-from .wire import check_contract, describe_typed, describe_v1, to_v1_sample
+from .wire import (
+    check_contract,
+    describe_typed,
+    describe_v1,
+    to_focus_payload,
+    to_v1_sample,
+)
 
 
 def _prepare_console() -> None:
@@ -132,6 +138,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--focus",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "是否发 api_doc §3.5 的视线报文（focus，逐帧）。"
+            "关掉会让 B 的 VAI 校准永远做不完且不报错，"
+            "只应在排查协议问题时临时关掉"
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="不起 TCP 服务，只把窗口打到标准输出（用于验证数据契约）",
@@ -171,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             emit_mode=args.emit,
             vitals=args.vitals,
+            focus=args.focus,
         )
     except (ValueError, RuntimeError, ImportError) as exc:
         print(f"[A] 启动失败：{exc}", file=sys.stderr)
@@ -202,13 +219,33 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _summarize_sent(server: VisionServer) -> str:
-    """收摊时那行摘要。两种模式发的报文种类不同，数字的含义也不同。"""
+    """收摊时那行摘要。两种模式发的报文种类不同，数字的含义也不同。
+
+    ``focus_packets`` 与 ``v1_frames`` 在视线通道开着时**应当相等**
+    （两者都只在报文真的发出去之后才自增，而且视线与帧同频）。对不上就
+    单独点一句：那说明有帧没走到 :meth:`VisionServer._emit_focus` ——
+    链路照跑、帧报文照发，只有 B 的 VAI 一直不出指数，**没有任何报错**。
+    """
     if server.emit_mode == EMIT_V1:
-        return (
+        focus = (
+            f" + {server.stats['focus_packets']} 条 §3.5 视线报文"
+            if server.focus
+            else "（视线通道关闭）"
+        )
+        line = (
             f"共推送 {server.stats['v1_frames']} 帧 §3.2 报文"
             f" + {server.stats['rppg_packets']} 条 §3.5 体征报文"
+            f"{focus}"
             f"（读取 {server.stats['frames']} 帧）"
         )
+        if server.focus and (
+            server.stats["focus_packets"] != server.stats["v1_frames"]
+        ):
+            line += (
+                f"\n[A] ⚠ 视线报文数与帧报文数不一致 —— 有帧没走到视线通道，"
+                f"B 的专注度指数不会出来"
+            )
+        return line
     return f"共推送 {server.stats['windows']} 个窗口"
 
 
@@ -229,7 +266,7 @@ def _dry_run(server: VisionServer, every: int = 10) -> int:
 
 
 def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
-    """逐帧投影、打印、过契约闸，并**照发** §3.5 的体征报文。
+    """逐帧投影、打印、过契约闸，并**照发** §3.5 的两条类型化报文。
 
     ``every`` 是打印间隔而不是采样间隔 —— 计数器与契约检查**每一帧都跑**，
     只是不每帧都打印。若拿它当采样阈值，契约检查就会漏掉它跳过的那几帧。
@@ -243,11 +280,13 @@ def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
     source = server.source
     aggregator = server.aggregator
     vitals = server.vitals
+    focus_on = server.focus
 
     source.open()
     frames = 0
     violations = 0
     vitals_sent = 0
+    focus_sent = 0
     last: dict | None = None
     try:
         while True:
@@ -269,7 +308,7 @@ def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
             if frames % every == 0:
                 print(describe_v1(payload))
 
-            # 体征通道与实跑走**同一条**路径（server._emit_side_channels），
+            # 体征通道与实跑走**同一条**路径（server._emit_vitals），
             # 时间戳同样取 frame.ts。
             if vitals is not None:
                 typed = vitals.feed(frame.ts)
@@ -282,6 +321,18 @@ def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
                     # 印到的多半是帧报文）。
                     if problems or vitals_sent % 5 == 1:
                         print(describe_typed(typed))
+
+            # 视线通道同样复用实跑的那个构造器（wire.to_focus_payload），
+            # **逐帧** —— 所以这里不能写成 "vitals 有才发"。
+            if focus_on:
+                typed = to_focus_payload(frame)
+                problems = _check(typed, frames)
+                violations += problems
+                focus_sent += 1
+                # 逐帧报文不能逐帧打印，否则输出会被它淹没、帧报文反而看不见。
+                # 抽取按 every 的节奏，契约检查**每一帧都跑**。
+                if problems or frames % every == 0:
+                    print(describe_typed(typed))
 
             # v1 不消费窗口，但必须排空缓冲（详见 server._emit_v1）。
             if aggregator.should_close(frame.ts):
@@ -298,7 +349,7 @@ def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
 
     print(
         f"\n[A] 共投影 {frames} 帧 §3.2 报文 + {vitals_sent} 条 §3.5 体征报文"
-        f"（未起服务）  契约违规 {violations} 条"
+        f" + {focus_sent} 条 §3.5 视线报文（未起服务）  契约违规 {violations} 条"
     )
     if violations:
         print("[A] ⚠ 有报文不符合 api_doc，接上 backend_B 会静默失效")

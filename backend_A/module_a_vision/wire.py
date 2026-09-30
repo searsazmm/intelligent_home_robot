@@ -53,6 +53,11 @@ api_doc §3.2 是**逐帧流式**协议，一条报文一帧。这不是随手�
 ``{"type":"focus", …}``      视线：偏离度 + 获取质量
 ============================ ==================================================
 
+**两者的速率不一样，而且是各自的功能决定的，不是随手定的**：``rppg`` 约
+1Hz（``Rppg`` 的窗口本身就是 8 秒，发密了没有新信息），``focus`` 则
+**与帧同频** —— 掉到 1Hz 以下会让 B 的 VAI 校准**静默**永远做不完，
+理由写在 :func:`to_focus_payload` 里。
+
 **帧报文仍然不带 ``type``。** §3.5 草案里曾写"现有视觉帧标 ``type:"frame"``"，
 本模块刻意**不**那么做，理由有两条，任一条都足够：
 
@@ -133,6 +138,20 @@ RPPG_FIELDS: tuple[str, ...] = ("type", "timestamp", "hr", "rr", "ibi_ms")
 
 #: 视线报文的字段集合。
 FOCUS_FIELDS: tuple[str, ...] = ("type", "timestamp", "gaze", "gaze_quality")
+
+#: ``gaze_quality`` 的两个取值。**刻意只有两档，没有中间值。**
+#:
+#: A 侧给不出可信的连续质量分：``_gaze_off`` 是一个纯几何比值，没有标定集、
+#: 没有误差模型，"这个 0.83 有多可信"在 A 这边无从谈起。更要紧的是**方向**：
+#: 让 A 给自己的估计打分，等于让被测方给自己的考卷评分 —— B 若拿这个分去开
+#: 自己的门控，那道门控就形同虚设。所以这里只表达**这一帧到底量到没有**，
+#: 真正的质量判据（人脸大小、遮挡、头姿是否在校准范围内）留给 B 侧，
+#: 因为只有 B 手里有跨帧的个人基线。
+#:
+#: **B 不得拿这个数字去做门控**，只能据 ``gaze is None`` 判断有无。
+GAZE_QUALITY_MEASURED = 1.0
+#: 这一帧取不到视线（无人脸 / 画面不可用 / 模型没有虹膜点）。
+GAZE_QUALITY_NONE = 0.0
 
 #: ``hr`` 的合法区间（bpm）。下界 30 不是"再低就不可能"，而是
 #: :class:`~rppg.Rppg` 的带通下限 0.7Hz ≈ 42bpm 减去一个 FFT 分辨率
@@ -316,7 +335,9 @@ def build_focus_payload(
         语义完全不同：后者是"正对着镜头"，前者是"不知道"。
         A 侧把这两者区分开，B 才可能不把"不知道"当成"很专注"。
     :param gaze_quality: ``[0,1]``。**必须与 ``gaze`` 是否为 ``None`` 一致**
-        （见 :func:`assert_focus_contract` 的不变式）。
+        （见 :func:`assert_focus_contract` 的不变式）。A 侧只会填
+        :data:`GAZE_QUALITY_MEASURED` 或 :data:`GAZE_QUALITY_NONE`
+        —— 这个字段表达的是**可用性**而不是精度，理由见那两个常量。
     """
     return {
         "type": MSG_FOCUS,
@@ -324,6 +345,47 @@ def build_focus_payload(
         "gaze": None if gaze is None else round(float(gaze), 4),
         "gaze_quality": round(float(gaze_quality), 4),
     }
+
+
+def to_focus_payload(frame: FrameFeatures) -> dict[str, Any]:
+    """把**一帧**投影成 §3.5 的视线报文。与 :func:`to_v1_sample` 并列。
+
+    **逐帧调用、与帧报文同频 —— 这是功能前提，不是性能取舍。**
+
+    B 侧的 VAI 要先过 ``PassiveCalibrator``，它的 ``ready()`` 是一个 AND：
+    ``≥5.0 秒`` **且** ``≥30 个样本``；而且它按 ``max_sample_gap_seconds``
+    判定"这段观察时间还算不算数"（``non-contact/专注度指数/focus_index/
+    inference/calibration.py``）。**速率一旦掉到 1Hz 以下**，有效观察时长
+    停止累加、每次 ``update()`` 都 ``reset()``，表现是"校准永远做不完"，
+    **没有任何报错**。按 2Hz 发的话，首个指数要 25 秒才出得来
+    （30 样本 15 秒 + ``min_valid_seconds_for_index`` 10 秒）。
+    每条报文只有两个数，与帧同频的成本可以忽略。
+
+    可用性判据里那一半"看得见人"与 :func:`to_v1_sample` 的 ``has_face``
+    **刻意是同一个表达式**（``has_face and quality.valid``）。两边都加上
+    视线那一半之后，关系是**子集而不是等价**：
+
+    * 有视线 ⟹ 帧报文里有人脸（这条必须成立：帧说没人却报出视线，
+      B 会拿一条不存在的观测去做校准）；
+    * 反过来不成立，**而且不成立才是对的** —— "看得见人"与"量得到视线"
+      是两件事，CSV 回放里前者为真、后者恒假（V1 CSV 没有视线列）。
+
+    所以别把它写成"帧有人脸则视线必须有值"：那会把 CSV 回放路径判成故障。
+
+    **取不到视线时照发**（``gaze=null, gaze_quality=0``），不要跳过这一帧。
+    跳过会让 B 的样本间隔凭空拉长，正好踩中上面那条"间隔超限就 reset"；
+    而"这一帧没量到"本身就是 B 的门控需要的输入。
+    """
+    usable = (
+        frame.has_face
+        and frame.quality.valid
+        and frame.gaze_off_ratio is not None
+    )
+    return build_focus_payload(
+        frame.ts,
+        gaze=frame.gaze_off_ratio if usable else None,
+        gaze_quality=GAZE_QUALITY_MEASURED if usable else GAZE_QUALITY_NONE,
+    )
 
 
 # ================================================================ §3.5 契约闸

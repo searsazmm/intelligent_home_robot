@@ -24,8 +24,9 @@ import threading
 from typing import Callable, Optional
 
 import config
+from core.focus import FocusTracker
 from core.protocol import LineBuffer, ProtocolError, decode_json_line
-from core.typed_messages import TypedMessageRouter
+from core.typed_messages import MSG_FOCUS, TypedMessageRouter
 from core.vision_state import VisionSample, VisionStateEvaluator
 
 logger = logging.getLogger(__name__)
@@ -41,15 +42,32 @@ class VisionClient:
         host: str = config.VISION_HOST,
         port: int = config.VISION_PORT,
         on_typed: Optional[Callable[[str, object], None]] = None,
+        focus: Optional[FocusTracker] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.evaluator = evaluator
         self.on_sample = on_sample
 
+        #: VAI 专注度跟踪器（api_doc §3.5.3 → core/focus.py）。
+        #:
+        #: **它挂在这里，不挂 VisionStateEvaluator。** 两个理由：
+        #: 一是它要同时看两条流（头姿/ear 在帧报文里、gaze 在 focus 报文里），
+        #: 而 ``evaluator.push()`` 只吃 ``VisionSample``；二是不该让最核心的
+        #: 判定器接受 dict，把四态防抖与 VAI 的校准/门控两套有效性模型搅在一起。
+        #:
+        #: 接线放在类内部（而不是让 main.py 自己用 on_sample/on_typed 拼）是为了
+        #: **让实时与离线两条路逐字相同** —— 与下面共用分流器同一个理由。
+        #: main.py 只管读 ``tracker.snapshot()``。
+        self.focus = focus
+
+        #: 外部订阅者。以前只是转手给分流器、不留在自己身上；现在由
+        #: :meth:`_dispatch_typed` 转发（要先过跟踪器），所以要存下来。
+        self.on_typed = on_typed
+
         #: api_doc §3.5 类型化报文的分流器。带 ``type`` 的报文在这里就被摘走，
         #: **永远走不到下面那条帧路径** —— 理由见 :mod:`core.typed_messages`。
-        self.typed = TypedMessageRouter(on_typed)
+        self.typed = TypedMessageRouter(self._dispatch_typed)
 
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
@@ -178,12 +196,30 @@ class VisionClient:
 
         self.evaluator.push(sample)
 
+        if self.focus is not None:
+            self.focus.on_sample(sample)
+
         if self.on_sample is not None:
             try:
                 self.on_sample(sample)
             except Exception:
                 # 回调是上层的事，它崩了不该带崩读取循环
                 logger.exception("on_sample 回调抛出异常，已忽略")
+
+    def _dispatch_typed(self, kind: str, reading: object) -> None:
+        """类型化报文的落点：先喂专注度跟踪器，再把原文转交给外部回调。
+
+        **顺序不能反。** :meth:`FocusTracker.on_reading` 会去配对"最近一帧"
+        帧报文，而 A 的发送顺序是「帧 → 体征 → 视线」；到这里时那一帧必然
+        已经收下（同一个 ``recv`` 里按行处理），所以只要不把两边对调就行。
+
+        抛出的异常由 :class:`TypedMessageRouter` 兜住（它把订阅方回调整个包在
+        try 里）：跟踪器崩了不该带崩视觉读取线程。
+        """
+        if self.focus is not None and kind == MSG_FOCUS:
+            self.focus.on_reading(reading)
+        if self.on_typed is not None:
+            self.on_typed(kind, reading)
 
     def _warn_missing_fields(self, payload: dict) -> None:
         """api_doc §3.2 规定的字段缺了就提醒一次（只在开头几帧提醒，避免刷屏）。"""
@@ -243,21 +279,35 @@ class OfflineVisionFeeder:
         speed: float = 1.0,
         loop: bool = True,
         on_typed: Optional[Callable[[str, object], None]] = None,
+        focus: Optional[FocusTracker] = None,
     ) -> None:
         self.csv_path = csv_path
         self.evaluator = evaluator
         self.on_sample = on_sample
         self.speed = max(speed, 0.01)   # 0 会导致除零
         self.loop = loop
+        self.on_typed = on_typed
+        # 与 :class:`VisionClient` 一样挂在这里，理由见那边的注释。
+        # 离线回放的 ts 会因 loop 归零而回退，FocusTracker 据此重置基线
+        # （core/focus.py 的 ``_detect_discontinuity``），所以演示用 --loop
+        # 时指数会反复停在 WARMING_UP —— 那是**正确行为**，不是 bug。
+        self.focus = focus
         # 与 :class:`VisionClient` **同一个**分流器。两条路各写一份 if 的话，
         # "实时对、回放错"这类差异只会在演示当天被发现。
         #
         # api_doc §3.4 的 CSV 里不会有类型化报文（导出的是逐帧视觉数据），
         # 但 ``--offline`` 也可以指向一份抓包 dump，那时就有；不接这一步，
         # 那些行会变成 has_face=false 的幽灵帧。
-        self.typed = TypedMessageRouter(on_typed)
+        self.typed = TypedMessageRouter(self._dispatch_typed)
         self._stop = threading.Event()
         self.frames_received = 0
+
+    def _dispatch_typed(self, kind: str, reading: object) -> None:
+        """同 :meth:`VisionClient._dispatch_typed` —— 两条路必须逐字相同。"""
+        if self.focus is not None and kind == MSG_FOCUS:
+            self.focus.on_reading(reading)
+        if self.on_typed is not None:
+            self.on_typed(kind, reading)
 
     def run(self) -> None:
         """阻塞回放，直到 stop() 或文件读完（loop=False 时）。"""
@@ -331,6 +381,9 @@ class OfflineVisionFeeder:
                 self.evaluator.push(sample)
                 self.frames_received += 1
                 played += 1
+
+                if self.focus is not None:
+                    self.focus.on_sample(sample)
 
                 if self.on_sample is not None:
                     try:
