@@ -37,7 +37,7 @@ from .server import (
     build_server,
     describe_hints,
 )
-from .wire import assert_v1_contract, describe_v1, to_v1_sample
+from .wire import check_contract, describe_typed, describe_v1, to_v1_sample
 
 
 def _prepare_console() -> None:
@@ -123,6 +123,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="剧本/视频循环播放，用于长时间演示",
     )
     p.add_argument(
+        "--vitals",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "是否发 api_doc §3.5 的体征报文（rppg）。只有合成源挂得上。"
+            "关掉可以得到一条只含帧报文的干净流，排查协议问题时用"
+        ),
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="不起 TCP 服务，只把窗口打到标准输出（用于验证数据契约）",
@@ -161,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.real_time if args.real_time is not None else not args.dry_run
             ),
             emit_mode=args.emit,
+            vitals=args.vitals,
         )
     except (ValueError, RuntimeError, ImportError) as exc:
         print(f"[A] 启动失败：{exc}", file=sys.stderr)
@@ -196,6 +206,7 @@ def _summarize_sent(server: VisionServer) -> str:
     if server.emit_mode == EMIT_V1:
         return (
             f"共推送 {server.stats['v1_frames']} 帧 §3.2 报文"
+            f" + {server.stats['rppg_packets']} 条 §3.5 体征报文"
             f"（读取 {server.stats['frames']} 帧）"
         )
     return f"共推送 {server.stats['windows']} 个窗口"
@@ -218,17 +229,25 @@ def _dry_run(server: VisionServer, every: int = 10) -> int:
 
 
 def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
-    """逐帧投影、打印、过契约闸。
+    """逐帧投影、打印、过契约闸，并**照发** §3.5 的体征报文。
 
     ``every`` 是打印间隔而不是采样间隔 —— 计数器与契约检查**每一帧都跑**，
     只是不每帧都打印。若拿它当采样阈值，契约检查就会漏掉它跳过的那几帧。
+
+    ⚠️ 这里的契约校验必须走 :func:`~module_a_vision.wire.check_contract`
+    （与 :meth:`VisionServer.broadcast` 同一个函数），**不能**再直接调
+    ``assert_v1_contract``。分叉的后果很具体：类型化报文会被判"多余字段"，
+    于是 ``--dry-run`` —— 排查"到底是 A 算错了还是 B 判错了"最快的那件
+    工具 —— 会持续输出与实跑不符的结论。
     """
     source = server.source
     aggregator = server.aggregator
+    vitals = server.vitals
 
     source.open()
     frames = 0
     violations = 0
+    vitals_sent = 0
     last: dict | None = None
     try:
         while True:
@@ -245,13 +264,24 @@ def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
             )
             last = payload
 
-            problems = assert_v1_contract(payload)
-            if problems:
-                violations += 1
-                print(f"  ✗ 第 {frames} 帧契约违规：{'；'.join(problems)}")
+            violations += _check(payload, frames)
 
             if frames % every == 0:
                 print(describe_v1(payload))
+
+            # 体征通道与实跑走**同一条**路径（server._emit_side_channels），
+            # 时间戳同样取 frame.ts。
+            if vitals is not None:
+                typed = vitals.feed(frame.ts)
+                if typed is not None:
+                    problems = _check(typed, frames)
+                    violations += problems
+                    vitals_sent += 1
+                    # 体征报文 1Hz，而打印间隔是 every 帧 —— 不单独判一次
+                    # 就会漏掉绝大多数体征行（每 10 帧才印一帧的话，
+                    # 印到的多半是帧报文）。
+                    if problems or vitals_sent % 5 == 1:
+                        print(describe_typed(typed))
 
             # v1 不消费窗口，但必须排空缓冲（详见 server._emit_v1）。
             if aggregator.should_close(frame.ts):
@@ -267,12 +297,25 @@ def _dry_run_v1(server: VisionServer, every: int = 10) -> int:
         print(describe_v1(last))
 
     print(
-        f"\n[A] 共投影 {frames} 帧 §3.2 报文（未起服务）"
-        f"  契约违规 {violations} 条"
+        f"\n[A] 共投影 {frames} 帧 §3.2 报文 + {vitals_sent} 条 §3.5 体征报文"
+        f"（未起服务）  契约违规 {violations} 条"
     )
     if violations:
-        print("[A] ⚠ 有报文不符合 api_doc §3.2，接上 backend_B 会静默失效")
+        print("[A] ⚠ 有报文不符合 api_doc，接上 backend_B 会静默失效")
+    elif vitals is not None and vitals_sent == 0:
+        # 单独点出来：体征一条都没发，是这条通道整个没接上，
+        # 而不是"数值不好看"。
+        print("[A] ⚠ 体征报文一条都没发出 —— 体征通道是死的")
     return 0
+
+
+def _check(payload: dict, frame_index: int) -> int:
+    """跑契约闸并打印违规项。返回违规条数。"""
+    kind, problems = check_contract(payload)
+    if not problems:
+        return 0
+    print(f"  ✗ 第 {frame_index} 帧的 {kind} 报文契约违规：{'；'.join(problems)}")
+    return len(problems)
 
 
 def _dry_run_v2(server: VisionServer) -> int:

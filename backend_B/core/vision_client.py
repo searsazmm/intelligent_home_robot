@@ -25,6 +25,7 @@ from typing import Callable, Optional
 
 import config
 from core.protocol import LineBuffer, ProtocolError, decode_json_line
+from core.typed_messages import TypedMessageRouter
 from core.vision_state import VisionSample, VisionStateEvaluator
 
 logger = logging.getLogger(__name__)
@@ -39,11 +40,16 @@ class VisionClient:
         on_sample: Optional[Callable[[VisionSample], None]] = None,
         host: str = config.VISION_HOST,
         port: int = config.VISION_PORT,
+        on_typed: Optional[Callable[[str, object], None]] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.evaluator = evaluator
         self.on_sample = on_sample
+
+        #: api_doc §3.5 类型化报文的分流器。带 ``type`` 的报文在这里就被摘走，
+        #: **永远走不到下面那条帧路径** —— 理由见 :mod:`core.typed_messages`。
+        self.typed = TypedMessageRouter(on_typed)
 
         self._sock: Optional[socket.socket] = None
         self._stop = threading.Event()
@@ -99,8 +105,8 @@ class VisionClient:
             if self._stop.wait(backoff):
                 break
 
-        logger.info("视觉客户端已停止（共收到 %d 帧，脏数据 %d 条）",
-                    self.frames_received, self.bad_lines)
+        logger.info("视觉客户端已停止（共收到 %d 帧，脏数据 %d 条）。%s",
+                    self.frames_received, self.bad_lines, self.typed.summary())
 
     def stop(self) -> None:
         """请求停止并唤醒可能正在等待的循环。"""
@@ -159,6 +165,12 @@ class VisionClient:
             logger.warning("丢弃非法报文：%s", exc)
             return
 
+        # api_doc §3.5：带 type 的报文**先**分流，必须在 _warn_missing_fields
+        # 之前 —— 否则前几条类型化报文会各打一行"缺少 api_doc 规定的字段"的
+        # 假警报，把真正的字段问题淹掉。
+        if self.typed.handle(payload):
+            return
+
         self._warn_missing_fields(payload)
 
         sample = VisionSample.from_payload(payload)
@@ -200,6 +212,21 @@ class VisionClient:
 # 离线回放（api_doc §5.1：开发阶段模块 A 导出 CSV，B 读文件并行开发）
 # --------------------------------------------------------------------------
 
+def _drop_empty_cells(row: dict) -> dict:
+    """CSV 行里空着的格子一律当作**没有这个字段**。
+
+    ``csv.DictReader`` 对"补齐列"与"空格子"给的是两种不同的东西 ——
+    前者是 ``None``（列在表头里但没有对应值），后者是 ``''``。
+    两者对读取方应当同义，但 ``"type" in payload`` 这种键存在性判断
+    会把 ``''`` 当成"带 type"。
+
+    只在离线回放用。TCP 上收到的是 JSON，``''`` 与"键不存在"本来就分得清，
+    不该有这层解释。
+    """
+    return {k: v for k, v in row.items()
+            if v is not None and not (isinstance(v, str) and not v.strip())}
+
+
 class OfflineVisionFeeder:
     """读 CSV 逐行喂给判定器，模拟模块 A 的实时数据流。
 
@@ -215,12 +242,20 @@ class OfflineVisionFeeder:
         on_sample: Optional[Callable[[VisionSample], None]] = None,
         speed: float = 1.0,
         loop: bool = True,
+        on_typed: Optional[Callable[[str, object], None]] = None,
     ) -> None:
         self.csv_path = csv_path
         self.evaluator = evaluator
         self.on_sample = on_sample
         self.speed = max(speed, 0.01)   # 0 会导致除零
         self.loop = loop
+        # 与 :class:`VisionClient` **同一个**分流器。两条路各写一份 if 的话，
+        # "实时对、回放错"这类差异只会在演示当天被发现。
+        #
+        # api_doc §3.4 的 CSV 里不会有类型化报文（导出的是逐帧视觉数据），
+        # 但 ``--offline`` 也可以指向一份抓包 dump，那时就有；不接这一步，
+        # 那些行会变成 has_face=false 的幽灵帧。
+        self.typed = TypedMessageRouter(on_typed)
         self._stop = threading.Event()
         self.frames_received = 0
 
@@ -264,6 +299,20 @@ class OfflineVisionFeeder:
             for row in reader:
                 if self._stop.is_set():
                     break
+
+                # api_doc §3.5：带 type 的行先分流，**不进判定器**。
+                # 放在计时之前：类型化报文与同刻的帧共享时间戳，让它参与
+                # previous_ts 没有任何好处，只会把节奏算歪。
+                #
+                # 先丢掉空格子：CSV 里"这一格是空的"和"没有这一列"是一回事，
+                # 但 DictReader 会把它们表示成 ``''`` 与 ``None`` 两种**存在**的键。
+                # 不归一化的话，帧行的 ``type`` 会是 ``''`` —— 仍然满足"带 type"，
+                # 于是**整个 CSV 的每一帧都会被当成未知报文丢掉**，
+                # 表现为"B 一直显示 absent"。帧行只是这个坑最刺眼的受害者：
+                # 归一化之后，空格子对**所有**字段都等同于缺字段，
+                # 与 VisionSample.from_payload 一直以来的读法一致。
+                if self.typed.handle(_drop_empty_cells(row)):
+                    continue
 
                 timestamp = float(row.get("timestamp") or 0.0)
 

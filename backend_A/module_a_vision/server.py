@@ -28,7 +28,12 @@ A 用**同步** socket 而不是 asyncio——这不是偷懒：采集循环本�
     不会告警**——而它恰恰是最需要告警的一种。
 
 ``v1``（团队仓库默认）
-    api_doc §3.2 的平铺 8 字段，**逐帧一条**。
+    api_doc §3.2 的平铺 8 字段，**逐帧一条**；外加 §3.5 的**类型化报文**
+    （目前是 ``rppg`` 体征，见 :mod:`module_a_vision.vitals`）。
+
+    ⚠️ 类型化报文是**额外**发的，帧报文**仍然不带 ``type``** ——
+    理由见 :mod:`module_a_vision.wire` 的模块文档（一句话：带上了就会
+    撞上 §3.2 的键集合精确相等校验）。
 
     ⚠️ **``v1`` 模式下不发 ``heartbeat``，也不发 ``vision_window``。**
     B 的 ``VisionSample.from_payload`` 会把任何一条缺字段的报文兜成一个
@@ -41,7 +46,7 @@ A 用**同步** socket 而不是 asyncio——这不是偷懒：采集循环本�
 它是"图像不出模块 A"这条红线在代码里的最后一道闸，而**闸门装在
 出口而不是入口**，意味着将来无论谁新增了什么字段，都必须先过这一关。
 
-**契约**：``v1`` 模式的报文还要过 :func:`~module_a_vision.wire.assert_v1_contract`，
+**契约**：``v1`` 模式的报文还要过 :func:`~module_a_vision.wire.check_contract`，
 和隐私闸并排装在同一个出口。理由一样，但针对的是另一种失效：B 对缺失字段
 **静默回退默认值**，字段名拼错的表现不是崩溃，而是"状态永远停在 absent"。
 契约闸把这个静默失效变成出口处一次响亮的拒绝。
@@ -61,7 +66,7 @@ from shared.schema import WindowState
 from .aggregate.window import AggregatorConfig, WindowAggregator
 from .capture.base import CaptureConfig, is_feature_source, is_frame_source
 from .privacy.guard import PrivacyViolationError, assert_clean
-from .wire import assert_v1_contract, to_v1_sample
+from .wire import KIND_FRAME, check_contract, to_v1_sample
 
 #: 默认监听地址与端口（《系统总接口文档》§2.2：8000）。
 DEFAULT_HOST = "127.0.0.1"
@@ -94,6 +99,9 @@ class VisionServer:
         心跳被无条件关闭**，见模块文档。
     :param emit_mode: ``"v1"``（默认，api_doc §3.2 逐帧平铺）或 ``"v2"``
         （原生 10 秒嵌套窗口）。
+    :param vitals: 体征通道（:class:`~module_a_vision.vitals.RppgMonitor`）。
+        给了它，v1 模式就会在帧报文之外**另发** §3.5 的 ``rppg`` 报文。
+        ``None`` 表示这条通道关闭 —— 例如 CSV 回放（没有 RGB 也没有像素）。
     """
 
     def __init__(
@@ -106,6 +114,7 @@ class VisionServer:
         heartbeat_sec: float = HEARTBEAT_SEC,
         max_clients: int = 4,
         emit_mode: str = EMIT_V1,
+        vitals: Any = None,
     ) -> None:
         if emit_mode not in EMIT_MODES:
             raise ValueError(
@@ -119,6 +128,7 @@ class VisionServer:
         self.heartbeat_sec = heartbeat_sec
         self.max_clients = max_clients
         self.emit_mode = emit_mode
+        self.vitals = vitals
 
         self.aggregator = aggregator or WindowAggregator()
 
@@ -137,8 +147,18 @@ class VisionServer:
             "send_failures": 0,
             "privacy_blocked": 0,
             "v1_frames": 0,
-            #: 被契约闸拦下的报文数。**非零就是 bug**，不是可调参数。
+            #: 已发出的体征报文数（§3.5）。**0 就说明体征通道是死的** ——
+            #: 演示时它应该以 1Hz 稳定增长。
+            "rppg_packets": 0,
+            #: 被契约闸拦下的**帧**报文数。**非零就是 bug**，不是可调参数。
+            #:
+            #: ⚠️ 引入 §3.5 类型化报文后，这个计数器**只统计帧报文**。
+            #: 别把类型化报文的违规也记进来：那样它就同时表达两种
+            #: 完全不同的故障（"帧字段写错了"与"体征数值越界"），
+            #: 而"非零就是 bug"这句判断正是靠语义单一才成立的。
             "v1_contract_blocked": 0,
+            #: 被契约闸拦下的**类型化**报文数（rppg / focus）。
+            "typed_contract_blocked": 0,
         }
 
     # ------------------------------------------------------------ 生命周期
@@ -169,6 +189,10 @@ class VisionServer:
             f"[A] 视觉服务已监听 {self.host}:{self.port}"
             f"（源：{_describe(self.source)}  出站：{self.emit_mode}）"
         )
+        if self.emit_mode == EMIT_V1:
+            # 体征通道**单独打一行**，而且把"这是自检不是测量"写在上面：
+            # 它平时只在日志里出现一次，却是最容易被截图当结论的一行。
+            print(f"[A] 体征：{_describe(self.vitals) if self.vitals else '关闭'}")
         return sock
 
     def run(self) -> None:
@@ -254,6 +278,8 @@ class VisionServer:
         if sent:
             self.stats["v1_frames"] += 1
 
+        self._emit_side_channels(frame)
+
         # **缓冲必须照常排空。** v1 不消费窗口，可 `add_frame` 每一帧都往
         # `_buffer.frames` 里追加：不排空它就是一个只涨不落的内存泄漏，
         # 同时 `_stable` 与 `_attention` 这些跨窗口状态也再不会推进。
@@ -263,6 +289,24 @@ class VisionServer:
         # 模式下会一直是 0，而 `frames` 照常增长。看到这个组合不要以为是坏了。
         if self.aggregator.should_close(frame.ts):
             self.aggregator.close_window(frame.ts)
+
+    def _emit_side_channels(self, frame: Any) -> None:
+        """帧报文之外的通道。目前只有体征（api_doc §3.5 的 ``rppg``）。
+
+        **必须挂在逐帧路径上，而且必须与帧共用一个时间轴。**
+        :class:`~module_a_vision.vitals.RppgMonitor` 内部按**帧时间戳**
+        决定发不发、并按帧时间戳做 FFT，所以喂给它的 ``ts`` 只能是
+        ``frame.ts``，不能是墙钟 —— 合成源与 CSV 回放的时间轴都从 0 开始，
+        混进墙钟会让 ``Rppg`` 算出一个跨越两套时钟的帧率，然后
+        **一直**走置灰分支（``fs < 5.0``），表现是"体征一直出不来"。
+        """
+        if self.vitals is None:
+            return
+        payload = self.vitals.feed(frame.ts)
+        if payload is None:
+            return
+        if self.broadcast(payload):
+            self.stats["rppg_packets"] += 1
 
     def _emit(self, window: WindowState) -> None:
         """广播一个窗口。"""
@@ -298,10 +342,21 @@ class VisionServer:
         让"有没有绕过去"成为一个可以一眼回答的问题：只有这一个出口。
 
         1. **隐私闸** —— 图像不出模块 A。
-        2. **契约闸**（仅 v1）—— 报文必须严格是 §3.2 的 8 个字段。
+        2. **契约闸**（仅 v1）—— 报文必须严格是 §3.2 的 8 个字段
+           （帧），或 §3.5 的类型化形状（``rppg`` / ``focus``）。
            针对的失效不一样：B 对缺字段静默回退默认值，字段拼错不报错、
            不崩溃，只表现为"状态永远停在 absent"。这道闸把那个静默失效
            挪到出口，变成一次响亮的拒绝。
+
+        分流由 :func:`~module_a_vision.wire.check_contract` 做，**和
+        ``--dry-run`` 用的是同一个函数**——两者一旦各写一遍，
+        那个"最快的排查工具"就会开始输出与实跑不符的"一切正常"。
+
+        :raises wire.UnknownMessageTypeError: v1 模式下收到一个带 ``type``
+            却不在 §3.5 白名单里的报文。**刻意让它抛出去**：兜底成
+            "当帧处理"会让它撞上"多余字段"从而在这里被静默丢弃，
+            故障于是表现成"某个功能一直不工作"，而不是一次启动后
+            几秒内就能看到的失败。
         """
         try:
             assert_clean(message)
@@ -313,13 +368,18 @@ class VisionServer:
             return 0
 
         if self.emit_mode == EMIT_V1:
-            problems = assert_v1_contract(message)
+            kind, problems = check_contract(message)
             if problems:
-                self.stats["v1_contract_blocked"] += 1
+                # 两类报文分开计数：帧违规与体征/视线违规是两种完全不同的
+                # 故障，混进一个计数器会让"非零就是 bug"这句判断失去意义。
+                self.stats[
+                    "v1_contract_blocked" if kind == KIND_FRAME
+                    else "typed_contract_blocked"
+                ] += 1
                 # 同样绝不"补两个字段再发"：那会让对端收到一份看起来
                 # 正常、实际有一个字段是瞎填的报文，比直接不发更糟。
                 print(
-                    "[A] ✗ v1 报文不符合 api_doc §3.2，已丢弃：\n  "
+                    f"[A] ✗ {kind} 报文不符合 api_doc，已丢弃：\n  "
                     + "\n  ".join(problems)
                 )
                 return 0
@@ -433,6 +493,7 @@ def build_server(
     no_face_backend: bool = False,
     real_time: bool = True,
     emit_mode: str = EMIT_V1,
+    vitals: bool = True,
     **kwargs: Any,
 ) -> VisionServer:
     """按种类装配一个服务端。供 ``main.py`` 与 ``tools/`` 使用。
@@ -446,11 +507,16 @@ def build_server(
     时间戳在瞬间跳完的窗口，冷却与持续性判定全部失去意义。
     离线验证数据契约时设 ``False``。
     :param emit_mode: ``"v1"``（默认）或 ``"v2"``，见 :class:`VisionServer`。
+    :param vitals: 是否挂 §3.5 的体征通道。**只有合成源挂得上** ——
+        它是目前唯一能给出 RGB 的源（合成体征直出 ``(t, R, G, B)``）。
+        CSV 回放既没有 RGB 列也没有像素；camera / video 的真像素取色
+        本步尚未实现。传 ``False`` 可以要一条只发帧的干净流（排查用）。
     """
     cfg = CaptureConfig(real_time=real_time, **kwargs)
 
     if source_kind == "synthetic":
         from .capture.synthetic import SyntheticFeatureSource
+        from .vitals import RppgMonitor, SyntheticVitalsSource
 
         return VisionServer(
             source=SyntheticFeatureSource(scenario=scenario, cfg=cfg),
@@ -458,6 +524,7 @@ def build_server(
             host=host,
             port=port,
             emit_mode=emit_mode,
+            vitals=RppgMonitor(SyntheticVitalsSource()) if vitals else None,
         )
 
     if source_kind == "csv":

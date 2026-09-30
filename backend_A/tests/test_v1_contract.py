@@ -34,8 +34,19 @@ from module_a_vision.metrics.eye import EyeTracker  # noqa: E402
 from module_a_vision.wire import (  # noqa: E402
     EMO_FEATURE_VALUES,
     EMOTION_TO_FEATURE,
+    FOCUS_FIELDS,
+    KIND_FRAME,
+    MSG_FOCUS,
+    MSG_RPPG,
+    RPPG_FIELDS,
     V1_FIELDS,
+    UnknownMessageTypeError,
+    assert_focus_contract,
+    assert_rppg_contract,
     assert_v1_contract,
+    build_focus_payload,
+    build_rppg_payload,
+    check_contract,
     to_v1_sample,
 )
 
@@ -223,11 +234,26 @@ class TestContractGate(unittest.TestCase):
         self.assertIn("blink_cnt", " ".join(problems))
 
     def test_extra_field_is_caught(self) -> None:
-        """V2 的 ``type`` 字段混进来要被拦下。"""
+        """规范外的字段混进来要被拦下。"""
         payload = self.clean()
-        payload["type"] = "vision_window"
+        payload["emotion"] = "happy"
         problems = assert_v1_contract(payload)
         self.assertTrue(problems)
+        self.assertIn("多余", " ".join(problems))
+
+    def test_type_key_still_makes_it_not_a_frame(self) -> None:
+        """**即使 ``type`` 的值是 ``"frame"``，它也不再是一帧。**
+
+        这条看着多余，其实是**唯一**能拦住"照着 §3.5 草案把
+        ``type:"frame"`` 加回来"的守卫。草案里曾写过"现有视觉帧标
+        ``type:"frame"``"，实现刻意没那么做（见
+        :mod:`module_a_vision.wire` 的模块文档）。将来有人翻到旧文档、
+        照着改回来时，契约闸会在这里把他拦下 —— 否则那一个键会一路
+        走到 B，而 B 那边表现是"状态永远停在 absent"。
+        """
+        payload = {"type": "frame", **self.clean()}
+        problems = assert_v1_contract(payload)
+        self.assertTrue(problems, "带了 type 的帧报文必须被判为不合规")
         self.assertIn("多余", " ".join(problems))
 
     def test_bool_is_not_accepted_as_int(self) -> None:
@@ -276,6 +302,175 @@ class TestContractGate(unittest.TestCase):
         payload["blink_cnt"] = True
         payload["emo_feature"] = "???"
         self.assertGreaterEqual(len(assert_v1_contract(payload)), 3)
+
+
+class TestRouting(unittest.TestCase):
+    """分流：帧 / rppg / focus，以及"第三样东西"。"""
+
+    def test_frame_has_no_type_and_routes_to_frame(self) -> None:
+        payload = to_v1_sample(make_frame(), blink_total=0, emotion=Emotion.NORMAL)
+        kind, problems = check_contract(payload)
+        self.assertEqual(kind, KIND_FRAME)
+        self.assertEqual(problems, [])
+
+    def test_focus_packet_is_not_sent_to_the_frame_gate(self) -> None:
+        """**这条是分流 bug 的直接守卫。**
+
+        曾经的写法是 ``if type == "rppg": … else: assert_v1_contract(…)``。
+        那样 ``focus`` 会落进 ``else``、被 frame 闸判成"多余字段"、
+        在 ``broadcast`` 里丢弃 —— 于是 VAI 永远拿不到视线数据，
+        而**所有"报文格式正确"的测试全都是绿的**。
+
+        这里断言 focus 走的是它自己那条路，而不是被 frame 闸判违规。
+        """
+        payload = build_focus_payload(1.0, gaze=0.1, gaze_quality=1.0)
+        kind, problems = check_contract(payload)
+        self.assertEqual(kind, MSG_FOCUS)
+        self.assertEqual(problems, [])
+        # 反过来确认：它**确实**过不了 frame 闸（所以"兜底成帧"
+        # 那种写法一定会静默丢弃它，而不是碰巧能用）。
+        self.assertTrue(assert_v1_contract(payload))
+
+    def test_unknown_type_raises_instead_of_falling_back(self) -> None:
+        """未知类型必须抛，不能兜底当帧处理。"""
+        for bogus in ("vision_window", "heartbeat", "frame", "rppg2", ""):
+            with self.subTest(type=bogus):
+                with self.assertRaises(UnknownMessageTypeError):
+                    check_contract({"type": bogus, **{f: 0 for f in V1_FIELDS}})
+
+    def test_unknown_message_type_error_is_a_value_error(self) -> None:
+        """继承 ``ValueError`` 是为了让 ``main()`` 现有的 except 接得住它。
+
+        接不住的话，配置错误会以一整段栈回溯的形式砸在用户脸上，
+        而不是 ``[A] ✗ 运行中断：…`` 那样一行说明。
+        """
+        self.assertTrue(issubclass(UnknownMessageTypeError, ValueError))
+
+
+class TestRppgContract(unittest.TestCase):
+    """§3.5 体征报文的契约闸。"""
+
+    def clean(self) -> dict:
+        return build_rppg_payload(12.5, hr=75, rr=19.1, ibi_ms=[780, 780, 546])
+
+    def test_clean_payload_passes(self) -> None:
+        payload = self.clean()
+        self.assertEqual(set(payload), set(RPPG_FIELDS))
+        self.assertEqual(assert_rppg_contract(payload), [])
+
+    def test_null_hr_is_legal(self) -> None:
+        """**``hr: null`` 是正常态。** 窗口未满 / SNR 不够 / 帧率过低时
+        ``Rppg`` 都会置灰，而这三种情况在实跑里都很常见。任何断言
+        "收到体征报文 ⇒ hr 是数字"的测试都是错的。
+        """
+        payload = build_rppg_payload(0.0, hr=None, rr=None, ibi_ms=[])
+        self.assertIsNone(payload["hr"])
+        self.assertEqual(assert_rppg_contract(payload), [])
+
+    def test_hr_and_rr_range_is_enforced(self) -> None:
+        for bad in (5, 300, -1):
+            with self.subTest(hr=bad):
+                payload = self.clean()
+                payload["hr"] = bad
+                self.assertTrue(assert_rppg_contract(payload), f"hr={bad} 应被拦下")
+        for bad in (0.5, 90.0):
+            with self.subTest(rr=bad):
+                payload = self.clean()
+                payload["rr"] = bad
+                self.assertTrue(assert_rppg_contract(payload), f"rr={bad} 应被拦下")
+
+    def test_bool_is_not_accepted_as_a_number(self) -> None:
+        payload = self.clean()
+        payload["hr"] = True
+        self.assertTrue(assert_rppg_contract(payload))
+
+    def test_ibi_entries_must_be_ints_in_range(self) -> None:
+        for bad in ([700.5], [0], [99999], ["700"]):
+            with self.subTest(ibi=bad):
+                payload = self.clean()
+                payload["ibi_ms"] = bad
+                self.assertTrue(assert_rppg_contract(payload), f"ibi={bad} 应被拦下")
+
+    def test_ibi_must_be_an_array(self) -> None:
+        payload = self.clean()
+        payload["ibi_ms"] = 700
+        self.assertTrue(assert_rppg_contract(payload))
+
+    def test_missing_and_extra_fields_are_caught(self) -> None:
+        payload = self.clean()
+        del payload["rr"]
+        self.assertIn("缺少", " ".join(assert_rppg_contract(payload)))
+
+        payload = self.clean()
+        payload["sqi"] = 0.8
+        self.assertIn("多余", " ".join(assert_rppg_contract(payload)))
+
+    def test_wrong_type_tag_is_caught(self) -> None:
+        payload = self.clean()
+        payload["type"] = MSG_FOCUS
+        self.assertTrue(assert_rppg_contract(payload))
+
+
+class TestFocusContract(unittest.TestCase):
+    """§3.5 视线报文的契约闸。"""
+
+    def clean(self) -> dict:
+        return build_focus_payload(1.0, gaze=0.05, gaze_quality=1.0)
+
+    def test_clean_payload_passes(self) -> None:
+        payload = self.clean()
+        self.assertEqual(set(payload), set(FOCUS_FIELDS))
+        self.assertEqual(assert_focus_contract(payload), [])
+
+    def test_unavailable_gaze_is_legal_and_quality_must_be_zero(self) -> None:
+        """``gaze: null`` 合法，但此时 ``gaze_quality`` 必须是 0。"""
+        payload = build_focus_payload(2.0, gaze=None, gaze_quality=0.0)
+        self.assertIsNone(payload["gaze"])
+        self.assertEqual(assert_focus_contract(payload), [])
+
+    def test_gaze_and_quality_must_agree(self) -> None:
+        """**不变式：``gaze is None`` ⟺ ``gaze_quality == 0``。**
+
+        两头都要查。只查"null ⇒ 0"会放过第二行那种：``gaze`` 明明有值
+        却报质量为 0 —— 对端会把它当成不可信而丢掉一个有效观测，
+        而且丢掉的过程没有任何痕迹。
+        """
+        payload = self.clean()
+        payload["gaze"] = None
+        payload["gaze_quality"] = 1.0
+        self.assertTrue(assert_focus_contract(payload), "null + 质量 1.0 应被拦下")
+
+        payload = self.clean()
+        payload["gaze_quality"] = 0.0
+        self.assertTrue(assert_focus_contract(payload), "有值 + 质量 0 应被拦下")
+
+    def test_gaze_range_is_enforced(self) -> None:
+        for bad in (-0.1, 1.5):
+            with self.subTest(gaze=bad):
+                payload = self.clean()
+                payload["gaze"] = bad
+                self.assertTrue(assert_focus_contract(payload))
+
+    def test_gaze_accepts_zero_and_one(self) -> None:
+        """0.0 是"正对着镜头"，必须是合法值 —— 它和 ``null`` 不是一回事。"""
+        for good in (0.0, 1.0):
+            with self.subTest(gaze=good):
+                payload = build_focus_payload(1.0, gaze=good, gaze_quality=1.0)
+                self.assertEqual(assert_focus_contract(payload), [])
+
+    def test_bool_gaze_is_caught(self) -> None:
+        payload = self.clean()
+        payload["gaze"] = True
+        self.assertTrue(assert_focus_contract(payload))
+
+    def test_missing_and_extra_fields_are_caught(self) -> None:
+        payload = self.clean()
+        del payload["gaze_quality"]
+        self.assertIn("缺少", " ".join(assert_focus_contract(payload)))
+
+        payload = self.clean()
+        payload["target_roi_probability"] = 0.7
+        self.assertIn("多余", " ".join(assert_focus_contract(payload)))
 
 
 class TestBlinkCounter(unittest.TestCase):

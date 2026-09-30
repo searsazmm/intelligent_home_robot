@@ -44,7 +44,12 @@ if _HERE not in sys.path:
 import _console  # noqa: E402,F401  （导入即生效：让中文输出不乱码）
 
 from module_a_vision.server import build_server  # noqa: E402
-from module_a_vision.wire import V1_FIELDS, assert_v1_contract  # noqa: E402
+from module_a_vision.wire import (  # noqa: E402
+    KIND_FRAME,
+    TYPED_MESSAGE_TYPES,
+    V1_FIELDS,
+    check_contract,
+)
 
 # ---------------------------------------------------------------- B 的可用性
 
@@ -121,13 +126,24 @@ def _read_lines(sock: socket.socket, seconds: float) -> list[dict]:
 
 
 class TestWireShape(unittest.TestCase):
-    """裸 socket 收 A 的报文，逐条校验契约。"""
+    """裸 socket 收 A 的报文，逐条校验契约。
+
+    v1 流上现在有**两种**东西（见 :mod:`module_a_vision.wire` 的模块文档）：
+
+    * **帧**报文 —— §3.2 的平铺 8 字段，**不带 ``type``**；
+    * **类型化**报文 —— §3.5 的 ``rppg`` / ``focus``，**带 ``type``**。
+
+    所以下面每一条都得先想清楚"这条断言到底是对谁说的"。混着断言会得到
+    一条会在两种报文之间来回翻转的测试，而它失败时给不出任何线索。
+    """
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.h = _ServerHarness()
         cls.sock = cls.h.connect()
         cls.samples = _read_lines(cls.sock, OBSERVE_SEC)
+        cls.frames = [p for p in cls.samples if "type" not in p]
+        cls.typed = [p for p in cls.samples if "type" in p]
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -135,59 +151,58 @@ class TestWireShape(unittest.TestCase):
             cls.sock.close()
         cls.h.stop()
 
+    # ------------------------------------------------------------ 帧报文
+
     def test_received_enough_frames(self) -> None:
-        """收到足够多的帧 —— 这一条同时排除了"心脏跳"混进来。
+        """收到足够多的**帧** —— 这一条同时排除了"心脏跳"混进来。
 
         10fps 跑 6 秒应该接近 60 条。下限放到 30 是留给 Windows 上
         线程调度的抖动，但**远高于**"每 10 秒一条"会得到的 1 条。
         所以如果有人把逐帧流式改回按窗口上报，这里会立刻变红。
+
+        数的是 ``cls.frames`` 而不是 ``cls.samples``：后者现在混着体征
+        报文，拿它当帧率会把 1Hz 的体征也算成视觉帧。
         """
         self.assertGreater(
-            len(self.samples),
+            len(self.frames),
             30,
-            f"6 秒只收到 {len(self.samples)} 条 —— 逐帧流式是不是被改掉了？",
+            f"6 秒只收到 {len(self.frames)} 帧 —— 逐帧流式是不是被改掉了？",
         )
 
-    def test_every_message_has_exactly_the_eight_fields(self) -> None:
-        for i, payload in enumerate(self.samples):
+    def test_every_frame_has_exactly_the_eight_fields(self) -> None:
+        self.assertTrue(self.frames, "一帧都没收到")
+        for i, payload in enumerate(self.frames):
             with self.subTest(index=i):
                 self.assertEqual(set(payload), set(V1_FIELDS))
 
-    def test_no_message_carries_a_type_key(self) -> None:
-        """v1 模式下**不能**混进 ``heartbeat`` / ``vision_window``。
-
-        B 的 ``VisionSample.from_payload`` 会把任何一条缺 8 字段的报文
-        兜成一个 ``has_face=false`` 的样本推进判定器 —— 也就是周期性
-        伪造"看不见老人"。这条测试钉住的是那个失效。
-        """
-        for payload in self.samples:
-            self.assertNotIn("type", payload)
-
     def test_every_message_passes_the_contract_gate(self) -> None:
+        """整条流上**每一条**都要过闸 —— 帧和类型化报文各自的那一道。"""
+        self.assertTrue(self.samples, "一条报文都没收到")
         for i, payload in enumerate(self.samples):
             with self.subTest(index=i):
-                self.assertEqual(assert_v1_contract(payload), [])
+                kind, problems = check_contract(payload)
+                self.assertEqual(problems, [], f"{kind} 报文违规")
 
     def test_blink_counter_never_goes_backwards(self) -> None:
-        """整条流上 ``blink_cnt`` 单调不减。
+        """整条**帧**流上 ``blink_cnt`` 单调不减。
 
         B 的 ``_blink_rate_per_minute`` 检测到倒退就返回 None，
         于是**静默关掉一条疲劳判据** —— 不报错、不告警。
         也就是说这个 bug 在集成后是不可见的，只有在这里才拦得住。
         """
-        counters = [p["blink_cnt"] for p in self.samples]
+        counters = [p["blink_cnt"] for p in self.frames]
         self.assertEqual(counters, sorted(counters), "blink_cnt 出现倒退")
 
     def test_frame_rate_beats_the_stale_threshold(self) -> None:
         """**本文件最重要的一条断言。**
 
-        报文的 ``timestamp`` 间隔必须**远小于** B 判定失联的 5 秒阈值。
+        帧报文的 ``timestamp`` 间隔必须**远小于** B 判定失联的 5 秒阈值。
         这条测试针对的是一个真实发生过的设计错误：曾经打算在 A 关窗时
         （每 10 秒）发一条 §3.2 报文。那样 B 每 10 秒里会有 5 秒判 absent，
         状态周期性抖动、C 端的卡片跟着闪 —— 而两个模块各自的单元测试
         **全都是绿的**，因为谁的逻辑都没错，错的是两者的时间尺度关系。
         """
-        stamps = [p["timestamp"] for p in self.samples]
+        stamps = [p["timestamp"] for p in self.frames]
         gaps = [b - a for a, b in zip(stamps, stamps[1:])]
         self.assertTrue(gaps, "只收到一帧，算不出间隔")
         worst = max(gaps)
@@ -199,20 +214,96 @@ class TestWireShape(unittest.TestCase):
         )
 
     def test_stream_starts_with_a_face(self) -> None:
-        """``sad`` 剧本开场是 25 秒安静段，所以流里必须有人脸。"""
-        self.assertTrue(any(p["has_face"] for p in self.samples))
-        self.assertTrue(all(isinstance(p["has_face"], bool) for p in self.samples))
+        """``sad`` 剧本开场是 25 秒安静段，所以帧流里必须有人脸。"""
+        self.assertTrue(any(p["has_face"] for p in self.frames))
+        self.assertTrue(all(isinstance(p["has_face"], bool) for p in self.frames))
 
     def test_emo_feature_reaches_low_after_calibration(self) -> None:
         """表情通道真的在工作，不是一个恒为 normal 的常量。
 
-        2 秒的观察窗不够跨过表情分类器的 25 秒标定段，所以这条只断言
+        6 秒的观察窗不够跨过表情分类器的 25 秒标定段，所以这条只断言
         **取值合法**；"能不能变成 low"由 ``--dry-run`` 与手工联调验证
         （见 README 的验证表）。这里刻意不断言 ``low`` 出现过 ——
         写一条自己都知道跑不到的断言，比不写更糟。
         """
-        values = {p["emo_feature"] for p in self.samples}
+        values = {p["emo_feature"] for p in self.frames}
         self.assertTrue(values <= {"normal", "low", "tired"}, f"非法取值 {values}")
+
+    # ------------------------------------------------------------ 类型化报文
+
+    def test_only_allowlisted_types_appear(self) -> None:
+        """v1 流上只能出现 §3.5 白名单里的 ``type``。
+
+        这条替换了原来那条 ``assertNotIn("type", payload)`` ——
+        ``type`` 现在是**合法的鉴别符**了，继续笼统地禁止它会拦下正确
+        的实现。但原来的意图必须保留下来，所以下面把三种**具体**的
+        V2 报文名单独点出来断言：
+
+        ``heartbeat`` / ``vision_window`` / ``vision_unusable`` 一个都
+        不能出现。B 的 ``VisionSample.from_payload`` 会把任何一条缺 8
+        字段的报文兜成一个 ``has_face=false`` 的样本推进判定器 ——
+        也就是周期性伪造"看不见老人"。这正是 A 在 v1 模式下**刻意
+        关掉心跳**的原因（``server.serve``），新开类型化通道时不能
+        把这套失效再放进来一次。
+        """
+        seen = {p["type"] for p in self.typed}
+        self.assertTrue(
+            seen <= set(TYPED_MESSAGE_TYPES),
+            f"出现了白名单外的报文类型：{sorted(seen - set(TYPED_MESSAGE_TYPES))}",
+        )
+        for forbidden in ("heartbeat", "vision_window", "vision_unusable"):
+            self.assertNotIn(
+                forbidden, seen, f"{forbidden} 混进了 v1 流，B 会当成幽灵帧"
+            )
+
+    def test_every_message_is_a_frame_or_a_known_typed_message(self) -> None:
+        """兜掉"第三种东西"：每条报文要么是帧，要么是登记过的类型。
+
+        这条与上面那条互补。上面查的是"``type`` 的取值合不合法"，
+        这条查的是"**没有 ``type`` 的那些到底是不是帧**" —— 一条既
+        不带 ``type``、字段又不对的报文会同时绕过两条单独的检查。
+        """
+        for i, payload in enumerate(self.samples):
+            with self.subTest(index=i):
+                kind, _ = check_contract(payload)
+                self.assertIn(kind, {KIND_FRAME, *TYPED_MESSAGE_TYPES})
+
+    def test_vitals_packets_actually_flow(self) -> None:
+        """**观察窗内必须收到体征报文，否则体征通道就是死代码。**
+
+        这一条是专门为下面那个失效写的，它真实发生过（在计划阶段被
+        设计审查抓住）：默认演示源 ``--source synthetic`` 是**特征源**，
+        全程不碰像素。如果 rPPG 只挂在"有像素"的分支上，演示路径上
+        它一行都不会执行 —— 而**整套测试照绿**，因为没有一条断言在问
+        "体征到底发出来没有"。所以这条断言不是凑数的，它是这一类
+        静默失效的唯一守卫。
+
+        下限取 3 而不是 1：1Hz 跑 6 秒应该收到 5-6 条，只收到 1 条说明
+        "发了一条就停了"，那和一条都没有差不多。
+        """
+        vitals = [p for p in self.typed if p["type"] == "rppg"]
+        self.assertGreaterEqual(
+            len(vitals),
+            3,
+            f"{OBSERVE_SEC:.0f} 秒只收到 {len(vitals)} 条体征报文 —— "
+            f"体征通道是死的？检查 build_server 有没有给合成源挂 vitals",
+        )
+
+    def test_vitals_hr_may_be_null(self) -> None:
+        """``hr`` 允许是 ``null`` —— 那是**正常态**，不是错误。
+
+        ``Rppg`` 在 8 秒窗口未满、SNR<1.5、或帧率<5Hz 时都会置灰。
+        6 秒的观察窗**必然**落在"窗口未满"那一段里，所以这条断言
+        实际上是在钉住"契约允许置灰"。任何"收到 rppg ⇒ hr 是数字"
+        的假设都会让观察窗一缩短就红，而那不是被测代码的错。
+        """
+        vitals = [p for p in self.typed if p["type"] == "rppg"]
+        self.assertTrue(vitals, "一条体征报文都没有")
+        for payload in vitals:
+            self.assertTrue(
+                payload["hr"] is None or isinstance(payload["hr"], int),
+                f"hr 既不是 null 也不是 int：{payload['hr']!r}",
+            )
 
 
 @unittest.skipUnless(_B_AVAILABLE, "backend_B 不在旁边，跳过对端测试")
@@ -262,6 +353,29 @@ class TestAgainstRealEvaluator(unittest.TestCase):
         行不通的 JSON、超长行、半包 —— 都会计进 ``bad_lines``。
         """
         self.assertEqual(self.client.bad_lines, 0)
+
+    def test_typed_packets_reached_the_real_client(self) -> None:
+        """**真实 B 客户端真的认出了 A 的 §3.5 报文。**
+
+        上面 :class:`TestWireShape` 那几条查的是"裸 socket 收到的字节对不对"。
+        这一条查的是另一半，也是更容易漏的那一半：**B 的代码读不读得懂**。
+        两侧的契约可以各自自洽而互不认识 —— 一边把字段写成 ``gaze_quality``、
+        另一边找 ``gaze_q``，两边单测全绿，合起来一条都用不上。
+
+        所以这里断言的是 **B 自己的计数器**：收到过 rppg、没有未知类型、
+        没有解析失败。计数器是 B 认了账的直接证据，不是我们替它推断的。
+
+        ``unknown == 0`` 这条顺带钉住"别的类型一个都别冒出来" ——
+        它在 B 侧才看得见（A 侧的白名单测试只查 A 自己发的那些）。
+        """
+        self.assertGreaterEqual(
+            self.client.typed.counts.get("rppg", 0),
+            3,
+            f"真实 B 客户端一条 rppg 都没认出来（计数={self.client.typed.counts}）——"
+            f" 两侧的字段名是不是对不上？",
+        )
+        self.assertEqual(self.client.typed.unknown, 0, "出现了白名单外的报文类型")
+        self.assertEqual(self.client.typed.malformed, 0, "有报文没通过 B 侧的 §3.5 校验")
 
     def test_state_becomes_normal(self) -> None:
         """**字段名对上了没有，这一条说了算。**
