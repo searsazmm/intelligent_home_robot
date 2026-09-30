@@ -544,6 +544,12 @@ DOUBAO_DONE_CODE = 20000000
 #: 采样率。24k 是 SeedTTS 的常规值，最后统一重采样到 WAV_RATE。
 DOUBAO_SAMPLE_RATE = 24000
 
+#: 流式路径可用的采样率，按优先级排。**2026-09-30 实测三档都能出 PCM**
+#: （16k/24k/48k 各调一次，都回了音频块）。挑的时候要取"服务端能给"和
+#: "本机声卡能开"的交集 —— 挑不到就不走流式，见
+#: :meth:`core.voice.audio.Player.stream_rate`。
+DOUBAO_PCM_RATES = (24000, 48000, 16000)
+
 
 def probe_synthesizer(engine, text: str = PROBE_TEXT) -> bool:
     """**真的合成一句话**，看它到底行不行。
@@ -622,6 +628,8 @@ def build_doubao_request(
     text: str,
     speaker: str,
     speed: float = 1.0,
+    fmt: str = "mp3",
+    sample_rate: int = DOUBAO_SAMPLE_RATE,
 ) -> dict:
     """构造 v3 的请求体。
 
@@ -629,6 +637,10 @@ def build_doubao_request(
 
     ``speed`` 是**倍数**（和 config.VOICE_SPEED 同一单位），
     这里换算成服务端的 ``speech_rate``，见 :func:`speech_rate_from_speed`。
+
+    ``fmt`` / ``sample_rate`` 默认是落盘那条路径（MP3 → 16k WAV），
+    流式播报会显式传 ``pcm`` 和设备能开的采样率，理由见
+    :meth:`DoubaoSynthesizer.synthesize_pcm_stream`。
 
     ⚠️ **这里没有 reqid。** 请求 id 只走 ``X-Api-Request-Id`` 头
     （见 :func:`build_doubao_headers`）—— v3 的 body 里不带这个字段，
@@ -643,10 +655,10 @@ def build_doubao_request(
             "text": text,
             "speaker": speaker,
             "audio_params": {
-                # 拿 MP3 而不是 PCM：MP3 的解码路径
+                # 默认拿 MP3 而不是 PCM：MP3 的解码路径
                 # （soundfile → 重采样到 16k）已经在 edge-tts 上验证过了。
-                "format": "mp3",
-                "sample_rate": DOUBAO_SAMPLE_RATE,
+                "format": fmt,
+                "sample_rate": int(sample_rate),
                 "speech_rate": speech_rate_from_speed(speed),
             },
         },
@@ -709,6 +721,68 @@ def parse_doubao_stream(raw: bytes) -> bytes:
     return base64.b64decode("".join(chunks))
 
 
+class DoubaoStreamParser:
+    """把豆包的 JSON 行流**逐行**变成音频块。喂一行，吐一块。
+
+    和 :func:`parse_doubao_stream` 是同一套协议，区别只在收的姿势：
+    那个是"整个响应收完再拼"，这个是"来一行解一行"。边收边播必须用后者。
+
+    **为什么不把 parse_doubao_stream 直接改成生成器**：它返回 ``bytes``
+    这件事被现有测试和 :meth:`DoubaoSynthesizer.synthesize_wav`（缓存/预热
+    那条已经跑通的路径）钉着，改签名会波及一条与本次改动无关的链路。
+
+    错误处理上它比 parse_doubao_stream **更宽松**，这是刻意的：
+    那个函数可以"整句失败"，因为此时一个字都还没念出去；而流式播到一半
+    才发现服务端报了错时，音频已经进耳朵了 —— 这时候能做的只有记下来，
+    硬要抛异常只会让调用方把半句话重念一遍。所以这里只**攒着**
+    :attr:`failure`，由调用方决定怎么办。
+    """
+
+    def __init__(self) -> None:
+        #: 收到结束码（``code == DOUBAO_DONE_CODE``）。
+        self.done = False
+        #: 服务端报的错。**可能和音频同时存在** —— 有音频也别当成功。
+        self.failure = ""
+        #: 已解出的音频块数。
+        self.chunks = 0
+
+    def feed(self, line: str) -> Optional[bytes]:
+        """喂一行原文，返回这一行解出的音频（没有音频则 None）。"""
+        line = (line or "").strip()
+        if not line or line.startswith("event:"):
+            return None
+        if line.startswith("data:"):          # SSE 端点带这个前缀
+            line = line[5:].strip()
+        if not line or line == "[DONE]":
+            return None
+        try:
+            event = json.loads(line)
+        except ValueError:
+            # 流的边界上偶尔会有零散字符，为它整句失败不值得。
+            return None
+
+        code = event.get("code")
+        if code == DOUBAO_DONE_CODE:
+            self.done = True
+            return None
+        if code not in (0, None):
+            self.failure = "code=%s message=%s" % (code, event.get("message"))
+            return None
+
+        data = event.get("data")
+        if not data:
+            return None
+        try:
+            chunk = base64.b64decode(data)
+        except Exception:
+            # b64decode 默认对非法字符是**静默丢弃**，所以这里多半不会触发；
+            # 留着是为了万一将来换成 validate=True 时行为不至于变成"少一块音频"。
+            self.failure = "音频块不是合法 base64"
+            return None
+        self.chunks += 1
+        return chunk
+
+
 class DoubaoSynthesizer:
     """豆包（火山引擎）在线合成，音色比 SAPI 自然得多。
 
@@ -726,6 +800,14 @@ class DoubaoSynthesizer:
     #: 见 :func:`probe_synthesizer`。豆包的域名在国内可直连，
     #: 这正是它比 edge-tts 更适合这个项目的原因之一。
     requires_network = True
+
+    #: 能不能边收边播。``Speaker`` 靠它决定走流式还是"等整句合成完"。
+    supports_streaming = True
+
+    #: 流式合成能按哪些采样率给。``Speaker`` 拿它和播放设备的能力求交集 ——
+    #: 之所以让引擎自己报、而不是让 ``loop`` 写死豆包的档位：``loop`` 是
+    #: 通用层，不该知道"豆包"这个名字。
+    stream_rates = DOUBAO_PCM_RATES
 
     def __init__(
         self,
@@ -842,6 +924,98 @@ class DoubaoSynthesizer:
             logger.exception("豆包合成失败")
             return False
 
+    def synthesize_pcm_stream(self, text: str, sample_rate: int):
+        """边收边吐 PCM（16bit 单声道 @ ``sample_rate``）。
+
+        ------------------------------------------------------------------
+        为什么必须换成 PCM
+        ------------------------------------------------------------------
+        走 MP3 就**永远快不了**：MP3 是一整条码流，libsndfile 只吃完整文件，
+        所以拿到最后一块之前一个字都解不出来。PCM 反过来 —— 每块都是独立的
+        样本序列，收到一块就能直接送声卡。
+
+        本机实测（2026-09-30，同一句话）：
+
+            MP3   首块 603ms  全部收完 1230ms   ← 必须等 1230ms 才出声
+            PCM   首块 535ms  全部收完 1197ms   ← 535ms 就能出声
+
+        省下的就是"服务器还在继续吐后面几块"的那 600 多毫秒。音频本身的
+        长度不变，变的是**开口早了多少**。
+
+        ------------------------------------------------------------------
+        生成器，而且失败语义分两段
+        ------------------------------------------------------------------
+        生成器函数体要等第一次 ``next()`` 才跑，所以"不可用"这类错误也是
+        在消费时才抛的，调用方的 try 必须包住整个 for。
+
+        - **吐出第一块音频之前**失败 → 抛 ``ValueError``。此时一个字都没念出去，
+          调用方可以干净地落回 :meth:`synthesize_wav`（那条路还带本地兜底）。
+        - **已经吐过音频之后**失败 → 只记日志然后结束。说出去的半句话收不回来，
+          抛异常只会让调用方把整句重念一遍 —— 用户会听到"豆…豆包合成失败"。
+        """
+        if not self._usable or not text.strip():
+            raise ValueError("豆包合成不可用：%s" % (self._reason or "文本为空"))
+
+        import urllib.error
+        import urllib.request
+        import uuid
+
+        body = build_doubao_request(
+            text=text,
+            speaker=self.voice,
+            speed=self.speed,
+            fmt="pcm",
+            sample_rate=sample_rate,
+        )
+        request = urllib.request.Request(
+            DOUBAO_ENDPOINT,
+            data=json.dumps(body).encode("utf-8"),
+            headers=build_doubao_headers(self.api_key, self.resource_id,
+                                         uuid.uuid4().hex),
+            method="POST",
+        )
+
+        parser = DoubaoStreamParser()
+        started = False
+        try:
+            # 不用 response.read()：那会等整个响应收完，正是要避开的等待。
+            # 直接迭代响应对象是按行读，来一行给一行。
+            with urllib.request.urlopen(request, timeout=SYNTH_TIMEOUT) as response:
+                for raw_line in response:
+                    chunk = parser.feed(raw_line.decode("utf-8", "replace"))
+                    if chunk:
+                        started = True
+                        yield chunk
+        except urllib.error.HTTPError as exc:
+            # API Key 无效、音色与模型版本不匹配都会走到这里。
+            # 把服务端的话原样带出来，否则排查时只剩下一个数字状态码。
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                pass
+            message = "豆包流式合成 HTTP 错误：%s %s" % (exc.code, detail)
+            logger.warning("%s", message)
+            if not started:
+                raise ValueError(message) from exc
+            return
+        except Exception as exc:
+            # 断网、超时、连接被重置都是常态。
+            logger.warning("豆包流式合成中断：%r", exc)
+            if not started:
+                raise ValueError("豆包流式合成失败：%r" % (exc,)) from exc
+            return
+
+        if parser.failure:
+            logger.warning("豆包流式合成服务端报错：%s", parser.failure)
+            if not started:
+                raise ValueError(parser.failure)
+        if not started:
+            raise ValueError(parser.failure or "服务端没有返回任何音频数据")
+        if not parser.done:
+            logger.debug("豆包流没有结束码（可能被截断），已拿到 %d 块",
+                         parser.chunks)
+
     def close(self) -> None:
         return None
 
@@ -954,6 +1128,35 @@ class FallbackSynthesizer:
             return False
         self.used_fallback = ok
         return ok
+
+    @property
+    def supports_streaming(self) -> bool:
+        """能不能边收边播 —— **由主引擎决定，不是恒 True**。
+
+        生产路径上豆包一定是被这一层包着的（见 ``build_synthesizer``），
+        所以这里不转达的话，流式播报永远不会被 ``Speaker`` 选中。
+        但也不能写死 True：主引擎要是不支持，``Speaker`` 就该老老实实走
+        "等整句合成完"那条路，而不是调一个不存在的方法。
+        """
+        return bool(getattr(self.primary, "supports_streaming", False))
+
+    @property
+    def stream_rates(self):
+        """主引擎能给的采样率档位。和 ``supports_streaming`` 一样只做转达。"""
+        return getattr(self.primary, "stream_rates", ())
+
+    def synthesize_pcm_stream(self, text: str, sample_rate: int):
+        """转达主引擎的流式合成。**这一层刻意不做兜底。**
+
+        流式一旦出了声就没法回退：前半句是豆包音色、后半句突然变成 SAPI
+        的机械音，而且兜底那句会把**整句**重念一遍 —— 用户听到的是
+        "您看着有点乏了您看着有点乏了"。
+
+        所以"一块都没吐出来就失败"时这里**原样抛出**，由 ``Speaker`` 落到
+        :meth:`synthesize_wav`，那条路上有完整的逐句兜底。把"什么时候还能
+        兜底"这个判断收在一处，比在两层里各判一次更不容易判错。
+        """
+        yield from self.primary.synthesize_pcm_stream(text, sample_rate)
 
     def close(self) -> None:
         for engine in (self.primary, self._backup):

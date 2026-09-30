@@ -951,6 +951,274 @@ class TestSpeaker(unittest.TestCase):
         self.assertEqual(speaker.engine_name, "?")
 
 
+class FakeStreamingSynthesizer(FakeSynthesizer):
+    """既能落盘、也能"边收边吐"的假引擎。"""
+
+    supports_streaming = True
+    stream_rates = (24000,)
+
+    def __init__(self, chunks=None, fail_before_first=False, fail_after=None,
+                 **kwargs):
+        super().__init__(**kwargs)
+        self.chunks = list(chunks if chunks is not None else [b"\x00\x01" * 50])
+        self.fail_before_first = fail_before_first
+        self.fail_after = fail_after
+        self.stream_calls = []
+
+    def synthesize_pcm_stream(self, text, sample_rate):
+        self.stream_calls.append((text, sample_rate))
+        if self.fail_before_first:
+            raise ValueError("模拟：一块音频都没出来就失败")
+        for index, chunk in enumerate(self.chunks):
+            if self.fail_after is not None and index >= self.fail_after:
+                raise ValueError("模拟：吐了几块之后断流")
+            yield chunk
+
+
+class FakeStreamPlayer(FakePlayer):
+    """支持流式播放的假播放器。``rate=None`` 表示"设备与引擎谈不拢"。"""
+
+    def __init__(self, rate=24000):
+        super().__init__()
+        self.rate = rate
+        self.streamed = []
+        self.rate_queries = []
+
+    def stream_rate(self, candidates):
+        self.rate_queries.append(tuple(candidates))
+        return self.rate if self.rate in tuple(candidates) else None
+
+    def play_pcm_stream(self, chunks, sample_rate):
+        try:
+            for chunk in chunks:
+                self.streamed.append(chunk)
+        except Exception:
+            # 和真 Player 一致：异常吃掉，只回答"有没有出过声"。
+            pass
+        return bool(self.streamed)
+
+
+class TestSpeakerAsyncSay(unittest.TestCase):
+    """应声词：异步垫一句，正式回复必须排在它**后面**。
+
+    这一组盯着的是**顺序**，而不是"能不能异步"。用 Lock 抢锁的写法能通过
+    "异步"的所有断言，却会让老人听到"回答……嗯，我听着呢"。
+    """
+
+    def setUp(self):
+        self.synth = FakeSynthesizer()
+        self.player = FakePlayer()
+        self.speaker = Speaker(synthesizer=self.synth, player=self.player)
+        self.addCleanup(self.speaker.close)
+
+    def test_async_say_returns_immediately(self):
+        """**不能阻塞。** 调用它的线程紧接着要去做大模型的网络请求，
+        在这里等就等于把应声词变成了对正式回复的额外延迟。"""
+        self.player.delay = 0.3
+        started = time.monotonic()
+        self.assertTrue(self.speaker.say_async("嗯，我听着呢。"))
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.15, "say_async 阻塞了调用线程")
+        self.speaker._join_async()
+
+    def test_reply_waits_for_the_ack(self):
+        """核心断言：合成顺序必须是 应声词 → 正式回复。"""
+        self.player.delay = 0.05
+        self.assertTrue(self.speaker.say_async("嗯，我听着呢。"))
+        time.sleep(0.01)                 # 给后台线程一点时间先拿到锁
+        self.speaker.say("您看着有点乏了。")
+        self.assertEqual([text for text, _ in self.synth.calls],
+                         ["嗯，我听着呢。", "您看着有点乏了。"],
+                         "正式回复抢在应声词前面播了")
+
+    def test_reply_waits_even_if_the_worker_has_not_started_yet(self):
+        """应声线程还没被调度时也不能乱序 —— 靠的不是"抢得快"。"""
+        self.player.delay = 0.05
+        self.speaker.say_async("嗯，让我想想。")
+        self.speaker.say("好的。")        # 立刻，不给后台线程任何机会
+        self.assertEqual([text for text, _ in self.synth.calls],
+                         ["嗯，让我想想。", "好的。"])
+
+    def test_a_second_ack_is_dropped_while_one_is_playing(self):
+        """上一句应声还没说完又来一句：丢掉，否则连成"嗯，我想想，嗯，我想想"。"""
+        self.player.delay = 0.2
+        self.assertTrue(self.speaker.say_async("嗯，我听着呢。"))
+        self.assertFalse(self.speaker.say_async("嗯，让我想想。"))
+        self.speaker._join_async()
+        self.assertEqual([text for text, _ in self.synth.calls], ["嗯，我听着呢。"])
+
+    def test_empty_text_is_a_no_op(self):
+        self.assertFalse(self.speaker.say_async(""))
+        self.assertFalse(self.speaker.say_async("   "))
+        self.assertFalse(self.speaker.say_async(None))
+        self.assertEqual(self.synth.calls, [])
+
+    def test_busy_flag_is_cleared_after_async_speech(self):
+        """应声词说完必须把 busy 清掉 —— 挂着不清，主动关怀就永远不再触发。"""
+        self.speaker.say_async("嗯，我听着呢。")
+        self.speaker._join_async()
+        self.assertFalse(self.speaker.busy)
+
+    def test_busy_flag_is_cleared_even_if_synthesis_fails(self):
+        speaker = Speaker(synthesizer=FakeSynthesizer(succeed=False),
+                          player=self.player)
+        self.addCleanup(speaker.close)
+        speaker.say_async("嗯，我听着呢。")
+        speaker._join_async()
+        self.assertFalse(speaker.busy)
+
+
+class TestSpeakerStreaming(unittest.TestCase):
+    """边收边播：缓存没命中时，第一块音频到了就开口，不等整句合成完。"""
+
+    def setUp(self):
+        self.synth = FakeStreamingSynthesizer()
+        self.player = FakeStreamPlayer()
+        self.speaker = Speaker(synthesizer=self.synth, player=self.player)
+        self.addCleanup(self.speaker.close)
+
+    def test_streams_when_the_engine_supports_it(self):
+        self.assertTrue(self.speaker.say("您好呀"))
+        self.assertEqual(len(self.synth.stream_calls), 1)
+        self.assertEqual(self.synth.calls, [], "不该再落回整句合成")
+
+    def test_negotiated_rate_is_passed_through(self):
+        self.speaker.say("您好呀")
+        self.assertEqual(self.synth.stream_calls[0][1], 24000)
+        self.assertEqual(self.player.rate_queries, [(24000,)])
+
+    def test_engine_without_streaming_uses_the_old_path(self):
+        """SAPI 这类只落盘的引擎照旧走老路。"""
+        synth = FakeSynthesizer()               # 没有 supports_streaming
+        speaker = Speaker(synthesizer=synth, player=self.player)
+        self.addCleanup(speaker.close)
+        self.assertTrue(speaker.say("您好呀"))
+        self.assertEqual(len(synth.calls), 1)
+
+    def test_falls_back_when_rates_do_not_overlap(self):
+        """设备采样率与引擎档位没有交集 → 整句合成。
+
+        硬开一个设备开不了的采样率会抛 PortAudioError，比慢一点糟得多。
+        """
+        player = FakeStreamPlayer(rate=None)
+        speaker = Speaker(synthesizer=self.synth, player=player)
+        self.addCleanup(speaker.close)
+        self.assertTrue(speaker.say("您好呀"))
+        self.assertEqual(self.synth.stream_calls, [])
+        self.assertEqual(len(self.synth.calls), 1, "没有落回整句合成")
+
+    def test_no_player_means_no_streaming(self):
+        """``--no-play``：没有播放端就无所谓"边收边播"，但仍要**合成**。
+
+        返回 True 是既有的语义 —— ``_play_locked`` 在"已合成但没有播放设备"
+        这条分支上返回 True（合成成功 ≠ 说了话，但也不是失败）。
+        """
+        speaker = Speaker(synthesizer=self.synth, player=None)
+        self.addCleanup(speaker.close)
+        self.assertTrue(speaker.say("您好呀"))
+        self.assertEqual(self.synth.stream_calls, [])
+        self.assertEqual(len(self.synth.calls), 1)
+
+    def test_falls_back_when_nothing_was_played(self):
+        """一块都没吐出来就失败 —— 干净的失败，落回整句合成（那条路带兜底）。"""
+        synth = FakeStreamingSynthesizer(fail_before_first=True)
+        speaker = Speaker(synthesizer=synth, player=self.player)
+        self.addCleanup(speaker.close)
+        self.assertTrue(speaker.say("您好呀"))
+        self.assertEqual(len(synth.calls), 1, "没有落回整句合成")
+
+    def test_does_not_replay_after_audio_was_already_heard(self):
+        """**已经出声之后**断流：绝不能重念。
+
+        这是流式改造里唯一会直接伤到用户的错误 —— 老人会听到同一句话
+        被念两遍（而且第二遍还是从头开始）。
+        """
+        synth = FakeStreamingSynthesizer(
+            chunks=[b"\x00\x01" * 10] * 4, fail_after=1)
+        speaker = Speaker(synthesizer=synth, player=self.player)
+        self.addCleanup(speaker.close)
+        speaker.say("您好呀")
+        self.assertEqual(synth.calls, [], "已经出声了还重念了一遍")
+
+    def test_cache_hit_never_opens_a_stream(self):
+        """缓存命中就直接播文件 —— 那句已经在本机了，没有任何理由再走网络。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = speech_cache.SpeechCache(tmp, "fake|voice|1.0")
+            warm = os.path.join(tmp, "warm.wav")
+            write_wav(warm)
+            cache.store("您好呀", warm)
+
+            speaker = Speaker(synthesizer=self.synth, player=self.player,
+                              cache=cache, cache_allow=["您好呀"])
+            self.addCleanup(speaker.close)
+            self.assertTrue(speaker.say("您好呀"))
+            self.assertEqual(self.synth.stream_calls, [])
+            self.assertEqual(self.synth.calls, [])
+
+
+class TestDoubaoStreamParser(unittest.TestCase):
+    """流式解析器：喂一行吐一块。协议的细节全在这里。"""
+
+    @staticmethod
+    def _audio(payload: bytes) -> str:
+        return json.dumps(
+            {"code": 0, "data": base64.b64encode(payload).decode("ascii")})
+
+    def _feed(self, parser, lines):
+        out = []
+        for line in lines:
+            chunk = parser.feed(line)
+            if chunk:
+                out.append(chunk)
+        return b"".join(out)
+
+    def test_basic_stream(self):
+        parser = tts.DoubaoStreamParser()
+        blob = self._feed(parser, [
+            self._audio(b"aaa"),
+            self._audio(b"bbb"),
+            json.dumps({"code": tts.DOUBAO_DONE_CODE, "message": "OK"}),
+        ])
+        self.assertEqual(blob, b"aaabbb")
+        self.assertTrue(parser.done)
+        self.assertEqual(parser.chunks, 2)
+        self.assertEqual(parser.failure, "")
+
+    def test_sse_prefix_and_event_lines_are_tolerated(self):
+        parser = tts.DoubaoStreamParser()
+        blob = self._feed(parser, [
+            "event: message",
+            "data: " + self._audio(b"zzz"),
+            "data: [DONE]",
+            "",
+            "   ",
+        ])
+        self.assertEqual(blob, b"zzz")
+
+    def test_error_code_is_recorded_not_raised(self):
+        """流式里报错**不抛** —— 音频可能已经进耳朵了，抛只会让调用方重念。"""
+        parser = tts.DoubaoStreamParser()
+        parser.feed(self._audio(b"aaa"))
+        parser.feed(json.dumps({"code": 45000010, "message": "invalid speaker"}))
+        self.assertEqual(parser.chunks, 1)
+        self.assertIn("45000010", parser.failure)
+        self.assertIn("invalid speaker", parser.failure)
+
+    def test_garbage_lines_are_skipped(self):
+        parser = tts.DoubaoStreamParser()
+        blob = self._feed(parser, [
+            "not json", "{", "", "event: x", "data:", self._audio(b"ok")])
+        self.assertEqual(blob, b"ok")
+        self.assertEqual(parser.failure, "")
+
+    def test_done_is_not_audio(self):
+        parser = tts.DoubaoStreamParser()
+        self.assertIsNone(
+            parser.feed(json.dumps({"code": tts.DOUBAO_DONE_CODE})))
+        self.assertTrue(parser.done)
+        self.assertEqual(parser.chunks, 0)
+
+
 class TestSpeakerLogging(unittest.TestCase):
     """播报的日志必须能区分「说了」「没合成出来」「播了但没人听见」。
 

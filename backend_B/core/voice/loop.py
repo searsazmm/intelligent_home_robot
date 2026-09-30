@@ -161,6 +161,11 @@ class Speaker:
 
         self._lock = threading.Lock()
         self._busy = threading.Event()
+        #: 异步播报（应声词，见 :meth:`say_async`）的簿记。
+        #: **单独一把锁**，绝不能用 ``_lock`` —— 理由见 :meth:`_join_async`。
+        self._async_lock = threading.Lock()
+        self._async_busy = False
+        self._async_thread: Optional[threading.Thread] = None
         self._last_text = ""
         self._tempdir = tempfile.mkdtemp(prefix="b_voice_")
         self._counter = 0
@@ -186,10 +191,78 @@ class Speaker:
         阻塞是刻意的：调用方需要知道"说完了"才能恢复采集。
         失败返回 False（比如没装 TTS），但**不抛异常** ——
         文字回复和表情照常工作。
+
+        进门时如果上一句**应声词**还在播，会先等它说完再排队 ——
+        见 :meth:`say_async`。
+        """
+        return self._say(text, join_async=True)
+
+    def say_async(self, text: str) -> bool:
+        """异步说一句：立刻返回，播报在后台线程里做。
+
+        用途只有一个 —— **应声词**。从用户说完到机器人给出正式回复，
+        大模型那一段本机实测要 0.9~1.0 秒；干等着就是"说完之后机器沉默"，
+        先垫一句「嗯，我听着呢」体感上就完全不同了。
+
+        两个关键性质：
+
+        1. **和 :meth:`say` 排在同一条队上，应声词一定在前。** 这一步是
+           自动的：正式回复走 :meth:`say`，它进门先 :meth:`_join_async`。
+           **不能靠"两个线程抢同一把锁"来排序** —— ``threading.Lock``
+           不保证先来先得，正式回复完全可能抢先拿到锁，于是老人听到的是
+           "回答……嗯，我听着呢"。
+        2. **同一时刻只允许一句异步播报。** 上一句还没说完又来一句时直接
+           丢掉这一次，否则应声词会连成一片："嗯，我想想，嗯，我想想"。
+
+        返回 False 表示"没排上队"（空文本 / 上一句还在说），**不是失败**。
         """
         text = (text or "").strip()
         if not text:
             return False
+
+        with self._async_lock:
+            if self._async_busy:
+                logger.debug("上一句异步播报还没说完，丢掉这次的：%s", _brief(text))
+                return False
+            self._async_busy = True
+            thread = threading.Thread(
+                target=self._say_async_worker, args=(text,),
+                name="voice-say-async", daemon=True)
+            self._async_thread = thread
+            thread.start()
+        return True
+
+    def _say_async_worker(self, text: str) -> None:
+        try:
+            # join_async=False：worker 本身就是被等的那一方，再等自己会死锁。
+            self._say(text, join_async=False)
+        except Exception:
+            logger.exception("异步播报失败")
+        finally:
+            with self._async_lock:
+                self._async_busy = False
+                self._async_thread = None
+
+    def _join_async(self) -> None:
+        """等上一句异步播报说完。**必须在取 ``_lock`` 之前调用。**
+
+        顺序反了就是死锁：worker 里也要拿 ``_lock``，先取 ``_lock`` 再等
+        worker，两边就永远等下去。同理 ``_async_lock`` 只用来读一个引用，
+        读完立刻放 —— 拿着它去 join 会卡住 worker 的收尾（worker 的
+        finally 也要拿这把锁）。
+        """
+        with self._async_lock:
+            thread = self._async_thread
+        if thread is not None:
+            thread.join()
+
+    def _say(self, text: str, *, join_async: bool) -> bool:
+        text = (text or "").strip()
+        if not text:
+            return False
+
+        if join_async:
+            self._join_async()
 
         with self._lock:                      # 串行化：同一时刻只能说一句
             self._last_text = text
@@ -213,6 +286,13 @@ class Speaker:
                 cached = self.cache.lookup(text)
                 if cached is not None:
                     return self._play_locked(text, cached, from_cache=True)
+
+            # 缓存没命中（大模型的回复必然唯一，永远走到这里）。
+            # 联网引擎可以**边收边播**：第一块音频到了就开口，不等整句合成完。
+            # 本机实测这能把开口前的沉默从 ~1.23s 压到 ~0.57s。
+            streamed = self._try_stream_locked(text)
+            if streamed is not None:
+                return streamed
 
             self._counter += 1
             wav_path = os.path.join(self._tempdir, f"say_{self._counter}.wav")
@@ -255,6 +335,85 @@ class Speaker:
         if self._cache_allow is None:
             return True
         return text.strip() in self._cache_allow
+
+    # ------------------------------------------------------------------
+    # 边收边播（流式合成）
+    # ------------------------------------------------------------------
+
+    def _try_stream_locked(self, text: str) -> Optional[bool]:
+        """试一次边收边播。``None`` = "条件不成立 / 一个字都没出声，请落回整句合成"。
+
+        四种情况返回 None，每一种都对应一条**本来就走不通**的路：
+
+          1. 没有播放设备（``--no-play``）—— 没有播放端就无所谓"边收边播"。
+             注意这条走 None 之后会落到 ``_play_locked`` 的"已合成但未播放"
+             分支，那正是 ``--no-play`` 期望的行为。
+          2. 引擎不支持流式（SAPI 是本地 37ms 合成，根本不需要；edge-tts 与
+             豆包的"落盘"路径也没实现）。
+          3. 设备采样率和引擎能给的档位没有交集 —— 流式不能重采样（见
+             ``Player.play_pcm_stream``），谈不拢就只能走整句合成。
+          4. 试了但**一块音频都没吐出来**就失败 —— 这是干净的失败，落回
+             整句合成那条路，它还带着本地 SAPI 的逐句兜底。
+
+        对第 4 种情况的**反面**特别要紧：一旦已经出声，就**绝不返回 None**。
+        返回 None 会让调用方把同一句话再合成一遍、再念一遍。
+        """
+        if self.player is None:
+            return None
+        if not getattr(self.synthesizer, "supports_streaming", False):
+            return None
+        stream_fn = getattr(self.synthesizer, "synthesize_pcm_stream", None)
+        if stream_fn is None:
+            return None
+
+        rates = getattr(self.synthesizer, "stream_rates", ())
+        if not rates:
+            return None
+        rate = self.player.stream_rate(rates)
+        if rate is None:
+            logger.debug("输出设备与合成引擎的采样率没有交集，这句走整句合成")
+            return None
+
+        return self._stream_locked(text, stream_fn, rate)
+
+    def _stream_locked(self, text: str, stream_fn, rate: int) -> Optional[bool]:
+        """真的去边收边播。调用方已持有锁。"""
+        if self.half_duplex:
+            try:
+                self.player.stop()        # 打断上一次可能的播放
+            except Exception:
+                pass
+
+        # 用一个盒子把"出没出过声""为什么断的"从生成器里带出来 ——
+        # Player.play_pcm_stream 会把异常吃掉并返回 False，光看返回值
+        # 分不清"设备没开起来"和"服务端一块都没给"。
+        state = {"started": False, "error": None}
+
+        def chunks():
+            try:
+                for piece in stream_fn(text, rate):
+                    state["started"] = True
+                    yield piece
+            except Exception as exc:       # noqa: BLE001 —— 原样往上抛，只顺手记一笔
+                state["error"] = exc
+                raise
+
+        t0 = time.monotonic()
+        ok = bool(self.player.play_pcm_stream(chunks(), rate))
+        elapsed = (time.monotonic() - t0) * 1000
+
+        if not state["started"]:
+            logger.warning("流式合成一块音频都没出来就失败，改用整句合成：%s（%s）",
+                           _brief(text), state["error"] or "无音频")
+            return None
+
+        if state["error"] is not None:
+            # 已经念出去了，收不回来。硬要重念只会让老人听两遍同一句话。
+            logger.warning("流式合成中途断了，已播出的部分不回退：%s",
+                           state["error"])
+        logger.info("流式播报：%s（首个字节到播完共 %.0fms，%dHz）",
+                    _brief(text), elapsed, rate)
+        return ok
 
     def _play_locked(self, text: str, wav_path: str,
                      synth_ms: float = 0.0, from_cache: bool = False) -> bool:

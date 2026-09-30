@@ -545,6 +545,19 @@ class TestDialogue(unittest.TestCase):
         reply = self.engine.respond("我胸口疼")
         self.assertIn(reply.reply, DISCOMFORT_REPLIES)
 
+    def test_ack_replies_are_prewarmed(self):
+        """应声词**尤其**要在预合成缓存里。
+
+        它整句的存在意义就是"立刻出声"：要是它自己还要等一次网络往返
+        （本机实测 1.2~1.6 秒），那还不如不说 —— 用户听到的是"沉默，
+        然后一句废话，然后沉默，然后回答"。
+        """
+        from core.dialogue import ACK_REPLIES, static_replies
+        prewarmed = static_replies()
+        for text in ACK_REPLIES:
+            with self.subTest(text=text):
+                self.assertIn(text, prewarmed)
+
     def test_crisis_and_discomfort_replies_are_prewarmed(self):
         """这两组必须进预合成集合。
 

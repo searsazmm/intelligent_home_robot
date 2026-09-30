@@ -33,7 +33,7 @@ import sys
 import threading
 import wave
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -396,6 +396,101 @@ class Player:
             # 播放失败不该中断对话 —— 文字回复和表情照常
             logger.exception("播放音频失败（设备 %r）", self.device_name or "默认")
             return False
+
+    # ------------------------------------------------------------------
+
+    def stream_rate(self, candidates: Iterable[int]) -> Optional[int]:
+        """在 ``candidates`` 里挑一个**本设备真的能开**的采样率；挑不到返回 None。
+
+        返回 None 不是异常，是正常结果：调用方据此决定"这次不走流式合成"，
+        退回"等整句合成完"那条老路。硬开一个设备开不了的采样率只会抛
+        ``PortAudioError: Invalid sample rate``。
+
+        存在的理由：流式播报**不能重采样**（重采样器要有状态、要跨块记住
+        上一个样本，见下面 play_pcm_stream 的说明），所以只能反过来 ——
+        让服务端按设备的采样率合成。本机实测豆包 16k/24k/48k 三档都给。
+        """
+        if self._device is None:
+            self._device = resolve_output_device(self.device_name)
+        for rate in candidates:
+            # supported_output_rate 是"先试 preferred"，所以相等即代表这个率能开。
+            if supported_output_rate(self._device, int(rate)) == int(rate):
+                return int(rate)
+        return None
+
+    def play_pcm_stream(self, chunks: Iterable[bytes], sample_rate: int) -> bool:
+        """**边收边播**：``chunks`` 是逐块产出的 16bit 单声道 PCM 字节。
+
+        返回"有没有真的发出声"，和 :meth:`play_wav` 的语义对齐：
+        一块音频都没有时返回 False（不是"设备坏了"，是"没东西可播"）。
+
+        为什么不像 :meth:`play_wav` 那样整段重采样：重采样是有状态的运算，
+        逐块做会在每块的接缝处产生"咔"声（线性插值要知道上一个样本才能算
+        边界）。所以调用方先用 :meth:`stream_rate` 把采样率谈成设备能开的
+        那个，这里就只做直通。真走到"设备换了一个率"的兜底分支时，
+        宁可退回"收完再播"也不做逐块重采样 —— 慢一点，但不会有杂音。
+        """
+        if self._device is None:
+            self._device = resolve_output_device(self.device_name)
+
+        try:
+            sounddevice = _sounddevice()
+        except ImportError:
+            logger.warning("未安装 sounddevice，无法播放语音（pip install sounddevice）")
+            return False
+
+        play_rate = supported_output_rate(self._device, sample_rate)
+        if play_rate != sample_rate:
+            logger.warning(
+                "输出设备不支持 %dHz（回落到 %dHz），本次改为收完再重采样播放",
+                sample_rate, play_rate)
+
+        self._stop.clear()
+        block_bytes = max(2, int(play_rate * 100 / 1000.0) * 2)
+        pending = b""            # 长度为奇数时把尾巴留到下一块，保证按 16bit 对齐
+        buffered = b""           # 仅当采样率对不上时才用到
+        played = False
+
+        try:
+            with sounddevice.RawOutputStream(
+                samplerate=play_rate,
+                channels=1,
+                dtype="int16",
+                device=self._device,
+            ) as stream:
+                for chunk in chunks:
+                    if self._stop.is_set():
+                        stream.abort()      # 被打断：立刻停，不等缓冲区放完
+                        return played
+                    if not chunk:
+                        continue
+                    pending += chunk
+                    even = len(pending) - (len(pending) % 2)
+                    if even <= 0:
+                        continue            # 只有半个样本，等下一块
+                    raw, pending = pending[:even], pending[even:]
+                    played = True
+                    if play_rate == sample_rate:
+                        # RawOutputStream 的 write 是阻塞的：它会一直等到
+                        # 缓冲区吃下这些数据。生产者（网络）比播放慢时
+                        # 这里自然就等，不会忙转。
+                        stream.write(raw)
+                    else:
+                        buffered += raw
+
+                if play_rate != sample_rate and buffered:
+                    for start in range(0, len(buffered), block_bytes):
+                        if self._stop.is_set():
+                            break
+                        piece = buffered[start:start + block_bytes]
+                        stream.write(resample_pcm(piece, sample_rate, play_rate))
+            return played
+        except Exception:
+            logger.exception("流式播放失败（设备 %r）", self.device_name or "默认")
+            # 返回 played 而不是 False：中途断流时声音**已经出去了一部分**，
+            # 报 False 会让调用方以为"这句一个字都没说"，进而重念一遍。
+            # 只有"设备压根没开起来"才是真的 False（那时 played 还是 False）。
+            return played
 
     def stop(self) -> None:
         """打断正在进行的播放。从别的线程调用。"""

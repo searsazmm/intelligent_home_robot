@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from core import llm
-from core.dialogue import DialogueEngine
+from core.dialogue import ACK_REPLIES, DialogueEngine
 from core.history_store import CsvHistoryStore
 from core.llm import (DeepSeekClient, NullChatClient, build_chat_headers,
                       build_chat_request, build_chatter, build_system_prompt,
@@ -671,6 +671,88 @@ class FakeLlm:
 
     def close(self):
         return None
+
+
+class TestThinkingReply(unittest.TestCase):
+    """应声词：用户说完、大模型还没答上来时先垫一句。
+
+    它整句的价值就在**快**，所以两条最要紧的断言是：
+      - 只在确实要走大模型时才说 —— 模板回复是本地查表，没有等待，
+        垫一句纯属废话，还容易让老人以为机器人没听懂；
+      - 说出口的那句必须在预合成缓存里（见 test_core.py），否则它自己
+        就要先等一次网络往返，正好抵消掉它想省的那段时间。
+    """
+
+    #: 一句能走大模型的话（test_llm.py 里其它用例也用这句）。
+    TOPIC = "我年轻时候在东北待过"
+
+    def test_fires_when_the_llm_will_be_used(self):
+        engine = DialogueEngine(llm=FakeLlm())
+        seen = []
+        engine.respond(self.TOPIC, on_thinking=seen.append)
+        self.assertEqual(len(seen), 1, "要走大模型却没垫应声词")
+        self.assertIn(seen[0], ACK_REPLIES)
+
+    def test_fires_before_the_request_is_sent(self):
+        """顺序必须是 应声词 → 请求。反了它就不叫应声词了。"""
+        order = []
+
+        class RecordingLlm(FakeLlm):
+            def complete(self, messages):
+                order.append("llm")
+                return super().complete(messages)
+
+        engine = DialogueEngine(llm=RecordingLlm())
+        engine.respond(self.TOPIC, on_thinking=lambda ack: order.append("ack"))
+        self.assertEqual(order, ["ack", "llm"])
+
+    def test_does_not_fire_for_crisis_text(self):
+        """危机语句绝不出门给大模型 —— 也就不该垫应声词。"""
+        engine = DialogueEngine(llm=FakeLlm())
+        seen = []
+        engine.respond("我不想活了", on_thinking=seen.append)
+        self.assertEqual(seen, [])
+
+    def test_does_not_fire_without_an_llm(self):
+        """没有大模型 = 全部走模板 = 没有等待。"""
+        engine = DialogueEngine()
+        seen = []
+        engine.respond(self.TOPIC, on_thinking=seen.append)
+        self.assertEqual(seen, [])
+
+    def test_does_not_fire_for_meaningless_input(self):
+        """「嗯」没有可回应的内容，模板就够了。"""
+        engine = DialogueEngine(llm=FakeLlm())
+        seen = []
+        engine.respond("嗯", on_thinking=seen.append)
+        self.assertEqual(seen, [])
+
+    def test_a_broken_callback_does_not_break_the_reply(self):
+        """应声词是锦上添花 —— 它炸了绝不能连累真正的回复。"""
+        engine = DialogueEngine(llm=FakeLlm("我在这儿呢。"))
+
+        def boom(_ack):
+            raise RuntimeError("模拟：播报层炸了")
+
+        reply = engine.respond(self.TOPIC, on_thinking=boom)
+        self.assertEqual(reply.reply, "我在这儿呢。")
+
+    def test_thinking_reply_avoids_repeating_itself(self):
+        """连着两轮同一句"嗯，我想想"，听起来就是卡带。"""
+        engine = DialogueEngine()
+        first = engine.thinking_reply()
+        second = engine.thinking_reply()
+        self.assertIn(first, ACK_REPLIES)
+        self.assertIn(second, ACK_REPLIES)
+        self.assertNotEqual(first, second)
+
+    def test_ack_replies_are_plain_text(self):
+        """带占位符就进不了预合成缓存；带标点以外的花样则会被念得很怪。"""
+        for text in ACK_REPLIES:
+            with self.subTest(text=text):
+                self.assertNotIn("{", text)
+                self.assertEqual(text, text.strip())
+                self.assertTrue(text)
 
 
 class TestLlmRouting(unittest.TestCase):

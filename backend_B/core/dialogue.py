@@ -32,7 +32,7 @@ import logging
 import random
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import config
 from core.llm import build_system_prompt, sanitize_reply
@@ -174,6 +174,8 @@ class DialogueEngine:
         self._rng = rng or random.Random()
         self._last_user_text_at: float = 0.0
         self._llm = llm                         # Chatter 或 None
+        #: 上一次说过的应声词，用来避开连着两次说同一句。
+        self._last_ack: str = ""
 
     # ------------------------------------------------------------------
     # 主入口
@@ -185,6 +187,7 @@ class DialogueEngine:
         vision: Optional[VisionState] = None,
         *,
         from_user: bool = True,
+        on_thinking: Optional[Callable[[str], None]] = None,
     ) -> DialogueReply:
         """生成回复。user_text 为空时返回一句兜底提示，不抛异常。
 
@@ -197,6 +200,12 @@ class DialogueEngine:
         说的话也算进去，就会变成 —— 机器人对着空房间说一句"我陪着您"，
         系统立刻据此认定「人在」，`absent` 被改写成 `normal`。
         等于用自己的回声证明了房间里有人。
+
+        ``on_thinking`` 是**应声词**的出口：**只在真的要调大模型、并且调用
+        之前**被调一次，参数是 :meth:`thinking_reply` 挑好的一句。它必须是
+        **非阻塞**的 —— 调用它的线程马上要去做那次网络请求，在这里阻塞
+        等于把应声词变成了对回复的额外延迟，正好是它想解决的问题。
+        见 :data:`ACK_REPLIES`。
         """
         user_text = (user_text or "").strip()
         vision = vision or VisionState()
@@ -218,7 +227,8 @@ class DialogueEngine:
         # 大模型只产出「回复文本」。上面那三行（意图 / 状态 / 情绪）已经是
         # 最终结果，不会因为走了大模型而变 —— 见模块 docstring 的说明。
         source = "llm"
-        reply_text = self._online_reply(state, intent, emotion, user_text)
+        reply_text = self._online_reply(state, intent, emotion, user_text,
+                                        on_thinking=on_thinking)
         if reply_text is None:
             # 不适用（危机 / 不适 / 问候这类）或调用失败，一律落回模板。
             source = "template"
@@ -261,6 +271,20 @@ class DialogueEngine:
         pool = fresh or candidates
 
         return self._rng.choice(pool)
+
+    def thinking_reply(self) -> str:
+        """挑一句应声词。见 :data:`ACK_REPLIES`。
+
+        避开上一次说过的那句：连着两轮"嗯，我想想"，听起来就是卡带。
+        这里**不用** ``_recent_replies()``（那个读历史 CSV），因为应声词
+        刻意**不写进历史** —— 历史是"机器人说过什么"的记录，而应声词
+        不是回答，把它记进去会污染给大模型的上下文，让它以为上轮自己
+        只说了句"嗯，我听着呢"。
+        """
+        fresh = [text for text in ACK_REPLIES if text != self._last_ack]
+        chosen = self._rng.choice(fresh or list(ACK_REPLIES))
+        self._last_ack = chosen
+        return chosen
 
     # ------------------------------------------------------------------
     # 1) 意图识别
@@ -488,7 +512,9 @@ class DialogueEngine:
         return True, ""
 
     def _online_reply(self, state: str, intent: str, emotion: TextEmotion,
-                      user_text: str) -> Optional[str]:
+                      user_text: str,
+                      on_thinking: Optional[Callable[[str], None]] = None,
+                      ) -> Optional[str]:
         """让大模型生成一句回复。返回 ``None`` 表示"不适用或失败，请落回模板"。
 
         契约：**只可能返回一句洗干净的、非空的文本，或者 None**。
@@ -498,6 +524,18 @@ class DialogueEngine:
         if not eligible:
             logger.debug("这句不走大模型：%s", why)
             return None
+
+        # 到这一步才垫应声词：上面那些分支（危机 / 不适 / 语气词）都是本地
+        # 查表出结果，没有等待，垫一句纯属废话；而模板回复里塞一句"嗯，我想想"
+        # 反而会让老人以为机器人没听懂。
+        #
+        # 位置也很讲究 —— 必须在 complete 之前、且不能 await 它。
+        if on_thinking is not None:
+            try:
+                on_thinking(self.thinking_reply())
+            except Exception:
+                # 应声词是锦上添花，它失败绝不能连累真正的回复。
+                logger.debug("应声词回调失败（不影响回复生成）", exc_info=True)
 
         try:
             raw = self._llm.complete(
@@ -728,6 +766,34 @@ CRISIS_REPLIES: List[str] = [
 ]
 
 # --------------------------------------------------------------------------
+# 应声词：用户说完了、回复还没生成出来时，先垫一句
+#
+# **它不是回答**，是"我听见了、我在想"。这一句会让接口那边多等一会儿，
+# 但老人听到的是"立刻有人应我"，而不是"说完之后机器沉默两秒半"。
+#
+# 三条写作约束，都来自"它必须立刻出声"这个前提：
+#
+#   1. **必须能被预合成缓存命中**（所以静态、无占位符）。它存在的全部意义
+#      就是快 —— 要是它自己还要等 1.2 秒的合成，那还不如不说。
+#      见 static_replies()。
+#   2. **不能有信息量。** 「您今天是不是累了」这种就不行：那是在猜，猜错了
+#      老人会纠正你，然后真正的回答又接上来，一句话变成三句。
+#   3. **长度要压得住沉默。** 大模型那一段本机实测 p50 ≈ 0.9~1.0 秒，
+#      这几句念出来大约 1.0~1.4 秒，刚好盖住。太短会露馅（应声完了还要等），
+#      太长就成了啰嗦。
+#
+# 只在**确实要走大模型**的时候才说（见 respond 的 on_thinking）：
+# 模板回复是本地查表、没有等待，这时候再垫一句纯属废话。
+# --------------------------------------------------------------------------
+
+ACK_REPLIES: List[str] = [
+    "嗯，我听着呢。",
+    "嗯，让我想想。",
+    "哎，您说。",
+    "嗯…我想想啊。",
+]
+
+# --------------------------------------------------------------------------
 # 主动开口的文案（api_doc §5 V1.2 的 proactive 报文用它）
 #
 # 和上面的应答模板有三条不同的写作约束，都来自「老人没有向你提问」这个前提：
@@ -802,6 +868,10 @@ def static_replies() -> List[str]:
     for text in DISCOMFORT_REPLIES:
         add(text)
     for text in CRISIS_REPLIES:
+        add(text)
+    # 应声词**尤其**不能漏：它整句的意义就是"立刻出声"，要是没被预合成，
+    # 它自己就得先等一次网络往返，那还不如沉默。
+    for text in ACK_REPLIES:
         add(text)
 
     return collected

@@ -114,7 +114,9 @@ class BackendB:
             host=args.status_host, port=args.status_port
         )
         self.chat_server = ChatServer(
-            on_chat=self.handle_chat,
+            # 不走 self.handle_chat：8002 是"不出声"的文本通道，而 handle_chat
+            # 默认会垫应声词（要出声）。见 _handle_chat_from_c。
+            on_chat=self._handle_chat_from_c,
             # 注入当前状态，让新连上的 C 端**立刻**拿到状态而不是等 15 秒心跳。
             # C 端默认只连 8002，这条就是它开局的唯一状态来源。
             state_provider=self._effective_state,
@@ -605,10 +607,18 @@ class BackendB:
     # 对话处理（ChatServer 的回调）
     # ==================================================================
 
-    def handle_chat(self, text: str) -> DialogueReply:
-        """收到用户一句话：生成回复 → 写历史 → 更新状态覆盖 → 返回。"""
+    def handle_chat(self, text: str, *, allow_ack: bool = True) -> DialogueReply:
+        """收到用户一句话：生成回复 → 写历史 → 更新状态覆盖 → 返回。
+
+        ``allow_ack=False`` 关掉**应声词**。8002 那条路要关 —— 它是模块 C
+        与测试脚本走的文本通道，按约定**不朗读**，而应声词是要出声的：
+        测试脚本跑一轮，机房里就会响起机器人的"嗯，我听着呢"。
+        """
         vision = self.evaluator.get_state()
-        reply = self.dialogue.respond(text, vision)
+        reply = self.dialogue.respond(
+            text, vision,
+            on_thinking=self._on_thinking if allow_ack else None,
+        )
 
         logger.info("用户：%s", text)
         logger.info("机器人：%s  [%s]", reply.reply, reply.reason)
@@ -636,6 +646,27 @@ class BackendB:
             self._publish_state(reply.state, reason)
 
         return reply
+
+    def _handle_chat_from_c(self, text: str) -> DialogueReply:
+        """8002 通道的对话入口。和语音那条路的唯一区别：**不出声**。
+
+        单独一个方法而不是让调用方传参：``on_chat`` 是构造 ``ChatServer``
+        时按引用传进去的，那边只能给一个无参调用形式。
+        """
+        return self.handle_chat(text, allow_ack=False)
+
+    def _on_thinking(self, ack: str) -> None:
+        """应声词的出口，交给 :meth:`Speaker.say_async` 播。
+
+        ⚠️ **必须立刻返回。** 调用它的线程紧接着就要去做大模型那次网络请求，
+        在这里阻塞等于把应声词变成对正式回复的额外延迟 —— 正好是它想解决的
+        那个问题。
+
+        没有语音层（未装配 / ``--no-play``）时直接跳过：应声词的全部意义
+        就是出声，没有声音就没有意义，没必要让对话路径多绕一圈。
+        """
+        if self.speaker is not None:
+            self.speaker.say_async(ack)
 
     # ==================================================================
     # 控制台输入（开发自测用）
