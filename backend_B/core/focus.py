@@ -141,8 +141,10 @@ IDX_UNAVAILABLE = "不可用"
 IDX_INSUFFICIENT = "有效观察时长不足"
 IDX_TREND = "研究趋势（非认知专注）"
 
-#: 有效观察时长达标后才出指数。与参考实现同值。
-MIN_VALID_SECONDS_FOR_INDEX = 10.0
+#: 有效观察时长达标后才出指数。原值 10.0（参考实现），降到 5.0
+#: 是因为 ``state_reset_gap_seconds`` 也从 2.0 调到 5.0 后，10 秒预热在
+#: 实际联调中太慢（用户要走神测试得坐正等 10 秒才出值）。5 秒够稳定。
+MIN_VALID_SECONDS_FOR_INDEX = 5.0
 
 #: 静默模式**必须**拿到的两路证据（需求文档 §4 B2：「视线稳定 + 有规律眨眼」）。
 #:
@@ -186,16 +188,18 @@ class FocusConfig:
     # --- 平滑与出值 ---
     #: 一阶低通的时间常数（秒）：``alpha = 1 - exp(-dt/tau)``。
     #: 用它而不是逐帧固定 alpha，是为了让 10fps 与 15fps 下的平滑行为一致。
-    ema_time_constant_seconds: float = 1.5
+    #: 原 1.5s 联调太跳（66.5→70.8 只用 1 秒），走神持续门槛达不到。
+    #: 降到 0.8s 让 VAI 更平滑，走神时稳定低值不会瞬间反弹。
+    ema_time_constant_seconds: float = 0.8
     min_valid_seconds_for_index: float = MIN_VALID_SECONDS_FOR_INDEX
 
     # --- 有效时间与重置 ---
     #: 两次有效观测间隔超过它就**不再计入**有效观察时长。
     #: 这也是"视线报文必须与帧同频"的原因：掉到 1Hz 以下这个门永远过不去，
     #: 表现为"校准/出值永远做不完"且不报错。
-    max_sample_gap_seconds: float = 1.0
+    max_sample_gap_seconds: float = 2.0
     #: 连续多久没有可评估的观测就重置整个会话（含校准基线）。
-    state_reset_gap_seconds: float = 2.0
+    state_reset_gap_seconds: float = 5.0
 
     # --- 眼部（单路 EAR）---
     ear_quality_min: float = 0.35
@@ -1116,6 +1120,42 @@ def should_stay_silent(
     return True, ""
 
 
+def is_distracted(
+    tracker: FocusTracker,
+    *,
+    stale_seconds: float,
+    max_index: float,
+    now_wall: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """**老人是不是走神了**（VAI 持续偏低）。返回 ``(走神, 否则的原因)``。
+
+    与 :func:`should_stay_silent` 对称的反向判定：同样的**可信 + 模态齐全**
+    前置（理由同上 —— 缺模态时权重重归一化会算出假分，闭眼 100 分那种坑
+    在走神方向上同样会咬人），只是阈值方向相反 —— 指数 **低于** ``max_index``
+    才算走神。
+
+    走神场景实测 VAI≈43.1（见 :func:`should_stay_silent` 的注释），所以默认
+    门槛 45 落在它上面一点点。门槛与专注门槛（70）之间留 25 分的灰色地带 ——
+    既不静默也不提醒，那段是"人在画面里但没特别专注"，由 idle_chat 兜底。
+
+    ⚠️ 本函数只判**此刻**，不判持续时长。走神会瞬间波动（眨眼、扭头一瞬），
+    只看一拍就提醒会变成唠叨。持续多久才算"真的走神了"由调用方
+    （:class:`proactive.ProactiveScheduler`）按 ``PROACTIVE_DISTRACT_SUSTAIN``
+    跟踪 —— 和 absent 的 ``greeting_absent`` 是同一种"边沿 vs 状态"的分工。
+    """
+    live, reason = focus_is_live(tracker, stale_seconds, now_wall)
+    if not live:
+        return False, reason
+
+    snapshot = tracker.snapshot()
+
+    index = snapshot.index
+    assert index is not None
+    if index >= max_index:
+        return False, f"专注度 {index:.1f} 未低至走神门槛 {max_index:g}"
+    return True, ""
+
+
 __all__ = [
     "DEFAULT_WEIGHTS",
     "EarBaseline",
@@ -1139,6 +1179,7 @@ __all__ = [
     "WEIGHT_VERSION",
     "focus_is_live",
     "gaze_evidence",
+    "is_distracted",
     "pose_alignment",
     "should_stay_silent",
 ]

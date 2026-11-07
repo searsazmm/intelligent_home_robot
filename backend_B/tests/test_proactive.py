@@ -18,6 +18,8 @@ from core.dialogue import DialogueEngine                         # noqa: E402
 from core.proactive import (                                     # noqa: E402
     CARE_KINDS,
     CAP_WINDOW_SECONDS,
+    GATE_AWAITING_REPLY,
+    GATE_DISTRACT_COOLDOWN,
     GATE_FOCUS,
     GATE_NO_TRIGGER,
     GATE_SPEAKING,
@@ -187,8 +189,11 @@ class TestPolicyGates(unittest.TestCase):
     # ---- 状态本身 ----
 
     def test_normal_never_triggers_care(self):
+        """normal 不触发**关怀**；它在安静时触发的是闲聊（idle_chat）。"""
         ctx = open_context(state=config.STATE_NORMAL)
-        self.assertIsNone(self.policy.evaluate(ctx))
+        decision = self.policy.evaluate(ctx)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "idle_chat")
 
     def test_absent_never_triggers_care(self):
         """对着空房间说话是荒谬的。absent 不在 CARE_KINDS 里，且无问候待发。"""
@@ -259,6 +264,59 @@ class TestDecisionPayload(unittest.TestCase):
         reason = policy.evaluate(ctx).reason
         self.assertIn("30", reason)
         self.assertIn(config.STATE_SAD, reason)
+
+
+class TestDistractRemindCooldown(unittest.TestCase):
+    """门禁 5b：走神提醒自己的 60 秒重复冷却。
+
+    走神豁免了 awaiting_reply / min_interval（第一次要能立马说），豁免
+    的代价是没有别的门替它防复读 —— TTS 播 4 秒 + 重新累计 3 秒，
+    实测 7-8 秒又说一遍，一轮走神连说 3 次，还把每小时配额一口气
+    吃光。这道门只压走神分支，不挡 idle_chat / greeting。
+    """
+
+    def setUp(self):
+        self.policy = ProactivePolicy(
+            sustain=20.0, min_interval=90.0, max_per_hour=4,
+            user_cooldown=60.0, greeting_absent=60.0, startup_grace=15.0,
+            quiet_hours=(22, 7), quiet_enabled=True,
+        )
+
+    def _distracted_ctx(self, **overrides):
+        base = dict(
+            state=config.STATE_NORMAL,     # 人在画面里，只是分神
+            distracted_held=5.0,           # >= 默认 distract_sustain 3.0
+        )
+        base.update(overrides)
+        return open_context(**base)
+
+    def test_first_prompt_not_blocked(self):
+        """没提醒过 → 正常触发（豁免的门禁不因新增冷却而失效）。"""
+        decision = self.policy.evaluate(self._distracted_ctx())
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "care_distracted")
+
+    def test_repeated_prompt_within_gap_is_blocked(self):
+        """60 秒内提醒过 → 走神分支被 5b 挡住，不再复读。"""
+        result = self.policy.assess(
+            self._distracted_ctx(last_distract_prompt_at=T0 - 30.0))
+        self.assertIsNone(result.decision)
+        self.assertEqual(result.suppressed_by, GATE_DISTRACT_COOLDOWN)
+
+    def test_prompt_after_gap_fires_again(self):
+        """冷却过了（61 秒）→ 同一轮走神若还在，可以再提醒一次。"""
+        decision = self.policy.evaluate(
+            self._distracted_ctx(last_distract_prompt_at=T0 - 61.0))
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "care_distracted")
+
+    def test_cooldown_does_not_block_other_kinds(self):
+        """冷却只压走神：held 未满时 idle_chat 不该被 5b 误挡。"""
+        ctx = self._distracted_ctx(distracted_held=0.0,
+                                   last_distract_prompt_at=T0 - 10.0)
+        decision = self.policy.evaluate(ctx)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "idle_chat")
 
 
 class FakeClock:
@@ -354,10 +412,16 @@ class TestScheduler(unittest.TestCase):
         self.assertEqual(decision.state, config.STATE_NORMAL)
 
     def test_no_greeting_after_short_absence(self):
-        """扭头走开拿个东西就回来，不值得开口。"""
+        """扭头走开拿个东西就回来，不值得说「您回来啦」。
+
+        人一直在场（absent 只有 5 秒）、又一直安静，闲聊问候
+        （idle_chat）是交互规则③的正当行为 —— 本条钉住的是
+        **greeting**（离开很久的边沿事件）不该发。
+        """
         self.establish(config.STATE_ABSENT, settle=False)
         self.clock.advance(5.0)                          # 只离开 5 秒
-        self.assertIsNone(self.scheduler.tick(config.STATE_NORMAL))
+        decision = self.scheduler.tick(config.STATE_NORMAL)
+        self.assertTrue(decision is None or decision.kind != "greeting")
 
     def test_greeting_is_one_shot(self):
         """问候只说一次 —— 不能每 0.2 秒的节拍都问一遍「您回来啦」。"""
@@ -366,6 +430,7 @@ class TestScheduler(unittest.TestCase):
 
         first = self.scheduler.tick(config.STATE_NORMAL)
         self.assertEqual(first.kind, "greeting")
+        self.scheduler.note_proactive()                  # 真的说出口了
 
         self.clock.advance(0.2)                          # 下一个发布节拍
         self.assertIsNone(self.scheduler.tick(config.STATE_NORMAL))
@@ -380,9 +445,10 @@ class TestScheduler(unittest.TestCase):
         self.clock.advance(120.0)
         self.assertIsNone(self.scheduler.tick(config.STATE_NORMAL))   # 边沿被静默挡下
 
-        self.hour = 9                                    # 天亮了，也不补说
+        self.hour = 9                                    # 天亮了，也不补说问候
         self.clock.advance(1.0)
-        self.assertIsNone(self.scheduler.tick(config.STATE_NORMAL))
+        decision = self.scheduler.tick(config.STATE_NORMAL)
+        self.assertTrue(decision is None or decision.kind != "greeting")
 
     def test_greeting_control_group(self):
         """上一条的对照组：同样的时序、非静默时段，确实会问候。
@@ -397,10 +463,15 @@ class TestScheduler(unittest.TestCase):
     # ---- 防骚扰 ----
 
     def test_note_proactive_blocks_immediate_repeat(self):
-        """开口之后立刻又开口 —— 必须被 min_interval 挡住。"""
+        """开口之后立刻又开口 —— 必须被 min_interval 挡住。
+
+        note_proactive 会同时置上「等回应」标记（门禁 1c），本测试只关心
+        min_interval 这道门，所以每次记完账都模拟老人接话解除它。
+        """
         self.establish(config.STATE_SAD)
         self.assertIsNotNone(self.scheduler.tick(config.STATE_SAD))
         self.scheduler.note_proactive()
+        self.scheduler.note_user_reply()                 # 老人接话，解除等回应
         self.clock.advance(30.0)
         self.assertIsNone(self.scheduler.tick(config.STATE_SAD))
         self.clock.advance(61.0)                         # 累计 91 秒
@@ -415,6 +486,7 @@ class TestScheduler(unittest.TestCase):
                 f"第 {index + 1} 次仍应在上限之内",
             )
             self.scheduler.note_proactive()
+            self.scheduler.note_user_reply()             # 解除等回应，见门禁 1c
             self.clock.advance(91.0)                     # 越过 min_interval
 
         # 说满 4 次，此时被上限挡住
@@ -484,6 +556,54 @@ class TestScheduler(unittest.TestCase):
     def test_note_care_uses_the_injected_clock(self):
         self.scheduler.note_care()
         self.assertEqual(self.scheduler.last_proactive_at, self.clock.now)
+
+
+class TestDistractPromptLedger(unittest.TestCase):
+    """走神提醒的重复冷却账（scheduler 侧）。
+
+    ``note_proactive`` 现在带 ``kind``：只有 ``care_distracted`` 记走神
+    冷却账 —— 旧调用点（不传 kind）行为完全不变。sustain / 门槛全设 0，
+    把别的门禁从等式里去掉，只留 60 秒冷却这一件事。
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.hour = 15
+        self.policy = ProactivePolicy(
+            sustain=0.0, min_interval=0.0, max_per_hour=10,
+            user_cooldown=0.0, greeting_absent=60.0, startup_grace=0.0,
+            quiet_enabled=False, distract_sustain=0.0,
+        )
+        self.scheduler = ProactiveScheduler(
+            policy=self.policy, clock=self.clock, hour_provider=lambda: self.hour)
+
+    def _tick_distracted(self):
+        return self.scheduler.tick(config.STATE_NORMAL, distracted=True)
+
+    def test_distract_fires_then_cooldowns_then_fires_again(self):
+        first = self._tick_distracted()
+        self.assertIsNotNone(first)
+        self.assertEqual(first.kind, "care_distracted")
+        self.scheduler.note_proactive(kind=first.kind)
+
+        # 计时清零后重新走神：held 立刻满，但 60 秒重复冷却挡住
+        self.assertIsNone(self._tick_distracted())
+        self.assertEqual(self.scheduler.last_assessment.suppressed_by,
+                         GATE_DISTRACT_COOLDOWN)
+
+        self.clock.advance(61.0)                        # 冷却过了
+        again = self._tick_distracted()
+        self.assertIsNotNone(again)
+        self.assertEqual(again.kind, "care_distracted")
+
+    def test_note_proactive_without_kind_keeps_old_behavior(self):
+        """不带 kind 的调用（旧调用点 / 其他关怀）不记走神冷却账。"""
+        first = self._tick_distracted()
+        self.assertIsNotNone(first)
+        self.scheduler.note_proactive()                 # 不带 kind
+        second = self._tick_distracted()
+        self.assertIsNotNone(second)
+        self.assertEqual(second.kind, "care_distracted")
 
 
 class TestDemoScaling(unittest.TestCase):
@@ -581,7 +701,7 @@ class TestDialogueIntegration(unittest.TestCase):
 
     def test_every_care_kind_has_templates(self):
         from core.dialogue import PROACTIVE_TEMPLATES
-        for kind in set(CARE_KINDS.values()) | {"greeting"}:
+        for kind in set(CARE_KINDS.values()) | {"greeting", "idle_chat"}:
             with self.subTest(kind=kind):
                 texts = PROACTIVE_TEMPLATES.get(kind)
                 self.assertTrue(texts, f"{kind} 没有文案，策略判出来也没话说")
@@ -589,12 +709,17 @@ class TestDialogueIntegration(unittest.TestCase):
                     self.assertTrue(text.strip())
 
     def test_proactive_templates_ask_no_questions(self):
-        """写作约束 1：主动开口不用问句。
+        """写作约束 1：关怀/问候**不用问句**。
 
         老人本来情绪就低，还要组织语言回答你 —— 追问是一种索取。
+        豁免 ``idle_chat`` 和 ``care_distracted``：两者都是邀请式问候，
+        目的就是邀请老人搭话（交互规则③的示例文案本身就是问句），
+        「没人回应就不重复」由门禁 1c 兜住。
         """
         from core.dialogue import PROACTIVE_TEMPLATES
         for kind, texts in PROACTIVE_TEMPLATES.items():
+            if kind in ("idle_chat", "care_distracted"):
+                continue
             for text in texts:
                 with self.subTest(kind=kind, text=text):
                     self.assertNotIn("？", text)
@@ -813,6 +938,240 @@ class TestFocusSuppression(unittest.TestCase):
         decision = scheduler.tick(config.STATE_NORMAL, focused=False)
         self.assertTrue(decision is None or decision.kind != "greeting",
                         "问候是一次性的边沿，被挡掉就该算用掉")
+
+
+class TestUserQuiet(unittest.TestCase):
+    """用户说「不想听你说话」之后的安静门：只压主动开口，压不到应答。
+
+    应答（handle_chat）根本不经过调度器，这里只需钉住调度器这一侧：
+    安静期内 tick 一律沉默，到期自动恢复，重新搭理则立刻解除。
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.policy = ProactivePolicy(
+            sustain=20.0, min_interval=90.0, max_per_hour=4,
+            user_cooldown=60.0, greeting_absent=60.0, startup_grace=15.0,
+            quiet_hours=(22, 7), quiet_enabled=True,
+        )
+
+    def _scheduler(self):
+        return ProactiveScheduler(
+            policy=self.policy, clock=self.clock, hour_provider=lambda: 15,
+        )
+
+    def _establish(self, scheduler, state=config.STATE_SAD):
+        """推到"除了用户安静外一切放行"的位置。"""
+        self.clock.advance(self.policy.startup_grace + 1.0)
+        scheduler.tick(state)
+        self.clock.advance(self.policy.sustain + 1.0)
+
+    def test_quiet_blocks_proactive(self):
+        from core.proactive import GATE_USER_QUIET
+        scheduler = self._scheduler()
+        self._establish(scheduler)
+        scheduler.enter_quiet(1800.0)
+        self.assertTrue(scheduler.in_quiet())
+        self.assertIsNone(scheduler.tick(config.STATE_SAD))
+        self.assertEqual(scheduler.last_assessment.suppressed_by,
+                         GATE_USER_QUIET)
+
+    def test_quiet_expires_automatically(self):
+        scheduler = self._scheduler()
+        self._establish(scheduler)
+        scheduler.enter_quiet(60.0)
+        self.clock.advance(61.0)
+        self.assertFalse(scheduler.in_quiet())
+        self.assertIsNotNone(scheduler.tick(config.STATE_SAD),
+                             "安静期到了就该恢复主动开口")
+
+    def test_clear_quiet_is_immediate_and_idempotent(self):
+        scheduler = self._scheduler()
+        self._establish(scheduler)
+        scheduler.enter_quiet(1800.0)
+        scheduler.clear_quiet()
+        scheduler.clear_quiet()                      # 幂等
+        self.assertFalse(scheduler.in_quiet())
+        self.assertIsNotNone(scheduler.tick(config.STATE_SAD))
+
+    def test_enter_quiet_extends_the_window(self):
+        scheduler = self._scheduler()
+        self._establish(scheduler)
+        scheduler.enter_quiet(60.0)
+        self.clock.advance(50.0)
+        scheduler.enter_quiet(60.0)                  # 续期
+        self.clock.advance(20.0)                     # 距首次已 70s，距续期才 20s
+        self.assertTrue(scheduler.in_quiet())
+
+    def test_non_positive_seconds_is_ignored(self):
+        scheduler = self._scheduler()
+        scheduler.enter_quiet(0.0)
+        scheduler.enter_quiet(-5.0)
+        self.assertFalse(scheduler.in_quiet())
+
+
+class TestAwaitingReply(unittest.TestCase):
+    """门禁 1c：上一次主动开口还没得到老人回应 → 不再主动开口。
+
+    交互规则：主动问候抛出去，老人接话就进入一问一答；没接话就
+    **不再重复问候** —— 对着没反应的老人一遍遍问「您在呀？」
+    比不问更糟。老人一接话（note_user_reply）立即解除。
+    与安静门同一条安全原则：只压主动开口，应答不经过这里。
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.policy = ProactivePolicy(
+            sustain=20.0, min_interval=90.0, max_per_hour=4,
+            user_cooldown=60.0, greeting_absent=60.0, startup_grace=15.0,
+            quiet_hours=(22, 7), quiet_enabled=True,
+        )
+
+    def _scheduler(self):
+        return ProactiveScheduler(
+            policy=self.policy, clock=self.clock, hour_provider=lambda: 15,
+        )
+
+    def _establish(self, scheduler, state=config.STATE_SAD):
+        """推到"除了等回应外一切放行"的位置。"""
+        self.clock.advance(self.policy.startup_grace + 1.0)
+        scheduler.tick(state)
+        self.clock.advance(self.policy.sustain + 1.0)
+
+    # ---- 策略层（纯判定） ----
+
+    def test_silent_while_awaiting_reply(self):
+        ctx = open_context(awaiting_reply=True)
+        self.assertIsNone(self.policy.evaluate(ctx))
+        self.assertEqual(self.policy.assess(ctx).suppressed_by,
+                         GATE_AWAITING_REPLY)
+
+    def test_fires_when_not_awaiting_reply(self):
+        """对照组：同一份输入，把 awaiting_reply 翻过来就该开口。
+
+        没有这条，上面的测试在"策略整体坏掉、永远沉默"时也会假绿。
+        """
+        self.assertIsNotNone(self.policy.evaluate(open_context(awaiting_reply=False)))
+
+    def test_speaking_gate_wins_over_awaiting_reply(self):
+        """更硬的门禁先报自己：正在说话时报 speaking 而不是 awaiting_reply。"""
+        ctx = open_context(speaking=True, awaiting_reply=True)
+        self.assertEqual(self.policy.assess(ctx).suppressed_by, GATE_SPEAKING)
+
+    # ---- 调度器层（记账 + 解除） ----
+
+    def test_note_proactive_sets_and_reply_clears(self):
+        scheduler = self._scheduler()
+        self._establish(scheduler)
+
+        decision = scheduler.tick(config.STATE_SAD)
+        self.assertIsNotNone(decision)
+        scheduler.note_proactive()                       # 真的开口了 → 等回应
+
+        self.clock.advance(self.policy.min_interval + 1.0)
+        self.assertIsNone(scheduler.tick(config.STATE_SAD),
+                          "没人接话，min_interval 过了也不该再开口")
+        self.assertEqual(scheduler.last_assessment.suppressed_by,
+                         GATE_AWAITING_REPLY)
+
+        scheduler.note_user_reply()                      # 老人接话了
+        self.clock.advance(self.policy.min_interval + 1.0)
+        self.assertIsNotNone(scheduler.tick(config.STATE_SAD),
+                             "接话之后恢复常规节奏")
+
+    def test_note_user_reply_is_idempotent(self):
+        scheduler = self._scheduler()
+        scheduler.note_user_reply()
+        scheduler.note_user_reply()
+        self.assertFalse(scheduler._awaiting_reply)
+
+    def test_note_care_does_not_arm_the_reply_gate(self):
+        """应答里追加的关怀**不是**主动开口，不该置上「等回应」。
+
+        老人自己开的口才有追加关怀，何来"等回应"一说。
+        （test_note_care_blocks_the_immediate_proactive_repeat 已顺带
+        钉了 min_interval 那一面，这里钉 awaiting_reply 这一面。）
+        """
+        scheduler = self._scheduler()
+        self._establish(scheduler)
+        scheduler.note_care()
+        self.assertFalse(scheduler._awaiting_reply)
+
+        self.clock.advance(self.policy.min_interval + 1.0)
+        self.assertIsNotNone(scheduler.tick(config.STATE_SAD),
+                             "追加关怀之后主动开口仍按常规节奏")
+
+
+class TestIdleChat(unittest.TestCase):
+    """交互规则③：画面内有人、连续 15 秒无语音输入 → 主动问候闲聊。
+
+    「15 秒」本身由门禁 4 的 user_cooldown（现为 15 秒）与门禁 2 的
+    启动宽限期共同保证，触发器只负责在 normal 状态下接住。
+    """
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.policy = ProactivePolicy(
+            sustain=20.0, min_interval=90.0, max_per_hour=4,
+            user_cooldown=60.0, greeting_absent=60.0, startup_grace=15.0,
+            quiet_hours=(22, 7), quiet_enabled=True,
+        )
+
+    def _scheduler(self):
+        return ProactiveScheduler(
+            policy=self.policy, clock=self.clock, hour_provider=lambda: 15,
+        )
+
+    def test_idle_chat_fires_for_a_quiet_present_elder(self):
+        scheduler = self._scheduler()
+        self.clock.advance(self.policy.startup_grace + 1.0)
+        decision = scheduler.tick(config.STATE_NORMAL)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "idle_chat")
+
+    def test_idle_chat_never_fires_when_absent(self):
+        """房间没人就闭嘴 —— 闲聊只给在场的人。"""
+        scheduler = self._scheduler()
+        self.clock.advance(self.policy.startup_grace + 1.0)
+        self.assertIsNone(scheduler.tick(config.STATE_ABSENT))
+
+    def test_no_reply_stops_the_chatter(self):
+        """规则③后半句：老人没有回应，不再重复问候。"""
+        scheduler = self._scheduler()
+        self.clock.advance(self.policy.startup_grace + 1.0)
+
+        first = scheduler.tick(config.STATE_NORMAL)
+        self.assertEqual(first.kind, "idle_chat")
+        scheduler.note_proactive()
+
+        self.clock.advance(self.policy.min_interval + 1.0)
+        self.assertIsNone(scheduler.tick(config.STATE_NORMAL),
+                          "没回应就再也不主动开口")
+        self.assertEqual(scheduler.last_assessment.suppressed_by,
+                         GATE_AWAITING_REPLY)
+
+    def test_reply_reopens_the_chat(self):
+        """老人接话 → 解除等待 → 下一轮问候恢复常规节奏。"""
+        scheduler = self._scheduler()
+        self.clock.advance(self.policy.startup_grace + 1.0)
+        self.assertIsNotNone(scheduler.tick(config.STATE_NORMAL))
+        scheduler.note_proactive()
+
+        scheduler.note_user_reply()
+        self.clock.advance(self.policy.user_cooldown + 1.0)
+        self.clock.advance(self.policy.min_interval + 1.0)
+        decision = scheduler.tick(config.STATE_NORMAL)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision.kind, "idle_chat")
+
+    def test_idle_chat_yields_to_care(self):
+        """sad/tired 持续够久时说关怀，不说闲聊 —— 关怀优先级更高。"""
+        scheduler = self._scheduler()
+        self.clock.advance(self.policy.startup_grace + 1.0)
+        scheduler.tick(config.STATE_SAD)
+        self.clock.advance(self.policy.sustain + 1.0)
+        decision = scheduler.tick(config.STATE_SAD)
+        self.assertEqual(decision.kind, "care_sad")
 
 
 if __name__ == "__main__":

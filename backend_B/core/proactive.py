@@ -66,6 +66,9 @@ logger = logging.getLogger(__name__)
 #: 状态 → 关怀类型。absent 刻意**不在**表里：
 #: 房间里没人，对着空气说话是荒谬的。
 #: 「人回来了」由 greeting 走另一条边沿判定，不是「absent 时慰问」。
+#: 走神（care_distracted）也刻意**不在这张表里** —— 它不是视觉状态映射，
+#: 而是看 VAI 指数持续偏低触发（见 :meth:`ProactivePolicy.assess` 的
+#: care_distracted 分支），状态多半是 normal：人还在画面里，只是分神了。
 CARE_KINDS = {
     config.STATE_SAD: "care_sad",
     config.STATE_TIRED: "care_tired",
@@ -80,10 +83,15 @@ CAP_WINDOW_SECONDS = 3600.0
 #: 有了它，「为什么机器人不说话」才有个可查的答案：``evaluate`` 的 ``None``
 #: 把六种沉默混成了一个值。
 GATE_SPEAKING = "speaking"
+GATE_USER_QUIET = "user_quiet"
+GATE_AWAITING_REPLY = "awaiting_reply"
 GATE_STARTUP_GRACE = "startup_grace"
 GATE_QUIET_HOURS = "quiet_hours"
 GATE_USER_COOLDOWN = "user_cooldown"
 GATE_MIN_INTERVAL = "min_interval"
+#: 走神提醒自己的重复冷却（60 秒内不再重复走神提醒）。只压走神分支，
+#: 不挡 idle_chat / greeting 等其他关怀 —— 那些有各自的门禁。
+GATE_DISTRACT_COOLDOWN = "distract_cooldown"
 GATE_HOURLY_CAP = "hourly_cap"
 GATE_FOCUS = "focus"
 GATE_NO_TRIGGER = "no_trigger"
@@ -91,7 +99,7 @@ GATE_NO_TRIGGER = "no_trigger"
 
 @dataclass(frozen=True)
 class ProactiveContext:
-    """一次判定的**全部**输入。冻结 + 无默认值，逼调用方把话说全。"""
+    """一次判定的**全部**输入。冻结；``user_quiet`` 之外无默认值。"""
 
     now: float                  #: 当前墙钟（单调），与 config §9 的秒数同一量纲
     hour: int                   #: 本地墙钟小时 0~23，静默时段用
@@ -104,6 +112,26 @@ class ProactiveContext:
     speaking: bool              #: 机器正在采集或播报中
     started_at: float           #: 进程启动时刻（宽限期用）
     focused: bool               #: 老人正在专注（VAI，见 core/focus.py）
+    #: 老人正在走神（VAI 持续偏低，见 core/focus.py 的 is_distracted）。
+    #: 与 ``focused`` 互斥：高专注压住关怀，低专注触发走神提醒，
+    #: 中间灰色地带既不静默也不提醒。
+    distracted: bool = False
+    #: 走神状态已持续的秒数（从首次检测到 VAI 低于阈值算起）。
+    #: 由 :class:`ProactiveScheduler` 跟踪，策略只读。
+    distracted_held: float = 0.0
+    #: 用户明确说过"不想听你说话/别说话"，且静默时长还没到。
+    #: 有默认值是为了不动旧的调用点（含大量测试里的位置参数构造）。
+    #: 只压主动开口，**绝不压应答** —— 和静默时段同一条安全原则。
+    user_quiet: bool = False
+    #: 上一次主动开口还没得到老人回应。为真期间不再主动开口 ——
+    #: 「问候没有回应就不重复问候」的落点。老人一接话即解除
+    #: （Scheduler.note_user_reply），同样只压主动、不压应答。
+    awaiting_reply: bool = False
+    #: 上一次**走神提醒**发出的时刻；0 = 从未。走神豁免了 awaiting_reply /
+    #: min_interval 两道闸门，防复读只能靠自己的重复冷却（60 秒）——
+    #: 账本在 :class:`ProactiveScheduler`（note_proactive(kind=...) 记），
+    #: 策略只读这一个数。
+    last_distract_prompt_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -123,8 +151,8 @@ class ProactiveAssessment:
     """一次判定的**完整**结果：开口的决定 + **沉默的原因**。
 
     为什么要在 ``Optional[ProactiveDecision]`` 之外再要一个类型：
-    ``None`` 把七种沉默混成了一个值（正在说话／宽限期／深夜／用户刚说完话／
-    刚主动过／超配额／没到 sustain／**正在专注**）。联调时最高频的问题
+    ``None`` 把多种沉默混成了一个值（正在说话／用户要求安静／宽限期／
+    深夜／用户刚说完话／刚主动过／超配额／没到 sustain／正在专注）。联调时最高频的问题
     恰恰是"它为什么不说话"，而只看 ``None`` 无从回答。
 
     所以判定把原因一并交出来，:meth:`ProactivePolicy.evaluate` 保持只返回决定
@@ -157,6 +185,8 @@ class ProactivePolicy:
         quiet_hours: Tuple[int, int] = (config.PROACTIVE_QUIET_START,
                                         config.PROACTIVE_QUIET_END),
         quiet_enabled: bool = config.PROACTIVE_QUIET_ENABLED,
+        distract_sustain: float = config.PROACTIVE_DISTRACT_SUSTAIN,
+        distract_remind_gap: float = config.PROACTIVE_DISTRACT_REMIND_GAP,
     ) -> None:
         self.sustain = sustain
         self.min_interval = min_interval
@@ -166,6 +196,15 @@ class ProactivePolicy:
         self.startup_grace = startup_grace
         self.quiet_hours = quiet_hours
         self.quiet_enabled = quiet_enabled
+        #: 走神要持续多久才触发提醒（秒）。和 sad/tired 的 sustain 同量级，
+        #: 但走神是 VAI 低值的持续，不是视觉状态——所以单独配一个参数，
+        #: 不复用 ``self.sustain``：将来想独立调走神门槛时不必动 sad/tired。
+        self.distract_sustain = distract_sustain
+        #: 走神提醒的重复冷却（秒）。走神豁免了 awaiting_reply / min_interval，
+        #: 第一时间能说；但 TTS 播 4 秒 + 重新累计 3 秒 = 7-8 秒又说一遍，
+        #: 一轮走神连说 3 次（实测）像复读机，还把每小时配额一口气吃光。
+        #: 60 秒内不再重复走神提醒 —— 只压走神分支，不挡别的关怀。
+        self.distract_remind_gap = distract_remind_gap
 
     # ------------------------------------------------------------------
 
@@ -202,6 +241,24 @@ class ProactivePolicy:
         if ctx.speaking:
             return ProactiveAssessment(None, GATE_SPEAKING)
 
+        # ---- 门禁 1b：用户明确要求安静（"别说话""不想听你说话"）----
+        # 用户当面表达的意愿，比一切节奏门禁都优先。静默到什么时候由
+        # ProactiveScheduler 的 quiet_until 控制（到期自动恢复；用户
+        # 期间主动说话会立刻解除）。这里和静默时段是同一条安全原则：
+        # 只压**主动开口**，应答在别处，根本不走这个判定。
+        if ctx.user_quiet:
+            return ProactiveAssessment(None, GATE_USER_QUIET)
+
+        # ---- 门禁 1c：上一次主动开口还没得到回应 ----
+        # 交互规则：主动问候抛出去，老人接了话就进入一问一答；
+        # 老人没接话，**不再重复问候** —— 对着没反应的老人一遍遍问
+        # 「您在呀？」比不问更糟。老人一开口（note_user_reply）即解除。
+        # 同样只压主动开口，应答不经过这里。
+        # 走神提醒豁免此门禁 —— 走神是视觉事件，idle_chat 后用户没回复
+        # 但如果走神了应该立刻提醒，不应该被"等回复"挡住。
+        if ctx.awaiting_reply and ctx.distracted_held < self.distract_sustain:
+            return ProactiveAssessment(None, GATE_AWAITING_REPLY)
+
         # ---- 门禁 2：启动宽限期 ----
         # 刚开机那一小段时间，视觉状态还在 absent→normal 之间抖，
         # 而且一上来就热情打招呼会吓人一跳。
@@ -222,8 +279,24 @@ class ProactivePolicy:
             return ProactiveAssessment(None, GATE_USER_COOLDOWN)
 
         # ---- 门禁 5：两次主动之间要有间隔 ----
+        # 走神提醒（care_distracted）豁免此门禁 —— 走神是视觉事件触发的，
+        # 不是机器人主动唠叨。idle_chat 刚说完 90 秒内如果用户走神了，
+        # 应该立刻提醒，不应该被"两次间隔 90 秒"挡住。
         if ctx.last_proactive_at > 0 and ctx.now - ctx.last_proactive_at < self.min_interval:
-            return ProactiveAssessment(None, GATE_MIN_INTERVAL)
+            if ctx.distracted_held < self.distract_sustain:
+                return ProactiveAssessment(None, GATE_MIN_INTERVAL)
+
+        # ---- 门禁 5b：走神提醒自己的重复冷却 ----
+        # 只压走神分支（此时 held 必然 >= sustain，其他分支不受影响 ——
+        # 和门禁 1c 豁免走神的写法同风格，反过来用）。放这里而不是走神
+        # 分支前，是为了让它在 hourly_cap **之前**就把重复提醒否掉：
+        # 走神不占配额冷却结束时若配额也满了，日志该记 cap 而不是冷却。
+        # 注意：held < sustain 时**不进**这条 —— idle_chat 等其他关怀
+        # 照常走后面的门禁。
+        if (ctx.last_distract_prompt_at > 0
+                and ctx.now - ctx.last_distract_prompt_at < self.distract_remind_gap
+                and ctx.distracted_held >= self.distract_sustain):
+            return ProactiveAssessment(None, GATE_DISTRACT_COOLDOWN)
 
         # ---- 门禁 6：一小时内的次数上限 ----
         if len(ctx.recent_proactive) >= self.max_per_hour:
@@ -271,6 +344,42 @@ class ProactivePolicy:
                 reason=f"「{ctx.state}」已持续 {held:.0f} 秒（阈值 {self.sustain:.0f} 秒）",
             ))
 
+        # ---- 走神提醒：VAI 持续偏低 + 状态 normal（人在画面里只是分神）----
+        #
+        # 排在 sad/tired 关怀之后、idle_chat 之前 —— 走神比泛泛闲聊更具体，
+        # 但不如 sad/tired 这种视觉状态明确（走神只看 VAI 数值，状态仍是 normal）。
+        # 走神时状态多半是 normal：人还在画面里，只是分神了。所以这里**不要求**
+        # 状态是某个特定值，只看 distracted 持续时长。absent 时 is_distracted
+        # 本来就返 False（焦点不可信），不会走到这里。
+        #
+        # 用问句（『需要我陪您聊聊天吗』）—— 走神提醒要邀请老人搭话，
+        # 和 idle_chat 同属"邀请式问候"语义，豁免"主动关怀不用问句"那条约束。
+        # 注意：只看 ``distracted_held`` 不看 ``ctx.distracted`` —— VAI 高频跳动
+        # 时当前帧可能 VAI>=68（distracted=False），但宽限期内 _distracted_since
+        # 未清空，distracted_held 仍在累积。只看持续时长即可。
+        if ctx.distracted_held >= self.distract_sustain:
+            return ProactiveAssessment(ProactiveDecision(
+                kind="care_distracted",
+                state=ctx.state,
+                reason=f"走神已持续 {ctx.distracted_held:.0f} 秒"
+                      f"（阈值 {self.distract_sustain:.0f} 秒）",
+            ))
+
+        # ---- 空闲闲聊（交互规则③）：画面内有人、安静了一阵 → 主动问候 ----
+        # 「连续 15 秒没有语音输入」不用在这里再判：门禁 4（user_cooldown
+        # = 15 秒）已经保证用户至少安静了这么久；用户从未开过口时由
+        # 门禁 2（启动宽限期 15 秒）兜底。走到这里，安静条件必然成立。
+        #
+        # 只在 normal 下触发：sad/tired 归关怀管（上面，等 sustain），
+        # absent 对着空房间说话是荒谬的。「老人没回应就不重复」由
+        # 门禁 1c（awaiting_reply）保证 —— 闲聊一次没人接，就闭嘴等老人。
+        if ctx.state == config.STATE_NORMAL:
+            return ProactiveAssessment(ProactiveDecision(
+                kind="idle_chat",
+                state=ctx.state,
+                reason="画面内有人且持续安静，主动问候闲聊",
+            ))
+
         return ProactiveAssessment(None, GATE_NO_TRIGGER)
 
 
@@ -311,8 +420,28 @@ class ProactiveScheduler:
 
         self._speaking = False
 
+        #: 用户要求安静**持续到何时**（单调时钟）；0 = 当前不在安静期。
+        #: 到期自动放行；期间用户主动说一句话立刻 :meth:`clear_quiet`。
+        self._quiet_until = 0.0
+
+        #: 上一次主动问候是否还**没人接话**。置真于 :meth:`note_proactive`，
+        #: 解除于 :meth:`note_user_reply`。为真期间不再主动开口 ——
+        #  「问候没回应就不重复」的落点。
+        self._awaiting_reply = False
+
         #: 专注静默这一轮的起点。**到点放行一次之后会重开**，见 :meth:`_apply_focus_cap`。
         self._focus_since: Optional[float] = None
+        #: 走神这一轮的起点。走神是会瞬间波动的（眨眼、扭头一瞬），
+        #: 只看一拍就提醒会变成唠叨 —— 用这个时间戳算"已持续多久"，
+        #: 由 :meth:`_track_distracted` 维护。
+        self._distracted_since: Optional[float] = None
+        #: 最近一次判定为走神的时刻（带宽限期用）。
+        self._last_distracted_at: Optional[float] = None
+        #: 最近一次**走神提醒真的发出**的时刻（0 = 从未）。
+        #: 只在 :meth:`note_proactive` 收到 ``kind="care_distracted"`` 时记 ——
+        #: 走神豁免了 awaiting_reply / min_interval，防复读的 60 秒重复冷却
+        #: 记在这里，经 ``ctx.last_distract_prompt_at`` 交给策略。
+        self._last_distract_prompt_at = 0.0
         #: 最近一次判定的**完整**结果（决定 + 被哪道门挡住）。
         #: 给联调与测试用：``tick`` 只返回决定，而"为什么没说话"在
         #: :class:`ProactiveAssessment` 里。默认 ``None`` = 还没 tick 过。
@@ -324,11 +453,58 @@ class ProactiveScheduler:
         """语音层在采集/播报时置真，避免机器人抢自己的话。"""
         self._speaking = bool(speaking)
 
-    def note_proactive(self, now: Optional[float] = None) -> None:
-        """记一次「真的开口了」。调用方在**成功发出**之后调用。"""
+    def enter_quiet(self, seconds: float) -> None:
+        """用户说"不想听你说话"后调用：接下来 ``seconds`` 秒内不主动开口。
+
+        只影响 :meth:`tick` 的主动开口判定；**应答路径不经过这里**，
+        所以用户在安静期内主动说话照样回答。重复调用会续期。
+        """
+        if seconds and seconds > 0:
+            self._quiet_until = self._clock() + seconds
+
+    def clear_quiet(self) -> None:
+        """用户重新主动说话时立即解除安静期（幂等）。"""
+        self._quiet_until = 0.0
+
+    def in_quiet(self, now: Optional[float] = None) -> bool:
+        """当前是否处于用户要求的安静期（供接线层与测试查询）。"""
+        moment = self._clock() if now is None else now
+        return moment < self._quiet_until
+
+    def note_proactive(self, now: Optional[float] = None,
+                       kind: Optional[str] = None) -> None:
+        """记一次「真的开口了」。调用方在**成功发出**之后调用。
+
+        ``kind``：这次主动关怀的类型（``decision.kind``）。只有
+        ``"care_distracted"`` 会额外记走神提醒的重复冷却账 ——
+        走神豁免了 awaiting_reply / min_interval，60 秒内不再重复说。
+
+        同时把「等回应」标记置真：主动问候是抛给老人的一个问题，
+        老人接了话（:meth:`note_user_reply`）才解除。没接话就一直沉默 ——
+        交互规则：问候没有回应，**不再重复问候**，避免变成对着发呆的
+        老人一遍遍问「您在呀？」的复读机。
+        """
         moment = self._clock() if now is None else now
         self._last_proactive_at = moment
         self._proactive_times.append(moment)
+        self._awaiting_reply = True
+        if kind == "care_distracted":
+            self._last_distract_prompt_at = moment
+        # 机器人一开口，走神计时清零重新累计：开口本身可能把用户从
+        # 走神中拉回来；不清零的话 distracted_held 仍 >= distract_sustain，
+        # 下一个 tick（0.25s 后）又会触发一次走神提醒，10 秒内连说 3 次。
+        # 走神豁免了 awaiting_reply 和 min_interval 两道闸门，所以必须有
+        # 自己的"已说过"记账 —— 这里就是那个记账。
+        self._distracted_since = None
+        self._last_distracted_at = None
+
+    def note_user_reply(self) -> None:
+        """老人接话了（任何真实语音/文字输入）。解除「等回应」标记。
+
+        下一次主动问候恢复按常规节奏判定（user_cooldown 等）。
+        与 :meth:`note_care` 一样**只改标记**，不动时间账本。
+        """
+        self._awaiting_reply = False
 
     def note_care(self, now: Optional[float] = None) -> None:
         """记一次「应答里追加了一句关怀」。
@@ -353,17 +529,29 @@ class ProactiveScheduler:
     def last_proactive_at(self) -> float:
         return self._last_proactive_at
 
+    @property
+    def distracted_held(self) -> float:
+        """走神已持续多久（秒，只读视图）。0 = 当前不在走神。
+
+        给展示层（``main._publish_vai`` 下发走神状态给 C）用：读的是
+        :meth:`tick` 记的账（:meth:`_track_distracted`），**不是**重新判定 ——
+        展示层不参与判决，与 ``_publish_vai`` 的只读旁路约束同一条理由。
+        """
+        return self._distracted_held(self._clock())
+
     def tick(
         self,
         state: str,
         last_user_at: float = 0.0,
         now: Optional[float] = None,
         focused: bool = False,
+        distracted: bool = False,
     ) -> Optional[ProactiveDecision]:
         """一个节拍。返回决定开口的内容，或 None。
 
         ``focused`` 由调用方按 ``core/focus.py`` 的 :func:`should_stay_silent`
         算好传进来（可信：有指数 + 状态有效 + 数据够新；且指数 ≥ 门槛）。
+        ``distracted`` 同源，由 :func:`is_distracted` 算好（VAI 持续偏低）。
         调度器**不自己去问** FocusTracker —— 那会让本模块依赖视觉层，
         也会让"多新算新 / 多高算专注"出现两个答案。
 
@@ -375,6 +563,7 @@ class ProactiveScheduler:
         moment = self._clock() if now is None else now
 
         self._track_state(state, moment)
+        self._track_distracted(distracted, moment)
         self._prune(moment)
 
         ctx = ProactiveContext(
@@ -389,6 +578,11 @@ class ProactiveScheduler:
             speaking=self._speaking,
             started_at=self._started_at,
             focused=self._apply_focus_cap(focused, moment),
+            distracted=distracted,
+            distracted_held=self._distracted_held(moment),
+            user_quiet=moment < self._quiet_until,
+            awaiting_reply=self._awaiting_reply,
+            last_distract_prompt_at=self._last_distract_prompt_at,
         )
 
         assessment = self.policy.assess(ctx)
@@ -437,6 +631,33 @@ class ProactiveScheduler:
         return False
 
     # ------------------------------------------------------------------
+
+    def _track_distracted(self, distracted: bool, now: float) -> None:
+        """跟踪走神的进入/退出，维护 ``_distracted_since`` 时间戳。
+
+        带宽限期的边沿检测：进入走神时记下起点，退出时**不立刻清空**，
+        而是等 2 秒宽限期过后才清空。这样 VAI 瞬时弹回（一拍 70+、
+        下一拍又降到 68 以下）不会打断走神计时 —— 实测 VAI 在 60-72
+        之间高频跳动，纯边沿检测会让 ``_distracted_since`` 从没累计到
+        持续门槛。和 :meth:`_track_state` 跟踪 absent 是同一种"边沿 vs 状态"分工。
+        """
+        if distracted:
+            if self._distracted_since is None:
+                self._distracted_since = now
+            self._last_distracted_at = now
+            return
+        # 不在走神：看宽限期过没过
+        if self._distracted_since is not None:
+            grace = getattr(self.policy, "distract_grace", 2.0)
+            last = getattr(self, "_last_distracted_at", None)
+            if last is None or (now - last) > grace:
+                self._distracted_since = None
+
+    def _distracted_held(self, now: float) -> float:
+        """走神已持续多久（秒）。当前不在走神返回 0。"""
+        if self._distracted_since is None:
+            return 0.0
+        return max(0.0, now - self._distracted_since)
 
     def _track_state(self, state: str, now: float) -> None:
         """跟踪状态变化，并识别「离开很久后回来」这个边沿。"""

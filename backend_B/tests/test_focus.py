@@ -261,12 +261,12 @@ class TestWarmupAndDuration(unittest.TestCase):
         self.assertFalse(snapshot.calibration["ready"])
 
     def test_default_config_keeps_the_reference_numbers(self):
-        """默认值必须还是 5s / 30 样本 / 10s，否则演示出来的就不再是 VAI。"""
+        """默认值：5s 校准 / 30 样本 / 5s 有效观察（原 10s，联调降到 5s）。"""
         config = FocusConfig()
         self.assertEqual(config.calibration_seconds, 5.0)
         self.assertEqual(config.calibration_min_samples, 30)
-        self.assertEqual(config.min_valid_seconds_for_index, 10.0)
-        self.assertEqual(config.ema_time_constant_seconds, 1.5)
+        self.assertEqual(config.min_valid_seconds_for_index, 5.0)
+        self.assertEqual(config.ema_time_constant_seconds, 0.8)
         self.assertEqual(DEFAULT_WEIGHTS, {"gaze": 0.55, "pose": 0.25, "eye_open": 0.20})
 
 
@@ -445,7 +445,7 @@ class TestSessionContinuity(unittest.TestCase):
             snapshot = feed(tracker, ts)
         self.assertTrue(snapshot.usable)
 
-        snapshot = feed(tracker, 6.0)   # 间隔 3.0s > 2.0s
+        snapshot = feed(tracker, 9.0)   # 间隔 6.0s > 5.0s（state_reset_gap）
         self.assertEqual(snapshot.status, FocusStatus.INSUFFICIENT_OBSERVATION)
         self.assertIsNone(snapshot.index)
         self.assertEqual(snapshot.index_status, IDX_UNAVAILABLE)
@@ -459,7 +459,9 @@ class TestSessionContinuity(unittest.TestCase):
         self.assertTrue(snapshot.usable)
         resets_before = tracker.resets
 
-        for ts in (3.2, 3.4, 3.6, 3.8, 4.0, 4.2, 4.4, 4.6, 4.8, 5.0, 5.2):
+        for ts in (3.2, 3.4, 3.6, 3.8, 4.0, 4.2, 4.4, 4.6, 4.8, 5.0,
+                   5.2, 5.4, 5.6, 5.8, 6.0, 6.2, 6.4, 6.6, 6.8, 7.0,
+                   7.2, 7.4, 7.6, 7.8, 8.0, 8.2, 8.4, 8.6, 8.8):
             snapshot = feed(tracker, ts, has_face=False)
         self.assertEqual(snapshot.status, FocusStatus.NO_FACE)
         self.assertGreater(tracker.resets, resets_before)

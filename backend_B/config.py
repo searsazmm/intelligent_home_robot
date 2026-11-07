@@ -86,7 +86,7 @@ VISION_STALE_SECONDS = _env_float("B_VISION_STALE", 5.0)
 # --------------------------------------------------------------------------
 
 # 眼睑开合度 EAR：睁眼一般 0.25~0.35，闭眼 < 0.20，因人而异，联调时可调
-EAR_TIRED_THRESHOLD = _env_float("B_EAR_TIRED", 0.20)
+EAR_TIRED_THRESHOLD = _env_float("B_EAR_TIRED", 0.22)
 # EAR 连续低于阈值多久判定为疲劳（秒）
 EAR_TIRED_DURATION = _env_float("B_EAR_TIRED_SEC", 3.0)
 # 眨眼频率（次/分钟）高于该值也判为疲劳（正常 15~20 次/分）
@@ -197,10 +197,10 @@ PROACTIVE_MIN_INTERVAL = _env_float("B_PROACTIVE_MIN_INTERVAL", 90.0)
 PROACTIVE_MAX_PER_HOUR = _env_int("B_PROACTIVE_MAX_PER_HOUR", 4)
 
 # 用户说过话之后的静默期（墙钟秒）。
-# **任何**真实用户输入（麦克风 / 8002 / --stdin）之后都闭嘴这么久 ——
-# 用户正要往下说的时候被机器人抢话，是最糟的失败模式。
-# 顺带保证了用 --stdin 打字自测时机器人不会插嘴。
-PROACTIVE_USER_COOLDOWN = _env_float("B_PROACTIVE_USER_COOLDOWN", 60.0)
+# 交互规则：画面里有人、且连续 **15 秒**没有用户语音输入 → 主动问候。
+# 所以这里就是 15 秒 —— 用户正要往下说的时候被机器人抢话，仍由
+# PROACTIVE_MIN_INTERVAL 与下面的「问候未获回应不再重复」一起兜住。
+PROACTIVE_USER_COOLDOWN = _env_float("B_PROACTIVE_USER_COOLDOWN", 15.0)
 
 # 人离开超过这么久再回来，才值得说一句「您回来啦」（墙钟秒）。
 # 短于这个时长的消失多半只是扭头/走开拿个东西，不值得开口。
@@ -210,16 +210,16 @@ PROACTIVE_GREETING_ABSENT = _env_float("B_PROACTIVE_GREETING_ABSENT", 60.0)
 # 而且启动初期视觉状态本来就在 absent→normal 之间抖。
 PROACTIVE_STARTUP_GRACE = _env_float("B_PROACTIVE_STARTUP_GRACE", 15.0)
 
-# 回答完之后**追加**关怀语的最小间隔（墙钟秒）。
+# 回答完之后**追加**关怀语的最小间隔（墙钟秒），**按类型分别冷却**。
 #
 # 和 PROACTIVE_MIN_INTERVAL 分开是刻意的：那个管「机器人主动开口」，
 # 这个管「应答里附带一句」。两件事的合理密度不一样 —— 主动开口抢的是
 # 话头（越少越好），应答里的追加只是把摄像头看到的事说一声。
 #
-# 180 秒 ≈ 连续聊天时每三分钟提一次。调小 = 更唠叨。
-# 第一次对话必然追加（计数器从 0 起算）。
-# 见 core/dialogue.py 的 DialogueEngine.respond()。
-CARE_FOLLOWUP_INTERVAL = _env_float("B_CARE_FOLLOWUP_INTERVAL", 180.0)
+# 交互规则：同类型关怀 30 秒内不重复 —— 刚说过「困了就歇会儿」，
+# 30 秒内不会再提休息；但情绪低落的关怀是另一类，不受影响。
+# 每类的记账见 core/dialogue.py 的 _last_care_at / _care_due。
+CARE_FOLLOWUP_INTERVAL = _env_float("B_CARE_FOLLOWUP_INTERVAL", 30.0)
 
 # 静默时段：这段时间内**不主动开口**。
 # ⚠️ 注意只静默"主动"，**绝不静默应答** —— 凌晨两点的「我不舒服」必须回答。
@@ -296,11 +296,43 @@ FOCUS_STALE_SECONDS = _env_float("B_FOCUS_STALE", 2.0)
 # 指数就一直是有效值，扭头看窗外也能出 43 分。那等于"摄像头一通电就
 # 再也不主动关心"，与本功能想做的事正好相反。
 #
-# 70 的依据（权重 0.55 视线 / 0.25 头姿 / 0.20 睁眼）：
+# 78 的依据（权重 0.55 视线 / 0.25 头姿 / 0.20 睁眼）：
 #   正对镜头 + 头正 + 睁眼 ≈ 92；视线明显离开正前方（对正 0.1）时
 #   光这一项就掉 0.55*0.9 ≈ 50 分，再叠头姿偏移会落到 40 上下。
-#   70 落在两者中间，且要求三路证据里至少两路在线。
-FOCUS_SILENT_MIN_INDEX = _env_float("B_FOCUS_MIN_INDEX", 70.0)
+#   实测正常坐姿波动带 68.7-78.8，取 78 —— 只有真坐正看镜头才够得着，
+#   稍一分神就退出静默。原 70 是为了给走神门槛（当时 68）留互斥空间；
+#   走神门槛提到 75 后，静默门槛必须跟着抬到 75 之上，否则 VAI 落在
+#   70-75 时"既专注又走神"：门禁 7 会在走神分支之前把它挡掉，
+#   走神提醒实际只对 VAI<70 生效，敏感度白提。
+FOCUS_SILENT_MIN_INDEX = _env_float("B_FOCUS_MIN_INDEX", 78.0)
+
+# --------------------------------------------------------------------------
+# 走神提醒（与上面的「专注静默」对称的**反向**判定）
+#
+# should_stay_silent 判"VAI 够高 → 压住主动关怀"；
+# 走神判定判"VAI 够低 → 触发一句『您看起来有点走神了』"。
+# 两者都用同一条新鲜度+模态齐全前置（focus_is_live + SILENCE_REQUIRED_MODALITIES），
+# 只是阈值方向相反。
+#
+# 注意 45 的来历：focus.py 的实测注释说"扭头看窗外、低头发呆场景 VAI≈43.1"。
+# 把门槛放在 75：实测 VAI 正常波动在 68.7-78.8，原 68 只能抓到少数走神
+# （用户反馈敏感度不够），75 覆盖正常波动带的大半，稍一低头/眼神飘就
+# 低于门槛。配合持续 3 秒过滤瞬时波动（原 5 秒偏钝，一并调快）。
+# --------------------------------------------------------------------------
+FOCUS_DISTRACT_MAX_INDEX = _env_float("B_FOCUS_DISTRACT_MAX_INDEX", 75.0)
+
+# 走神要持续多久才触发提醒（墙钟秒）。
+# 走神会瞬间波动（眨眼、扭头看一眼窗外），但用户要求"察觉到立刻说"，
+# 3 秒比眨眼长很多（不会误触），又能很快提醒（5 → 3，用户要求更敏感）。
+PROACTIVE_DISTRACT_SUSTAIN = _env_float("B_PROACTIVE_DISTRACT_SUSTAIN", 3.0)
+
+# 走神提醒的**重复**提醒最小间隔（墙钟秒）。
+# 走神豁免了 awaiting_reply / min_interval 两道闸门（第一次要能立马说），
+# 但开口把人拉回来要时间：TTS 播 4 秒 + 重新累计 3 秒，实测 7-8 秒又说一遍，
+# 一轮走神连说 3 次像复读机，还把每小时 4 次的配额一口气吃光 —— 之后
+# 一小时所有主动关怀（含下一次走神）全部被 hourly_cap 挡住。
+# 60 秒 = 一轮走神最多提醒 1 次，提醒配额留给别的关怀场景。
+PROACTIVE_DISTRACT_REMIND_GAP = _env_float("B_PROACTIVE_DISTRACT_REMIND_GAP", 60.0)
 
 # 连续专注静默的总时长上限（墙钟秒）。到点放行一次主动关怀，并打日志。
 #
@@ -378,6 +410,23 @@ AUDIO_OUTPUT_NAME = _env_str("B_AUDIO_OUT", "")
 #     SeedTTS  → speech_rate=-10（见 speech_rate_from_speed）
 #     edge-tts → rate="-10%"（见 EdgeTtsSynthesizer）
 VOICE_SPEED = _env_float("B_VOICE_SPEED", 0.9)
+
+# ---- 「听不清」响应配置（老人说"听不清""大声点""再说一遍"时）----
+#
+# 三项响应机制：
+#   ① 音量提升（默认 +20%，不超过系统最大音量）
+#   ② 语速降低（默认 -30%，在 VOICE_SPEED 基础上再减）
+#   ③ 复述确认（"您是说[上一句机器人说的话]对吗？"）
+#
+# 全部支持环境变量覆盖，方便现场调试。设 0 = 关掉该项。
+CLARIFY_VOLUME_BOOST = _env_float("B_CLARIFY_VOLUME", 0.20)
+#: 语速降低比例（0.30 = 在当前语速基础上再降 30%）。
+#: 与 VOICE_SPEED 叠加：默认 0.9 × (1 - 0.30) = 0.63 倍速。
+CLARIFY_SPEED_CUT = _env_float("B_CLARIFY_SPEED_CUT", 0.0)
+#: 是否复述确认（False 时只放慢放大、不复述）。
+CLARIFY_CONFIRM = _env_bool("B_CLARIFY_CONFIRM", True)
+#: clarify 模式持续多少句后自动恢复正常音量语速（避免老人忘了它还开着）。
+CLARIFY_HOLD_TURNS = _env_int("B_CLARIFY_HOLD", 3)
 
 # 音色：留空 = 自动挑第一个中文音色（按 Culture 前缀匹配，**不硬编码名字**）。
 # 豆包引擎下这个值就是 voice_type，见下面的 B_DOUBAO_VOICE。
@@ -507,3 +556,41 @@ LLM_CONTEXT_TURNS = _env_int("B_LLM_CONTEXT_TURNS", 4)
 # 代价是一次真实请求（约 1 秒），换来的是"启动日志里就能看出 Key 有没有效"。
 # 详见 core/llm.py 的 probe_chatter。离线开发时用 --no-llm-probe 跳过。
 LLM_PROBE = _env_bool("B_LLM_PROBE", True)
+
+# --------------------------------------------------------------------------
+# 14. 用户要求安静（「不想听你说话」）
+#
+# 只静默**机器人主动开口**（proactive），绝不静默应答 —— 老人随后主动
+# 问任何一句话都会正常回答，并自动解除安静。默认 30 分钟，到点也自动恢复。
+# --------------------------------------------------------------------------
+
+USER_QUIET_SECONDS = _env_float("B_USER_QUIET_SECONDS", 1800.0)
+
+# --------------------------------------------------------------------------
+# 15. 紧急求助：家人通知
+#
+# 「叫家里人来」不能只是一句话 —— 命中紧急求助 / 危机语句时，B 端向
+# 配置的 webhook 发一条 JSON 通知（可填企业微信/钉钉/飞书机器人或自建
+# 服务的 URL，分号分隔多个），同时往 8002 广播 emergency 报文让 C 端弹窗。
+# 没配 URL 时后两个动作照做，通知这一步只打日志（不报错、不打断回复）。
+# --------------------------------------------------------------------------
+
+FAMILY_ALERT_URLS = tuple(
+    url.strip() for url in _env_str("B_FAMILY_ALERT_URL", "").split(";")
+    if url.strip()
+)
+FAMILY_ALERT_TIMEOUT = _env_float("B_FAMILY_ALERT_TIMEOUT", 5.0)
+# 同一进程内两次真正发出通知的最小间隔，防止一句话被反复识别成多次求救。
+FAMILY_ALERT_COOLDOWN = _env_float("B_FAMILY_ALERT_COOLDOWN", 300.0)
+
+# --------------------------------------------------------------------------
+# 16. 天气查询（open-meteo，免 key、标准库 urllib 直连）
+#
+# 默认坐标 = 青城山。查询失败 / 超时一律落回"我看不到天气"的诚实模板，
+# 绝不编天气。换城市改这两个坐标即可。
+# --------------------------------------------------------------------------
+
+WEATHER_CITY = _env_str("B_WEATHER_CITY", "青城山")
+WEATHER_LAT = _env_float("B_WEATHER_LAT", 30.8997)
+WEATHER_LON = _env_float("B_WEATHER_LON", 103.5639)
+WEATHER_TIMEOUT = _env_float("B_WEATHER_TIMEOUT", 4.0)

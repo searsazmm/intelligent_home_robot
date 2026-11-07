@@ -55,7 +55,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from core import focus as focus_lib
 from core import proactive as proactive_lib
+from core import weather as weather_lib
 from core.dialogue import DialogueEngine, DialogueReply, static_replies
+from core.emergency import FamilyAlerter
 from core.history_store import CsvHistoryStore, TurnRecord
 from core.llm import build_chatter
 from core.typed_messages import MSG_RPPG
@@ -115,8 +117,15 @@ class BackendB:
         self.dialogue = DialogueEngine(
             history=self.history, llm=self.chatter,
             care_interval=self._care_interval(),
+            # 惰性取体征读数（vitals 意图现答 + 大模型提示词注入）。
+            # dialogue 建在下面的 vitals_store 之前，lambda 被调用时
+            # __init__ 早已跑完 —— 和 chat_server 的写法同一个道理。
+            vitals_provider=lambda: self.vitals_store.snapshot(),
+            # 天气实时查询同理惰性注入；网络失败返回 None，对话落回
+            # "看不到天气"的诚实兜底（core/weather.py）。
+            weather_provider=lambda: weather_lib.fetch_report(
+                config.WEATHER_LAT, config.WEATHER_LON, config.WEATHER_TIMEOUT),
         )
-
 
         # ---- 心率 / 呼吸（rppg）----
         # 接住 A 每秒一条的 rppg 报文（此前收下计数后**丢弃**，没有消费者）。
@@ -186,6 +195,12 @@ class BackendB:
         self._threads = []
         self._last_published_state: Optional[str] = None
 
+        # ---- 「听不清」clarify 模式 ----
+        # 老人说"听不清""大声点""再说一遍"时，提音量 + 放慢语速 + 复述确认。
+        # 触发后保持 CLARIFY_HOLD_TURNS 轮，到期自动恢复正常音量语速 ——
+        # 避免老人忘了它还开着，后续每句话都又大又慢。
+        self._clarify_hold: int = 0
+
         # ---- 主动关怀 ----
         # 挂在 _state_publish_loop 的 0.2 秒节拍上，不新增线程（见该方法的注释）。
         self.proactive = proactive_lib.ProactiveScheduler(
@@ -194,6 +209,15 @@ class BackendB:
                 config.FOCUS_DEMO_SUPPRESS_MAX_SECONDS if args.demo
                 else config.FOCUS_SUPPRESS_MAX_SECONDS
             ),
+        )
+
+        # ---- 紧急求助：家人通知 ----
+        # webhook 地址在 config §15（B_FAMILY_ALERT_URL，分号分隔多个）。
+        # 没配也能跑：alerter 只打一条 WARNING，C 端弹窗与语音安慰照常。
+        self.family_alerter = FamilyAlerter(
+            config.FAMILY_ALERT_URLS,
+            timeout=config.FAMILY_ALERT_TIMEOUT,
+            cooldown=config.FAMILY_ALERT_COOLDOWN,
         )
 
         # ---- 语音 ----
@@ -307,8 +331,10 @@ class BackendB:
         self.chat_server.broadcast_proactive(
             text, state=vision.state, reason=decision.reason, kind=decision.kind)
 
-        # 记账必须在**真的发出**之后，否则一次被门禁挡下的判定也会占用间隔配额
-        self.proactive.note_proactive()
+        # 记账必须在**真的发出**之后，否则一次被门禁挡下的判定也会占用间隔配额。
+        # kind 传给调度器：care_distracted 要记自己的 60 秒重复冷却账
+        # （走神豁免了 awaiting_reply / min_interval，防复读只能靠它）。
+        self.proactive.note_proactive(kind=decision.kind)
 
         self._say(text)
 
@@ -350,6 +376,12 @@ class BackendB:
             # 接上大模型之后每条回复都是模型现编的、必然唯一，缓存它们
             # 只会让缓存目录一直涨而命中率始终是 0。
             cache_allow=static_replies(),
+            # 「听不清」时惰性构造一个更慢的合成器实例。各引擎的 speed 在
+            # 构造时固定（SAPI 写进 PowerShell 脚本、豆包/edge 是 __init__
+            # 参数），运行时改不掉，所以需要第二个实例。只在第一次触发
+            # clarify 时才建，正常运行不付这个代价。
+            # speed 降到 base_speed × (1 − CLARIFY_SPEED_CUT)，如 0.9 × 0.7 = 0.63。
+            clarify_factory=self._build_clarify_factory(synthesizer),
         )
 
         if cache is not None and config.VOICE_PREWARM:
@@ -462,6 +494,32 @@ class BackendB:
             sample_rate=rate,
             blocksize_ms=config.VOICE_BLOCK_MS,
         )
+
+    def _build_clarify_factory(self, primary_synthesizer):
+        """构造「听不清」慢速合成器的工厂函数。
+
+        返回一个**无参 callable**，Speaker 在第一次进入 clarify 模式时
+        调用它。用工厂而不是直接建，是因为 clarify 只在老人说"听不清"
+        时才需要，正常运行不该付第二个引擎实例的启动代价。
+
+        语速 = 主合成器的 speed × (1 − clarify_speed_cut)。主合成器没
+        ``speed`` 属性（如 NullSynthesizer）时返回 None——Speaker 拿到
+        None 就只提音量、不放慢。
+        """
+        speed_cut = getattr(self.args, "clarify_speed_cut", config.CLARIFY_SPEED_CUT)
+        if speed_cut <= 0.0:
+            return None
+        base_speed = getattr(primary_synthesizer, "speed", None)
+        if base_speed is None or base_speed <= 0:
+            return None
+
+        clarify_speed = max(0.1, float(base_speed) * (1.0 - speed_cut))
+
+        def factory():
+            return build_synthesizer(
+                self.args.tts, speed=clarify_speed, voice=self.args.tts_voice)
+
+        return factory
 
     def _on_speaking_change(self, speaking: bool) -> None:
         """播报开始/结束的回调。由 Speaker 在**它自己的线程**里调用。
@@ -663,10 +721,25 @@ class BackendB:
 
         关掉 ``--no-vai-display`` 或没开 ``--focus-silence``（tracker 为 None）时
         整个方法直接返回 —— 后者是配置问题，不刷日志。
+
+        走神状态（``distracted``）下发的是 :class:`ProactiveScheduler` 里
+        ``tick`` 记的账（``distracted_held >= distract_sustain`` 的确认结果）
+        —— 读账不判定，和上面四条约束同一条只读旁路理由。这里**不调**
+        :meth:`_is_distracted`：那是当前帧判定（内部走 ``focus_is_live``），
+        展示层每 0.2 秒调它就破坏了约束 2。节拍上 ``_publish_vai`` 在
+        ``_tick_proactive`` 之前，拿到的是上一拍的账，0.2 秒的滞后可接受。
+        未开主动关怀时传 ``None``，报文不带该字段（C 端不显示走神）。
         """
         if not self.args.vai_display or self.focus_tracker is None:
             return
-        self.chat_server.publish_vai(self.focus_tracker.snapshot())
+        distracted = None
+        if self.args.proactive:
+            distracted = (
+                self.proactive.distracted_held >= self.proactive.policy.distract_sustain
+            )
+        self.chat_server.publish_vai(
+            self.focus_tracker.snapshot(), distracted=distracted
+        )
 
     def _publish_vitals(self) -> None:
         """把最新体征读数推给 C（**只供界面显示**）。一条都没收到过就不发。
@@ -736,6 +809,27 @@ class BackendB:
             logger.info("退出静默模式，恢复主动关怀（%s）", why)
         return silent
 
+    def _is_distracted(self) -> bool:
+        """老人是不是**走神了**（VAI 持续偏低，可触发走神提醒）。
+
+        与 :meth:`_focus_liveness` 对称的反向判定：同一个 tracker、同一套
+        可信+模态齐全前置，只是阈值方向相反 —— VAI **低于**
+        :data:`config.FOCUS_DISTRACT_MAX_INDEX` 才算走神。详见
+        :func:`focus.is_distracted` 的文档。
+
+        没有边沿日志 —— 走神判定本身有 ``distract_sustain`` 持续时长门槛，
+        瞬间波动不会触发提醒，不像专注静默那样一进就压住所有关怀，
+        所以不需要在进出时各打一条。
+        """
+        if self.focus_tracker is None:
+            return False
+        distracted, _why = focus_lib.is_distracted(
+            self.focus_tracker,
+            stale_seconds=config.FOCUS_STALE_SECONDS,
+            max_index=config.FOCUS_DISTRACT_MAX_INDEX,
+        )
+        return distracted
+
     def _tick_proactive(self, state: str) -> None:
         """一个主动关怀节拍。判定放在 core/proactive.py，这里只负责执行。
 
@@ -757,6 +851,7 @@ class BackendB:
             state,
             last_user_at=self.dialogue.last_user_text_at,
             focused=self._focus_liveness(),
+            distracted=self._is_distracted(),
         )
         if decision is not None:
             self._fire_proactive(decision)
@@ -785,15 +880,28 @@ class BackendB:
     def handle_chat(self, text: str, *, allow_ack: bool = True) -> DialogueReply:
         """收到用户一句话：生成回复 → 写历史 → 更新状态覆盖 → 返回。
 
-        ``allow_ack=False`` 关掉**应声词**。8002 那条路要关 —— 它是模块 C
-        与测试脚本走的文本通道，按约定**不朗读**，而应声词是要出声的：
-        测试脚本跑一轮，机房里就会响起机器人的"嗯，我听着呢"。
+        ``allow_ack=False`` 关掉**应声词**。当前 :data:`core.dialogue.ACK_REPLIES`
+        为空（用户要求回答问题前不加应答式前置短语），应声通路整体静默，
+        这个开关暂时无副作用，仅为"恢复应声词文案"的那一天保留。
         """
         vision = self.evaluator.get_state()
         reply = self.dialogue.respond(
             text, vision,
             on_thinking=self._on_thinking if allow_ack else None,
         )
+
+        # ---- 「听不清」clarify 处理路径 ----
+        # dialogue.py 已识别出 clarify 意图（"听不清""大声点""再说一遍"），
+        # 并给了一句兜底回复。这里按 config 的三项响应机制覆盖：
+        #   ① 提音量 +15~20%（config.CLARIFY_VOLUME_BOOST）
+        #   ② 放慢语速 -25~30%（config.CLARIFY_SPEED_CUT，由 Speaker 的
+        #     慢速合成器实例实现）
+        #   ③ 复述确认：用"您是说[上一句]对吗？"句式（config.CLARIFY_CONFIRM）
+        #
+        # 触发后保持 CLARIFY_HOLD_TURNS 轮，避免老人刚听清就又变回小声快语速。
+        # 复述的内容取自 history 里上一句机器人说的话 —— 如果没有（启动后
+        # 第一句就"听不清"），保留 dialogue 的兜底安抚句，不复述。
+        self._handle_clarify(reply)
 
         logger.info("用户：%s", text)
         logger.info("机器人：%s%s  [%s]", reply.reply,
@@ -838,6 +946,27 @@ class BackendB:
         if reply.follow_up:
             self.proactive.note_care()
 
+        # ---- 紧急求助：嘴上安慰之外，必须有真实动作 ----
+        # 家人 webhook 通知 + C 端醒目弹窗（_raise_emergency 内各自吞异常，
+        # 任何一条不通都不能连累回复本身）。
+        if reply.emergency:
+            self._raise_emergency(reply.emergency_kind, text)
+
+        # ---- 用户安静门 ----
+        # "不想听你说话" → 主动开口静默一段时间；用户这句本身**照常应答**。
+        # 其他任何真实输入都视为重新搭理机器人，立刻解除安静期 ——
+        # 安静只管"机器人别主动找话"，绝不能变成"叫它也不答应"。
+        if reply.intent == "quiet":
+            self.proactive.enter_quiet(config.USER_QUIET_SECONDS)
+            logger.info("用户要求安静：%.0f 秒内不主动开口（应答不受影响）",
+                        config.USER_QUIET_SECONDS)
+        else:
+            self.proactive.clear_quiet()
+            # 用户接话了 → 解除「上次主动问候还没人回应」的标记。
+            # 老人回应过一次，之后的主动问候恢复常规节奏；
+            # 没回应期间由 awaiting_reply 门禁压住，不重复问候。
+            self.proactive.note_user_reply()
+
         # 对话结论比纯视觉更准，限时覆盖一下，避免前端状态和对话内容对不上。
         # 走 _publish_state 而不是直接 publish：C 端要**立刻**看到这次覆盖，
         # 否则它会带着旧表情再挂 15 秒（见 _publish_state 的说明）。
@@ -856,6 +985,124 @@ class BackendB:
         """
         return self.handle_chat(text, allow_ack=False)
 
+    # ------------------------------------------------------------------
+    # 「听不清」clarify 处理
+    # ------------------------------------------------------------------
+
+    def _handle_clarify(self, reply: DialogueReply) -> None:
+        """在 ``handle_chat`` 里对 clarify 意图做三项响应。
+
+        ① 提音量 ② 放慢语速 ③ 复述确认。前两项委托 Speaker，
+        第三项在这里构造确认句并**覆盖 reply.reply**。
+
+        不复述的情况（保留 dialogue 的兜底句）：
+          - ``--no-clarify-confirm`` 或 ``B_CLARIFY_CONFIRM=0``（用户关掉了复述）
+          - 没有 history（--no-history）
+          - history 里还没有机器人说过的话（启动后第一句就"听不清"）
+
+        复述内容取自 ``history.last_robot_replies(1)``。要避免连续两次
+        "听不清"导致复述套娃（"您是说您是说X对吗？对吗？"）——
+        取最近 3 条里**第一条不以"您是说"开头的**，跳过已有的确认句。
+        """
+        volume_boost = getattr(self.args, "clarify_volume", config.CLARIFY_VOLUME_BOOST)
+        speed_cut = getattr(self.args, "clarify_speed_cut", config.CLARIFY_SPEED_CUT)
+        hold_turns = getattr(self.args, "clarify_hold", config.CLARIFY_HOLD_TURNS)
+        do_confirm = not getattr(self.args, "no_clarify_confirm", not config.CLARIFY_CONFIRM)
+
+        if reply.intent != "clarify":
+            # 非 clarify：如果之前在 clarify 模式里，递减保持计数。
+            if self._clarify_hold > 0:
+                self._clarify_hold -= 1
+                if self._clarify_hold <= 0:
+                    self._clarify_hold = 0
+                    if self.speaker is not None:
+                        self.speaker.clear_clarify()
+                        logger.info("clarify 模式已恢复（保持 %d 轮到期）", hold_turns)
+            return
+
+        # ---- 命中 clarify：进入/续期 clarify 模式 ----
+        if self.speaker is not None:
+            self.speaker.set_clarify(
+                volume_boost=volume_boost,
+                speed_cut=speed_cut,
+            )
+        self._clarify_hold = hold_turns
+        logger.info("clarify 模式已触发：音量 +%.0f%%，语速 -%.0f%%，保持 %d 轮",
+                    volume_boost * 100, speed_cut * 100, hold_turns)
+
+        # ③ 复述确认
+        if not do_confirm:
+            return
+        if self.history is None:
+            return
+
+        try:
+            recent = self.history.last_robot_replies(3)
+        except Exception:
+            logger.debug("读取历史回复失败，clarify 用兜底句", exc_info=True)
+            return
+
+        if not recent:
+            return
+
+        # 跳过已有的确认句（以"您是说"开头），取第一条真实回复，
+        # 避免连续"听不清"导致确认句套娃。
+        target = ""
+        for candidate in recent:
+            if not candidate.startswith("您是说"):
+                target = candidate
+                break
+        if not target:
+            target = recent[0]       # 全是确认句就取最近一条，总比不复述好
+
+        # 控制复述长度：太长的回复整段复述反而听不清。截到第一个句号或
+        # 30 字以内。clarify 的目的是"确认听到了什么"，不是"重播一遍"。
+        snippet = self._truncate_for_confirm(target)
+        if not snippet:
+            return
+
+        # 覆盖 reply.reply —— dialogue.py 的兜底句被这里替换掉。
+        # 用 dataclass 的字段赋值（DialogueReply 不是 frozen）。
+        old_reply = reply.reply
+        reply.reply = f"您是说{snippet}对吗？"
+        logger.info("clarify 复述确认：%s → %s", old_reply[:30], reply.reply[:50])
+
+    @staticmethod
+    def _truncate_for_confirm(text: str, max_chars: int = 30) -> str:
+        """把一句回复截到适合复述确认的长度。
+
+        太长的回复整段念"您是说……对吗"会让老人更听不清。
+        截到第一个句号/问号/感叹号，或 max_chars 字以内。
+        """
+        text = (text or "").strip()
+        if not text:
+            return ""
+        for i, ch in enumerate(text):
+            if ch in "。！？!?":
+                return text[:i + 1]
+        return text[:max_chars]
+
+    def _raise_emergency(self, kind: str, text: str) -> None:
+        """紧急求助的**真实动作**（与嘴上安慰并行，两条都不能缺）：
+
+        1. 家人 webhook 通知（:class:`core.emergency.FamilyAlerter`，
+           内部自带冷却去重 + 后台线程 + 失败只记日志）；
+        2. 往 8002 推 ``emergency`` 报文，C 端弹醒目警示。
+
+        两条通道各自 try 住：webhook 没配 / C 端没连接都不能影响另一条，
+        更不能影响已经在念的那句「您别慌，我这就通知家里人」。
+        """
+        logger.warning("【紧急求助】触发通知：kind=%s text=%r",
+                       kind, (text or "")[:80])
+        try:
+            self.family_alerter.alert(kind, text)
+        except Exception:
+            logger.exception("触发家人通知失败（不影响对话与 C 端弹窗）")
+        try:
+            self.chat_server.broadcast_emergency(kind, text)
+        except Exception:
+            logger.exception("推送紧急弹窗失败（不影响对话与家人通知）")
+
     def _on_thinking(self, ack: str) -> None:
         """应声词的出口，交给 :meth:`Speaker.say_async` 播。
 
@@ -865,7 +1112,13 @@ class BackendB:
 
         没有语音层（未装配 / ``--no-play``）时直接跳过：应声词的全部意义
         就是出声，没有声音就没有意义，没必要让对话路径多绕一圈。
+
+        :data:`core.dialogue.ACK_REPLIES` 为空时 ``ack`` 是空串 —— 应声功能
+        已被用户要求关闭，直接返回（say_async 对空文本也是 no-op，这里只是
+        少走一层）。
         """
+        if not ack or not ack.strip():
+            return
         if self.speaker is not None:
             self.speaker.say_async(ack)
 
@@ -1109,6 +1362,28 @@ def build_parser() -> argparse.ArgumentParser:
                              "听不见时先查端点音量，再考虑用这个显式指定真音箱")
     parser.add_argument("--list-audio", action="store_true",
                         help="打印音频设备列表后退出（排错第一步）")
+
+    # ---- 「听不清」clarify 响应 ----
+    parser.add_argument("--clarify-volume", type=float,
+                        default=config.CLARIFY_VOLUME_BOOST,
+                        metavar="增量",
+                        help=f"老人说'听不清'时音量提升增量"
+                             f"（默认 {config.CLARIFY_VOLUME_BOOST:g}，即 +{config.CLARIFY_VOLUME_BOOST * 100:.0f}%%）。"
+                             f"设 0 = 不提音量")
+    parser.add_argument("--clarify-speed-cut", type=float,
+                        default=config.CLARIFY_SPEED_CUT,
+                        metavar="降幅",
+                        help=f"老人说'听不清'时语速降低比例"
+                             f"（默认 {config.CLARIFY_SPEED_CUT:g}，即 -{config.CLARIFY_SPEED_CUT * 100:.0f}%%）。"
+                             f"设 0 = 不放慢（只提音量）")
+    parser.add_argument("--no-clarify-confirm", action="store_true",
+                        default=not config.CLARIFY_CONFIRM,
+                        help="关闭'您是说[复述]对吗？'的复述确认（默认开）")
+    parser.add_argument("--clarify-hold", type=int,
+                        default=config.CLARIFY_HOLD_TURNS,
+                        metavar="轮数",
+                        help=f"clarify 模式触发后保持多少轮后自动恢复正常音量语速"
+                             f"（默认 {config.CLARIFY_HOLD_TURNS} 轮）")
 
     return parser
 

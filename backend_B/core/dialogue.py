@@ -54,13 +54,17 @@ import logging
 import random
 import time
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
 
 import config
 from core import proactive as proactive_lib
+from core.emergency import EMERGENCY_PATTERNS
 from core.llm import build_system_prompt, sanitize_reply
 from core.text_emotion import TextEmotion, TextEmotionAnalyzer
+from core.vitals import VITALS_NOTE
 from core.vision_state import VisionState
+from core.weather import describe_activity, describe_weather
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +74,9 @@ TEXT_PRESENCE_WINDOW = 30.0
 
 # 回答内容与用户状态无关的意图：不管用户是累还是低落，问"你是谁"都得答身份。
 # 这些意图的模板优先级要高于"状态通用兜底"。
-STATE_INDEPENDENT_INTENTS = frozenset({"identity", "time", "question"})
+STATE_INDEPENDENT_INTENTS = frozenset(
+    {"identity", "time", "weather", "reminder", "festival", "vitals",
+     "emergency", "quiet", "clarify", "question", "story"})
 
 # 这些意图的回答**必须**是"接住老人说的那件事"，状态只决定要不要追加关怀，
 # 不能顶替内容。
@@ -106,6 +112,22 @@ MIN_TOPIC_LENGTH = 3
 #                     让它等 5 秒正是预合成缓存要消灭的那个失败模式。
 #                     而且这几组模板是全仓最强的（(tired, greeting)、(sad, greeting)
 #                     都手工调过），状态条件化在这里最有用。零收益、真回退。
+#   weather/reminder/festival
+#                     这三类需要**实时信息或可靠知识**，模型都不具备 ——
+#                     问"今天天气怎么样"它编一个晴天，求"提醒我吃药"它应
+#                     "好嘞我记下了"，问"重阳节是多久"它按训练数据里的
+#                     旧年份报个错日子。假信息比不回答危险得多（老人按编的
+#                     天气穿衣、等不会来的提醒、照错的日期盼儿女回家），
+#                     所以这三类永远走确定性回答：INTENT_FALLBACK 诚实模板
+#                     和 FESTIVALS 日期表。
+#   vitals            心率呼吸的数值在 VitalsStore 里，是传感器现读数，
+#                     模型看不见 —— 让它答"我心率多少"只会编一个数。
+#                     vitals_reply 按读数现算（含偏高偏低与建议）；
+#                     chat/question 里顺带提到体征时，数值经 _vitals_hint
+#                     注进提示词，而不是靠模型自己"记得"。
+#   emergency/quiet   紧急求助必须是确定、短促、像行动的回复（且不能把
+#                     "救命"发给第三方）；"别说话"的回答也只能是"好"。
+#                     两者都是逐句写死的，没有自由发挥空间。
 #
 # 另有两条**前置检查**不在这个集合里，见 llm_eligible：危机语句、身体不适。
 LLM_ELIGIBLE_INTENTS = frozenset({"chat", "venting", "question"})
@@ -134,10 +156,59 @@ STANDALONE_KEYWORDS = frozenset({"早"})
 #: 「早」「早！」「早，」都算打招呼；「早，我吃过了」不算（后面还有话）。
 _TRAILING_NOISE = " \t\r\n，。！？、；：,.!?;:~～…"
 
+#: 关键词被子串"借走"时的反例表：命中某个关键词、但整句还包含反例时，
+#: 这个关键词**不**作数，继续往后面的意图匹配。
+#:
+#: 和 STANDALONE_KEYWORDS 是同一类问题的另一种形态 —— 高频字词做子串
+#: 匹配时撞上语义相反的句子：
+#:   * 「我心疼孙子」命中 discomfort 的"疼" → 要回"要不要叫家里人"，
+#:     可人家是在说疼爱孙子；
+#:   * 「你好久没来」命中 greeting 的"你好" → 要回热情招呼，可人家
+#:     是在嗔怪。
+#: 反例只否决**它挂着的那个关键词**：「头疼，儿子还不心疼我」里
+#: "头疼"照样命中 discomfort，不会被"心疼"误伤。
+KEYWORD_BLOCKERS: Dict[str, tuple] = {
+    "疼": ("心疼", "疼爱"),
+    "你好": ("你好久",),
+    # 「救命稻草这个词怎么来的」是在问成语，不是求救 —— 反例借走"救命"，
+    # 让这句落回闲聊，而不是给家人发一条紧急通知。
+    "救命": ("救命稻草",),
+}
+
 INTENT_RULES: List[tuple] = [
+    # 紧急求助优先级最高，排在一切意图（包括危机情绪兜底）的关键词匹配之前。
+    # 词表刻意只收**完整说法**（"救命""叫救护车""喘不上气"），不收裸
+    # "报警""不行了" —— 误报一次家人通知，这个功能就再也没人信。
+    # 自我伤害类（"不想活了"）走 text_emotion.crisis，不在这里。
+    ("emergency", EMERGENCY_PATTERNS),
+    # 「听不清 / 大声点 / 再说一遍」：老人没听清机器人说的话。
+    # 排在 quiet 之后、其他意图之前 —— 提高音量、放慢语速、复述确认
+    # 是体验问题不是安全问题，但优先级要高于闲聊，否则一句"听不清"
+    # 被当成 question 走大模型就答非所问了。
+    ("clarify", (
+        "听不清", "听不见", "没听清", "没听见", "听不到",
+        "大声点", "大点声", "说大声", "声音小", "声音太小", "太小声",
+        "再说一遍", "再说一次", "重复一遍", "再说一遍", "重说",
+        "慢一点", "说慢点", "说太快", "太快了", "慢慢说",
+    )),
+    # 「不想听你说话 / 别说话 / 闭嘴」：必须排在问候之前且精确命中，
+    # 回答只能是"好，我不说话了"，并由 main 联动关掉主动开口。
+    ("quiet", (
+        "不想听你说话", "不想听你说", "不想听见你", "不想听到你",
+        "别说话", "不要说话", "你别说话", "你不要说话",
+        "别出声", "别吭声", "闭嘴", "你闭嘴",
+        "安静点", "安静一下", "安静一会", "别吵了", "别吵我",
+        "我想安静", "想一个人待", "不想搭理",
+    )),
+    # farewell 的关键词必须是**精确的告别说法**（见 KEYWORD_BLOCKERS 的教训）：
+    # 早先这里只有"出门""走了""我睡"三个短词，做子串匹配时
+    # 「我今天出门散步了」被当成告别、回一句"行，您去忙吧"把人打发了 ——
+    # 分享日常恰恰是陪伴机器人最该接住的话。「老伴走了」更糟：那是悼念。
+    # 所以这里全部收窄成主语+动作的完整说法。
     ("farewell", (
-        "再见", "拜拜", "走了", "我睡", "睡觉了", "不聊了", "下次聊", "先这样",
-        "回头聊", "晚安", "挂了", "出门",
+        "再见", "拜拜", "我走了", "我得走了", "先走了", "这就走",
+        "我睡了", "要睡了", "睡觉了", "不聊了", "下次聊", "先这样",
+        "回头聊", "晚安", "挂了", "出门了", "要出门",
     )),
     ("greeting", (
         "你好", "您好", "早上好", "中午好", "下午好", "晚上好", "在吗", "在不在",
@@ -147,7 +218,50 @@ INTENT_RULES: List[tuple] = [
     ("identity", (
         "你是谁", "你叫什么", "你的名字", "你是什么", "介绍一下你", "你会什么", "你能做什么",
     )),
-    ("time", ("几点", "现在时间", "几号", "今天星期", "今天几", "什么时候")),
+    # 心率 / 呼吸问句走**确定性**回答（vitals_reply 现算）：数值就在
+    # VitalsStore 里，模型看不见它，问"我心率多少"让它答只会编一个数。
+    # ⚠️ 关键词全部是"指标 + 问法"的组合，没有裸"心率""心跳" ——
+    # 「我心慌」「我心跳得厉害」是身体不适陈述，要留给 discomfort
+    # （回关怀），报数答非所问。
+    ("vitals", (
+        "心率多少", "心率是多少", "心率怎么样", "心率正常", "心率快不快",
+        "心率慢不慢", "我的心率", "我心率",
+        "心跳多少", "心跳是多少", "心跳怎么样", "心跳正常", "心跳快不快",
+        "我的心跳", "我心跳正常", "我的脉搏", "脉搏多少", "脉搏正常",
+        "呼吸多少", "呼吸是多少", "呼吸怎么样", "呼吸正常", "呼吸快不快",
+        "我的呼吸", "我呼吸",
+    )),
+    # 没有"什么时候" —— 「我什么时候能见到孙子」是盼头不是问钟点，
+    # 落到 question（可走大模型）才答得上；问时间有"几点"就够了。
+    # ⚠️ festival 必须排在 time **之前**："过年是几号"带"几号"，
+    # 排后面会被 time 抢走、回一句"看墙上那个钟"。
+    ("festival", (
+        "节日", "过节", "什么节", "春节", "过年", "元旦", "元宵", "清明",
+        "五一", "劳动节", "儿童节", "端午", "中秋", "国庆", "重阳", "除夕", "七夕",
+    )),
+    ("time", ("几点", "现在时间", "几号", "今天星期", "今天几",
+              "星期几", "周几", "礼拜几", "多少号", "日期", "成都时间")),
+    # 天气问句走**确定性**回答：联网查 open-meteo（core/weather.py），
+    # 查到就实时报温度阴晴，查不到就老实说"看不到"（INTENT_FALLBACK）。
+    # 模型没有实时数据，让它答"今天天气怎么样"只会编一个晴天出来。
+    # 注意关键词全是**问句式**说法 —— 「今天天气不错」是评价，仍是闲聊，
+    # 别把老人随口一句感慨也拦成天气播报。
+    ("weather", (
+        "天气怎么样", "天气如何", "天气好不好", "天气预报", "什么天气",
+        "啥天气", "多少度", "几度", "下雨", "下雪",
+        "降温", "刮风", "冷不冷", "热不热", "适合出门",
+    )),
+    # 讲故事：怀旧小故事从**预写池**里挑，不走大模型。两个理由：
+    # ①内容可控 —— 模型现编的长故事未必贴合老人的年代记忆，错一个年代
+    #   细节就出戏；②长度可控 —— 长文本流式合成中途断流的风险随字数涨。
+    # 词表收全说法、不收裸"故事" —— 「你别讲那些故事」是拒绝不是点播。
+    ("story", (
+        "讲故事", "讲个故事", "讲一个故事", "说个故事", "来个故事",
+        "听故事", "想听故事", "故事吧", "说书",
+    )),
+    # 提醒/叫醒同样走**诚实**回答：机器人没有闹钟和日历，应一句
+    # "好嘞我记下了"是假承诺 —— 老人到点等不到提醒，误的是吃药这种正事。
+    ("reminder", ("提醒我", "叫我起床", "叫醒我", "到点叫我", "记得叫我")),
     ("discomfort", (
         "不舒服", "头疼", "头晕", "胃疼", "肚子疼", "腰疼", "腿疼", "感冒", "发烧",
         "咳嗽", "没胃口", "吃不下", "血压", "心慌", "疼",
@@ -155,6 +269,11 @@ INTENT_RULES: List[tuple] = [
     ("praise", ("真好", "真棒", "你真", "喜欢你", "谢谢你陪", "有你真好")),
     ("question", ("怎么", "为什么", "是什么", "能不能", "可以吗", "有没有", "多少", "吗？", "呢？")),
 ]
+
+#: 命中 weather 意图、又带这些词的问句是**活动类**（"适合出门散步吗"），
+#: 走 describe_activity 简短建议而不是天气播报全文 —— 否则问天气和问散步
+#: 播的是一字不差的同一段全文（同一时段天气数据相同，播报是确定性的）。
+WEATHER_ACTIVITY_HINTS = ("散步", "遛弯", "锻炼", "运动", "走一走", "出门玩", "爬山")
 
 
 @dataclass
@@ -169,6 +288,11 @@ class DialogueReply:
     emotion_detail: str = "neutral"             # 细粒度情绪
     discomfort: bool = False                    # 是否提到身体不适
     reason: str = ""                            # 为什么这么回（调试用）
+    #: 是否命中紧急状况（身体紧急关键词 或 危机情绪）。main.py 据此触发
+    #: **真实动作**：家人 webhook 通知 + C 端紧急弹窗，而不只是嘴上说。
+    emergency: bool = False
+    #: "emergency"（救命/救护车）或 "crisis"（自我伤害语句）；空串=非紧急。
+    emergency_kind: str = ""
     #: 答完之后**追加**的关怀语；空串 = 这一轮不追加。
     #:
     #: 和 reply 是**两句话**，不是一句话的两半：朗读时要分两次合成
@@ -232,7 +356,8 @@ class DialogueEngine:
     """
 
     def __init__(self, history=None, rng: Optional[random.Random] = None,
-                 llm=None, care_interval: Optional[float] = None) -> None:
+                 llm=None, care_interval: Optional[float] = None,
+                 vitals_provider=None, weather_provider=None) -> None:
         """``llm`` 是大模型客户端（见 :mod:`core.llm`），**默认 None**。
 
         ⚠️ 默认值必须是 None，不能是"从 config 建一个"：
@@ -246,19 +371,36 @@ class DialogueEngine:
         改写 —— 和 :class:`core.proactive.ProactivePolicy` 接收阈值的方式
         一致。固定 180 秒在演示里等于"看不出来"，在 5 倍速回放下等于
         每 900「数据秒」一次。测试也靠它注入一个很小的值。
+
+        ``vitals_provider`` 是取**最新体征读数**的可调用（返回
+        ``RppgReading`` 或 None），供 vitals 意图现答与提示词注入用。
+        和 ``ChatServer`` 的 ``vitals_provider`` 同一个做法：**惰性
+        provider 而不是传 store 对象** —— main.py 里 DialogueEngine
+        建在 vitals_store 之前，lambda 在被调用时才解引用，此时
+        ``__init__`` 早已跑完。
         """
         self.analyzer = TextEmotionAnalyzer()
         self.history = history                  # CsvHistoryStore 或 None
         self._rng = rng or random.Random()
         self._last_user_text_at: float = 0.0
         self._llm = llm                         # Chatter 或 None
+        self._vitals_provider = vitals_provider  # Callable[[], RppgReading|None] 或 None
+        #: 天气查询：返回 core.weather.parse_report 形态的 dict，或 None
+        #: （查不到 / 未注入）。None 时 weather 意图走诚实兜底模板，
+        #: **绝不在测试构造里联网** —— 和 vitals_provider 同一个理由。
+        self._weather_provider = weather_provider
         #: 上一次说过的应声词，用来避开连着两次说同一句。
         self._last_ack: str = ""
+        #: 上一次讲过的故事本体（STORY_POOL 里的原文）。story_reply 拿它
+        #: 排除同一条 —— 连着点播两次不重样。
+        self._last_story: str = ""
         #: 追加关怀的最小间隔（秒）与**上次真的追加**的时刻。
         #: 用 time.monotonic()，和 _last_user_text_at 同一个时钟。
         self._care_interval: float = (
             config.CARE_FOLLOWUP_INTERVAL if care_interval is None else care_interval)
-        self._last_care_at: float = 0.0
+        #: 每类关怀最近一次真正追加的时刻（kind → 单调时钟秒）。
+        #: 冷却按**类型**分开记账：care_tired 刚说过，care_sad 不受影响。
+        self._last_care_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # 主入口
@@ -312,6 +454,22 @@ class DialogueEngine:
         # 生成出来，所以拿得到。
         care_kind = self._care_kind(vision, emotion)
 
+        # 紧急 / 危机 / 用户要求安静这三轮**不追加任何关怀语**：
+        # 求救之后接一句"您看着有点累"是错乱；"不想听你说话"之后接
+        # 主动关怀更是直接抗命。
+        if intent == "emergency" or intent == "quiet" or emotion.crisis:
+            care_kind = None
+
+        # 紧急标志：身体紧急关键词 或 危机情绪。main.py 拿到它才好触发
+        # 真实通知动作（webhook + C 弹窗），而不是让"我帮您叫家里人"
+        # 沦为一句空话。
+        if intent == "emergency":
+            emergency_kind = "emergency"
+        elif emotion.crisis:
+            emergency_kind = "crisis"
+        else:
+            emergency_kind = ""
+
         # 要追加关怀的这一轮，**内容部分一律按"状态正常"来生成**。
         #
         # 理由：追加的那句关怀说什么，是本地 PROACTIVE_TEMPLATES 定的。
@@ -342,9 +500,9 @@ class DialogueEngine:
         follow_up = ""
         if care_kind is not None:
             follow_up = self.proactive_reply(care_kind, vision)
-            # 只有**真的追加了**才记账。否则一次被别的分支挡下的判定
-            # 也会白扣掉这 180 秒的额度。
-            self._last_care_at = time.monotonic()
+            # 只有**真的追加了**才记账，且按**类型**记（同类型 30 秒内
+            # 不重复；别的类型不受影响）。
+            self._last_care_at[care_kind] = time.monotonic()
 
         return DialogueReply(
             reply=reply_text,
@@ -354,6 +512,8 @@ class DialogueEngine:
             emotion_score=emotion.score,
             emotion_detail=emotion.emotion,
             discomfort=emotion.discomfort,
+            emergency=bool(emergency_kind),
+            emergency_kind=emergency_kind,
             follow_up=follow_up,
             care_kind=care_kind or "",
             reason=f"视觉={vision.state}({vision.reason}) 文本={emotion.label}/{emotion.emotion} "
@@ -386,7 +546,7 @@ class DialogueEngine:
             return None                 # normal / absent：不需要关心，不打扰
         if self._text_already_says(kind, emotion):
             return None
-        if not self._care_due():
+        if not self._care_due(kind):
             return None
         return kind
 
@@ -403,9 +563,15 @@ class DialogueEngine:
             return emotion.is_negative()
         return False
 
-    def _care_due(self) -> bool:
-        """距上次真的追加是否已经够久。见 :attr:`_care_interval`。"""
-        return (time.monotonic() - self._last_care_at) >= self._care_interval
+    def _care_due(self, kind: str) -> bool:
+        """这一**类**关怀距上次真的追加是否已经够久。
+
+        冷却是**按类型记账**的（交互规则：同类型关怀 30 秒内不重复）：
+        刚说过「困了就歇会儿」（care_tired），30 秒后老人情绪低落，
+        「不开心就说说话」照样能追加 —— 是两类关怀，互不占额度。
+        """
+        return (time.monotonic() - self._last_care_at.get(kind, 0.0)
+                >= self._care_interval)
 
     @staticmethod
     def _care_note(kind: Optional[str], vision: VisionState,
@@ -463,12 +629,16 @@ class DialogueEngine:
     def thinking_reply(self) -> str:
         """挑一句应声词。见 :data:`ACK_REPLIES`。
 
+        :data:`ACK_REPLIES` 为空（用户要求去掉应答式前置短语）时返回空串 ——
+        调用链上的播报层对空文本是 no-op，整条应声通路随之静默。
+
         避开上一次说过的那句：连着两轮"嗯，我想想"，听起来就是卡带。
         这里**不用** ``_recent_replies()``（那个读历史 CSV），因为应声词
         刻意**不写进历史** —— 历史是"机器人说过什么"的记录，而应声词
-        不是回答，把它记进去会污染给大模型的上下文，让它以为上轮自己
-        只说了句"嗯，我听着呢"。
+        不是回答，把它记进去会污染给大模型的上下文。
         """
+        if not ACK_REPLIES:
+            return ""
         fresh = [text for text in ACK_REPLIES if text != self._last_ack]
         chosen = self._rng.choice(fresh or list(ACK_REPLIES))
         self._last_ack = chosen
@@ -483,16 +653,26 @@ class DialogueEngine:
 
         单字关键词（见 :data:`STANDALONE_KEYWORDS`）要求整句就是它本身 ——
         否则「走得早」这种会把一句悼念识别成打招呼。
+        被反例"借走"的关键词（见 :data:`KEYWORD_BLOCKERS`）不作数 ——
+        「我心疼孙子」不是身体不适。
         """
         stripped = (text or "").strip()
         for intent, keywords in INTENT_RULES:
+            # 「你真烦」带着 praise 的"你真"，但情绪是负面的 —— 那不是夸奖。
+            # 跳过这条规则继续匹配，多半会落到 venting（负面情绪兜底），
+            # 回倾诉模板比回"谢谢您夸奖"像话得多。
+            if intent == "praise" and emotion.label == "negative":
+                continue
             for keyword in keywords:
+                if keyword not in text:
+                    continue
+                if any(block in text for block in KEYWORD_BLOCKERS.get(keyword, ())):
+                    continue  # 关键词被反例"借走"了，见 KEYWORD_BLOCKERS
                 if keyword in STANDALONE_KEYWORDS:
                     if stripped.rstrip(_TRAILING_NOISE) == keyword:
                         return intent
                     continue
-                if keyword in text:
-                    return intent
+                return intent
 
         # 没命中关键词时，用情绪兜底：明显消极的话语按倾诉处理
         if emotion.label == "negative":
@@ -572,7 +752,7 @@ class DialogueEngine:
         既能对"疲劳 + 告别"说"那您早点休息"，又保证内容意图**永远**答的是
         内容而不是状态套话。
         """
-        candidates = self._candidates(state, intent, emotion)
+        candidates = self._candidates(state, intent, emotion, user_text)
 
         # 用户只说了"嗯"这种语气词时，别回显，换成不带 {topic} 的模板
         if len(self._topic_snippet(user_text)) < MIN_TOPIC_LENGTH:
@@ -588,7 +768,8 @@ class DialogueEngine:
         template = self._rng.choice(pool)
         return self._fill(template, user_text, vision, emotion)
 
-    def _candidates(self, state: str, intent: str, emotion: TextEmotion) -> List[str]:
+    def _candidates(self, state: str, intent: str, emotion: TextEmotion,
+                    user_text: str = "") -> List[str]:
         """收集候选回复。
 
         **顺序就是这套对话的第一条设计约束：状态不能顶替内容。**
@@ -598,8 +779,15 @@ class DialogueEngine:
         先歇一会吧」—— 状态句顶替了内容回答。现在它降到最后，只在连
         ``(normal, 意图)`` 的内容兜底都没有时才用。
         """
-        # 危机信号优先级最高，排在身体不适**之前** —— 这两件事会同时出现
+        # 身体紧急求助排在最前（"救命""叫救护车"）：回复要确定、简短、
+        # 像一个正在进行的动作 —— main.py 同时触发**真实**的家人通知。
+        # 它排在危机情绪之前：「救命，我不想活了」该先通知家人到场。
+        if intent == "emergency":
+            return list(EMERGENCY_REPLIES)
+
+        # 危机信号其次，排在身体不适**之前** —— 这两件事会同时出现
         # （"我疼得不想活了"），而这时候该回应的是"不想活"，不是"疼"。
+        # 同样会触发家人通知（kind=crisis）。
         #
         # 这几句刻意写成**确定性的**、逐句审过的：
         #   - 不说教、不追问原因（追问会让对方更孤立）
@@ -610,8 +798,13 @@ class DialogueEngine:
         if emotion.crisis:
             return list(CRISIS_REPLIES)
 
-        # 身体不适其次 —— 健康问题不能只回一句"多喝热水"式的套话
-        if emotion.discomfort or intent == "discomfort":
+        # 身体不适其次 —— 健康问题不能只回一句"多喝热水"式的套话。
+        #
+        # 但 reminder 让路："提醒我吃药"里也有健康词（文本情绪层把"吃药"
+        # 记成 discomfort），可那是在**求办事**，不是在说自己不舒服 ——
+        # 被 discomfort 抢走会答成"坐下缓缓喝口温水"。真在说身体的事
+        # （"下雨天我腿疼"这类）仍归身体关怀，不受 weather 意图影响。
+        if intent == "discomfort" or (emotion.discomfort and intent != "reminder"):
             return list(DISCOMFORT_REPLIES)
 
         # (状态, 意图) 精确匹配 —— 状态敏感的社交应答在这里，是**对的**
@@ -625,7 +818,57 @@ class DialogueEngine:
         # 有些意图的回答内容和用户状态无关，问"你是谁"时不管他累不累，
         # 都得答出"我是谁"。这类必须排在状态兜底之前，否则会被通用套话盖掉。
         if intent in STATE_INDEPENDENT_INTENTS and intent in INTENT_FALLBACK:
+            # 节日是唯一要**现算**的：日期来自 FESTIVALS 表加"今天"，
+            # 答案每天都不一样，不能靠预写的模板池随机挑。
+            if intent == "festival":
+                answer = festival_reply(user_text) if user_text else ""
+                return [answer] if answer else list(INTENT_FALLBACK["festival"])
+            # 体征是唯一"数值来自传感器"的现算：读数在 VitalsStore 里
+            # 每秒都在变，模板池里写死任何数都会过期。没测出 / provider
+            # 挂了都按"没数"处理，落回 INTENT_FALLBACK 的引导模板 ——
+            # 宁可说"还没测到"，也不能报一个 0 或旧数。
+            if intent == "vitals":
+                answer = vitals_reply(user_text, self._current_vitals()) if user_text else ""
+                return [answer] if answer else list(INTENT_FALLBACK["vitals"])
+            # 时间/日期/星期：本机时钟现算（成都时间 UTC+8），答案每秒都
+            # 不一样，同样不能靠模板池。
+            if intent == "time":
+                answer = time_reply(user_text) if user_text else ""
+                return [answer] if answer else list(INTENT_FALLBACK["time"])
+            # 天气：实时联网查（weather_provider 注入）。查不到返回空串，
+            # 落回"我看不到天气"的诚实模板 —— 绝不编温度。
+            # 活动类问句（"适合出门散步吗"）走简短建议 describe_activity：
+            # 否则问天气和问散步播的是一字不差的同一段全文 —— 同一时段
+            # 天气数据相同，describe_weather 输出是确定性的。
+            if intent == "weather":
+                answer = ""
+                if user_text:
+                    report = self._current_weather()
+                    if any(hint in user_text for hint in WEATHER_ACTIVITY_HINTS):
+                        answer = describe_activity(report, city=config.WEATHER_CITY)
+                    else:
+                        answer = describe_weather(report, city=config.WEATHER_CITY)
+                return [answer] if answer else list(INTENT_FALLBACK["weather"])
+            # 讲故事：承接句 + 从预写池挑的怀旧小故事（不与上次重复），
+            # 结尾的互动钩子把话头递回给老人。
+            if intent == "story":
+                answer = ""
+                if user_text:
+                    story = story_reply(self._rng, self._last_story)
+                    self._last_story = story
+                    answer = self._rng.choice(_STORY_OPENINGS) + story
+                return [answer] if answer else list(INTENT_FALLBACK["story"])
             return list(INTENT_FALLBACK[intent])
+
+        # 话题池排在通用闲聊之前：老人聊到具体的事（散步、孙子、吃饭…），
+        # 就接那件事，而不是「嗯嗯，然后呢」地应付。只对 chat 生效 ——
+        # venting 走情绪模板，社交应答走 (状态, 意图) 精确匹配。
+        # 大模型可用时 chat 根本到不了这里（先走 _online_reply），
+        # 所以这池子是**没有大模型时的兜底质量**。
+        if intent == "chat" and user_text:
+            topic_pool = topic_replies_for(user_text)
+            if topic_pool:
+                return topic_pool
 
         # 内容兜底：答内容就用"状态正常"那套话。
         #
@@ -643,8 +886,9 @@ class DialogueEngine:
 
         # 状态通用。
         #
-        # ⚠️ 当前位置**不可达** —— recognize_intent 只会返回十个意图，
-        # 上面各条已经把它们全覆盖了（identity/time/question 走意图无关那条，
+        # ⚠️ 当前位置**不可达** —— recognize_intent 只会返回 INTENT_RULES 里
+        # 那些意图加上 venting/chat 兜底，上面各条已经把它们全覆盖了
+        #（identity/time/weather/reminder/festival/question 走意图无关那条，
         # discomfort 在身体不适那条就返回了）。留着是**安全网**：将来加了新
         # 意图、又忘了配 (normal, 新意图) 模板时，退到这里至少还说人话，
         # 而不是掉到下面的通用兜底。看到这里"没人走"不要删。
@@ -747,8 +991,11 @@ class DialogueEngine:
             return None
 
         # 到这一步才垫应声词：上面那些分支（危机 / 不适 / 语气词）都是本地
-        # 查表出结果，没有等待，垫一句纯属废话；而模板回复里塞一句"嗯，我想想"
-        # 反而会让老人以为机器人没听懂。
+        # 查表出结果，没有等待，垫一句纯属废话。
+        #
+        # ACK_REPLIES 为空时 thinking_reply() 返回 ""，on_thinking("") 会
+        # 在播报层被丢掉（say_async 对空文本是 no-op）—— 应声通路整体静默，
+        # 用户听到的就是：说完 → 直接回答。
         #
         # 位置也很讲究 —— 必须在 complete 之前、且不能 await 它。
         if on_thinking is not None:
@@ -780,12 +1027,56 @@ class DialogueEngine:
 
         return text
 
+    def _current_vitals(self):
+        """取最新体征读数。provider 抛异常按"没测出"处理 —— 取数失败
+        绝不能连累回复生成（和 _history_messages 读历史失败同一条忍法）。"""
+        if self._vitals_provider is None:
+            return None
+        try:
+            return self._vitals_provider()
+        except Exception:
+            logger.debug("体征读数取用失败，按没测出处理", exc_info=True)
+            return None
+
+    def _current_weather(self):
+        """查一次实时天气。provider 缺失 / 网络失败都返回 None ——
+        调用方落回"看不到天气"的诚实模板，绝不连累回复生成。"""
+        if self._weather_provider is None:
+            return None
+        try:
+            return self._weather_provider()
+        except Exception:
+            logger.debug("天气查询失败，按看不到处理", exc_info=True)
+            return None
+
+    def _vitals_hint(self) -> str:
+        """把最新体征读数翻成给大模型看的一行提示；没测出返回空串。
+
+        没数时**刻意给空**而不是"未测出"—— 提示词里出现"未测出"只会
+        诱导模型拿它当话题。数值后面带上静息常见范围，模型才有依据说
+        偏高偏低；免责声明跟在数值后面一起给（红线：免责必须随数值走）。
+        """
+        reading = self._current_vitals()
+        if reading is None:
+            return ""
+        hr = getattr(reading, "hr", None)
+        rr = getattr(reading, "rr", None)
+        if hr is None and rr is None:
+            return ""
+        pieces: List[str] = []
+        if hr is not None:
+            pieces.append("心率约每分钟%d次（静息常见60到100）" % int(hr))
+        if rr is not None:
+            pieces.append("呼吸约每分钟%g次（静息常见12到20）" % float(rr))
+        return "%s；%s" % ("、".join(pieces), VITALS_NOTE)
+
     def _llm_messages(self, state: str, intent: str,
                       emotion: TextEmotion, user_text: str) -> List[Dict[str, str]]:
         """拼出发给大模型的消息数组。"""
         messages: List[Dict[str, str]] = [{
             "role": "system",
-            "content": build_system_prompt(state, intent, emotion.label),
+            "content": build_system_prompt(
+                state, intent, emotion.label, vitals_hint=self._vitals_hint()),
         }]
         messages.extend(self._history_messages())
         messages.append({"role": "user", "content": user_text})
@@ -931,6 +1222,381 @@ STATE_FALLBACK: Dict[str, List[str]] = {
     ],
 }
 
+# --------------------------------------------------------------------------
+# 话题池：老人聊到具体的事，就接那件事，而不是拿通用套话应付。
+#
+# chat 意图在没有大模型时（或请求失败落回模板时）原先只有三条通用应答
+# （「嗯嗯，{topic}——然后呢？」）—— 把老人的话复述一遍了事，聊什么
+# 都这个反应，聊两轮就索然。这里按话题给几句**接着内容说**的话，
+# 覆盖老人最常聊的四类：生活日常、家人情感、陪伴需求、健康留意。
+#
+# 写作约束同 REPLY_TEMPLATES：一句话、不说教、不装懂 ——
+# 尤其健康那组只往"按医嘱、找家人"上引，不给任何医疗意见。
+# 天气**不进**话题池：问天气走 weather 意图（诚实答"看不了"），
+# 「今天天气不错」这种评价继续按闲聊回。
+# --------------------------------------------------------------------------
+TOPIC_REPLIES: List[Tuple[Tuple[str, ...], List[str]]] = [
+    # ---- 生活日常 ----
+    (("散步", "遛弯", "走一走", "锻炼", "运动"), [
+        "散步好，走走浑身都松快。慢点走，别累着。",
+        "您这习惯好，天天动一动，腿脚就灵便。",
+        "出去走走比闷在家里强，累了就找个地方坐坐。",
+    ]),
+    (("吃饭", "做饭", "买菜", "胃口", "饿"), [
+        "到饭点就好好吃饭，吃饱了心里才踏实。",
+        "想吃啥就做点啥，胃口好多吃两口。",
+        "一个人吃饭也别糊弄，身子是自己的。",
+    ]),
+    (("睡", "失眠", "觉少"), [
+        "觉少别硬躺着，白天少眯点，晚上反倒好睡。",
+        "睡不好人就乏。躺下别想事，慢慢就着了。",
+    ]),
+    (("电视", "戏曲", "京戏", "看戏", "听戏"), [
+        "看会儿戏挺好，就是别看太久，眼睛要歇着。",
+        "老戏百听不厌，您听着乐呵就好。",
+    ]),
+    # ---- 家人与情感陪伴 ----
+    (("孙子", "孙女", "儿子", "闺女", "孩子", "儿女"), [
+        "孩子们忙是好事，他们过得好，您就少操点心。",
+        "想他们了就打个电话，听见声音心里就踏实了。",
+        "儿孙自有儿孙福，您把自个儿顾好是头一件。",
+    ]),
+    (("孤单", "没意思", "无聊", "陪陪我", "没人说话"), [
+        "有我陪着您呢，想聊什么咱们就聊什么。",
+        "我在家守着呢，您随时喊我都有应答。",
+        "闷得慌就跟我说说话，我哪儿也不去。",
+    ]),
+    # ---- 聊天邀请（主动要聊天，不是情绪低落时的求陪伴）----
+    # "你能陪我聊会儿天吗""咱们聊聊天""陪我说说话"——这类请求
+    # 如果落回 (normal, chat) 的「嗯嗯，{topic}——然后呢？」会把整句
+    # 当话题复述，变成"嗯嗯，你能陪我聊会儿天吗——然后呢？"，机械且
+    # 不自然。单独识别，给热情接受的回应，把球抛回给老人让他开口。
+    (("陪我聊", "聊聊天", "聊会儿", "聊会天", "说说话", "陪我说",
+      "陪你聊", "聊一聊", "聊聊天", "和您聊", "跟我聊"), [
+        "好呀，您想聊什么？我听着呢。",
+        "当然行，您随便说，我陪着您。",
+        "好，咱们聊。您最近怎么样？",
+        "行呀，您起个头，我接着您说。",
+    ]),
+    (("老朋友", "老同事", "老家", "老伙计"), [
+        "老朋友难得，能聊上几句就是福气。",
+        "老熟人一提起来话就长了，回头让他们常来坐坐。",
+    ]),
+    # ---- 健康留意（不给医疗意见，只往"按医嘱、找家人"上引）----
+    (("血压", "血糖", "体检", "吃药"), [
+        "这些事按医生说的来最稳妥，药别自己加减。",
+        "身体的事别自己扛着，让家里人陪您问问医生。",
+        "记不清吃药的点儿，就写张条贴冰箱上。",
+    ]),
+]
+
+
+def topic_replies_for(text: str) -> List[str]:
+    """用户这句话聊到了哪个话题，返回那组回复；没聊到具体话题返回空。
+
+    只做子串匹配就够 —— 话题关键词都是"散步""孙子"这种低歧义词，
+    不像意图词表那样需要反例保护（教训见 :data:`KEYWORD_BLOCKERS`）。
+    """
+    for keywords, replies in TOPIC_REPLIES:
+        if any(keyword in text for keyword in keywords):
+            return list(replies)
+    return []
+
+
+# --------------------------------------------------------------------------
+# 节日日期表：问「重阳节是多久」要答得出日子，而且**不能编**。
+#
+# 农历节的公历日期年年变，大模型记的往往是训练数据里的旧年份 ——
+# 让它自由发挥，"重阳节"能给你编出三四个版本。所以直接把公历日期
+# **手抄成表**（覆盖 2025~2027 三个演示年份），逐字审过再用；
+# 不引入农历换算库（新依赖，演示机离线装包麻烦），到期补表即可。
+# 表里查不到（年份超出 / 不认识的节日）就诚实说记不准，落回通用模板。
+# --------------------------------------------------------------------------
+_FESTIVAL_YEARS = (2025, 2026, 2027)
+
+
+def _every_year(month_day: Tuple[int, int]) -> Dict[int, Tuple[int, int]]:
+    """固定公历节日（元旦/国庆这类）不用逐年抄，直接铺满表里覆盖的年份。"""
+    return {year: month_day for year in _FESTIVAL_YEARS}
+
+
+#: (节日名, 农历说法（公历节日为空串）, 触发词, {年份: (月, 日)})
+FESTIVALS: List[Tuple[str, str, Tuple[str, ...], Dict[int, Tuple[int, int]]]] = [
+    ("元旦", "", ("元旦", "跨年"), _every_year((1, 1))),
+    ("春节", "农历正月初一", ("春节", "过年"), {
+        2025: (1, 29), 2026: (2, 17), 2027: (2, 6)}),
+    ("元宵节", "农历正月十五", ("元宵",), {
+        2025: (2, 12), 2026: (3, 3), 2027: (2, 20)}),
+    ("清明节", "", ("清明",), {2025: (4, 4), 2026: (4, 5), 2027: (4, 5)}),
+    ("劳动节", "", ("劳动节", "五一"), _every_year((5, 1))),
+    ("端午节", "农历五月初五", ("端午",), {
+        2025: (5, 31), 2026: (6, 19), 2027: (6, 9)}),
+    ("儿童节", "", ("儿童节",), _every_year((6, 1))),
+    ("中秋节", "农历八月十五", ("中秋",), {
+        2025: (10, 6), 2026: (9, 25), 2027: (9, 15)}),
+    ("国庆节", "", ("国庆",), _every_year((10, 1))),
+    ("重阳节", "农历九月初九", ("重阳",), {
+        2025: (10, 29), 2026: (10, 18), 2027: (10, 8)}),
+    ("除夕", "农历一年的最后一夜", ("除夕",), {
+        2025: (1, 28), 2026: (2, 16), 2027: (2, 5)}),
+]
+
+#: 问"今天过什么节"但没有点名具体节日时的触发词
+_GENERIC_FESTIVAL_WORDS = ("节日", "过节", "什么节")
+
+
+def festival_reply(text: str, today: Optional[date] = None) -> str:
+    """按节日表回答「X 节是哪天」。答不上返回空串（调用方落回通用模板）。
+
+    :param today: 注入"今天"供测试用；缺省用系统当天日期。
+    :return: 一句 ≤40 字、能直接念出来的回答；查不到就返回空串。
+    """
+    today = today or date.today()
+
+    # 点名了具体节日：取**出现位置最早**的那个（"中秋国庆放几天"答中秋）
+    best: Optional[Tuple[int, str, str, Dict[int, Tuple[int, int]]]] = None
+    for name, lunar, aliases, dates in FESTIVALS:
+        for alias in aliases:
+            pos = text.find(alias)
+            if pos >= 0 and (best is None or pos < best[0]):
+                best = (pos, name, lunar, dates)
+    if best is not None:
+        _, name, lunar, dates = best
+        # ⚠️ 表里存的是 (月, 日) 元组，和 date 直接比较永远不相等 ——
+        # 必须先拆出 (month, day)。
+        if (today.month, today.day) in dates.values():
+            lunar_part = f"，{lunar}" if lunar else ""
+            return f"今天就是{name}呀{lunar_part}。"
+        if today.year in dates:
+            when = date(today.year, *dates[today.year])
+            lunar_part = f"，{lunar}" if lunar else ""
+            if when > today:
+                days = (when - today).days
+                return f"{name}是{when.month}月{when.day}号{lunar_part}，还有{days}天。"
+            # 今年的过完了 → 答下一年的
+            if today.year + 1 in dates:
+                nxt = date(today.year + 1, *dates[today.year + 1])
+                return f"今年的{name}过了，明年是{nxt.month}月{nxt.day}号。"
+            return f"今年的{name}过了，往后的日期我记不太准了。"
+        if today.year + 1 in dates:
+            nxt = date(today.year + 1, *dates[today.year + 1])
+            lunar_part = f"，{lunar}" if lunar else ""
+            return f"{name}是明年{nxt.month}月{nxt.day}号{lunar_part}。"
+        return ""  # 年份超出表 → 诚实交给通用模板
+
+    # 没点名节日，但问了"今天什么节"：照实说今天是不是节
+    if any(word in text for word in _GENERIC_FESTIVAL_WORDS):
+        for name, _, _, dates in FESTIVALS:
+            if (today.month, today.day) in dates.values():
+                return f"今天就是{name}呀。"
+        return "今天不是什么节。您问哪个节的日期，春节端午重阳我都记得。"
+
+    return ""
+
+
+# --------------------------------------------------------------------------
+# 时间 / 日期 / 星期现答（成都时间，UTC+8）
+# --------------------------------------------------------------------------
+
+#: 项目部署在成都，统一按东八区报时 —— 不依赖本机时区设置
+#: （演示机器万一被改成别的时区，报出来的时间不能跟着错）。
+CHENGDU_TZ = timezone(timedelta(hours=8))
+
+_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
+
+
+def _hour_period(hour: int) -> str:
+    """小时 → 凌晨/早上/上午/中午/下午/晚上。"""
+    if hour < 6:
+        return "凌晨"
+    if hour < 9:
+        return "早上"
+    if hour < 11:
+        return "上午"
+    if hour < 14:
+        return "中午"
+    if hour < 18:
+        return "下午"
+    return "晚上"
+
+
+def _format_clock(now: datetime) -> str:
+    """把时刻翻成口语，例：晚上七点四十五分 / 中午十二点整 / 早上八点零五分。
+
+    老人听的是"下午三点"，不是"15点" —— 24 小时制必须折成 12 小时制，
+    时段词（_hour_period）负责把上午下午说清楚。
+    """
+    hour12 = now.hour % 12 or 12
+    minute = now.minute
+    if minute == 0:
+        minute_text = "整"
+    elif minute == 30:
+        minute_text = "半"
+    elif minute < 10:
+        minute_text = "零%d分" % minute
+    else:
+        minute_text = "%d分" % minute
+    return "%s%d点%s" % (_hour_period(now.hour), hour12, minute_text)
+
+
+def time_reply(text: str, now: Optional[datetime] = None) -> str:
+    """按问句报时刻 / 日期 / 星期（成都时间）。
+
+    与 :func:`festival_reply` 同模式：确定性现算，绝不进大模型 ——
+    模型没有时钟，让它答"几点"只会瞎编。
+
+    :param now: 注入时间供测试（时区感知）；缺省取当前成都时间。
+    :return: 一句能直接念的话。问句里没出现任何时间线索时默认报时刻。
+    """
+    now = now or datetime.now(CHENGDU_TZ)
+
+    asks_time = ("几点" in text) or ("现在时间" in text) or ("成都时间" in text)
+    asks_week = ("星期" in text) or ("周几" in text) or ("礼拜" in text)
+    # "今天几点"也带"今天几"，所以这一项要把"几点"排除，否则问钟点会
+    # 被当成问日期。
+    asks_date = (("几号" in text) or ("多少号" in text) or ("日期" in text)
+                 or (("今天几" in text) and ("几点" not in text)))
+    if not (asks_time or asks_week or asks_date):
+        asks_time = True
+
+    # 问日期就把星期一起报 —— 老人问"今天几号"多半两个都想知道，
+    # 一句话带全比追问强。只问星期 / 只问钟点则不多嘴。
+    if asks_date:
+        head = "今天是%d月%d号，%s。" % (now.month, now.day, _WEEKDAYS[now.weekday()])
+        if asks_time:
+            return head + "现在是%s。" % _format_clock(now)
+        return head
+
+    if asks_week:
+        return "今天是%s。" % _WEEKDAYS[now.weekday()]
+
+    return "现在是%s。" % _format_clock(now)
+
+
+# --------------------------------------------------------------------------
+# 体征现答：心率 / 呼吸的数值与分档建议
+# --------------------------------------------------------------------------
+
+#: 静息参考范围（成人口径）：心率 60–100 次/分，呼吸 12–20 次/分。
+#: "日常参考"不是医疗标准 —— 所以每句回答的尾部必须带 VITALS_NOTE。
+HR_RANGE = (60, 100)
+RR_RANGE = (12, 20)
+
+#: 每一档的建议都只落在机器人真能做的三件事上：歇一歇、观察、告诉
+#: 家里人。不给医疗口径（不上"去医院""吃药"），与 discomfort 分支、
+#: sanitize_reply 的 _MEDICAL_RE 同一条红线。
+_VITALS_ADVICE: Dict[Tuple[str, str], str] = {
+    ("hr", "normal"): "在静息常见的60到100之间，看着挺好的",
+    ("hr", "high"): "比静息常见的60到100偏高，先坐下歇几分钟缓一缓，要是一直这么快，记得告诉家里人",
+    ("hr", "low"): "比静息常见的60到100偏低，要是觉得头晕没力气，别硬撑，说一声让家里人知道",
+    ("rr", "normal"): "在静息常见的12到20之间，看着挺好的",
+    ("rr", "high"): "比静息常见的12到20快，坐下慢慢做几次深呼吸，要是一直这么快，记得告诉家里人",
+    ("rr", "low"): "比静息常见的12到20慢，要是觉得胸闷没劲，别硬撑，说一声让家里人知道",
+}
+
+
+def _vitals_band(value: float, reference: Tuple[int, int]) -> str:
+    """数值落在哪一档：normal / high / low（边界值算 normal）。"""
+    lo, hi = reference
+    if value > hi:
+        return "high"
+    if value < lo:
+        return "low"
+    return "normal"
+
+
+def vitals_reply(text: str, reading) -> str:
+    """按问句报心率 / 呼吸的当前测量值并给分档建议。答不上返回空串。
+
+    与 :func:`festival_reply` 同一个模式：确定性现算 —— 数值在
+    :class:`~core.vitals.VitalsStore` 里，是大模型看不见的数据，
+    问"我心率多少"让它答只会编一个数。
+
+    被问的指标没测出（A 端窗口未满 / SNR 不足）返回空串，调用方落回
+    :data:`INTENT_FALLBACK` 的引导模板 —— **不报 0、不拿另一个指标充数、
+    不报旧数**。过期心率比没有心率更危险。
+
+    :param reading: ``RppgReading`` 或 None（鸭子类型读属性）。
+    """
+    if reading is None:
+        return ""
+    hr = getattr(reading, "hr", None)
+    rr = getattr(reading, "rr", None)
+
+    asks_hr = any(word in text for word in ("心率", "心跳", "脉搏"))
+    asks_rr = "呼吸" in text
+    if not asks_hr and not asks_rr:
+        # 词表里的话都带指标名，走到这里是防御：两个都报。
+        asks_hr = asks_rr = True
+
+    parts: List[str] = []
+    if asks_hr:
+        if hr is None:
+            return ""
+        parts.append("您的心率大约每分钟%d次，%s"
+                     % (int(hr), _VITALS_ADVICE[("hr", _vitals_band(int(hr), HR_RANGE))]))
+    if asks_rr:
+        if rr is None:
+            return ""
+        rr_value = float(rr)
+        parts.append("您的呼吸大约每分钟%g次，%s"
+                     % (rr_value, _VITALS_ADVICE[("rr", _vitals_band(rr_value, RR_RANGE))]))
+    return "。".join(parts) + "。" + VITALS_NOTE + "。"
+
+
+# ---------------------------------------------------------------------------
+# 讲故事（story 意图）
+# ---------------------------------------------------------------------------
+
+#: 怀旧小故事池。每条 3 句话：起头点题、一个年代细节、结尾一句互动钩子
+#: （把话头递回给老人，故事讲完对话不冷场）。
+#:
+#: 为什么预写、不走大模型：
+#: ①**内容可控** —— 模型现编的长故事未必贴合老人的年代记忆，错一个
+#:   年代细节就出戏；怀旧故事的"怀旧感"靠的是具体的物（煤油灯、铁环、
+#:   布票），这些必须挑准了写死。
+#: ②**长度可控** —— 长文本流式合成中途断流的风险随字数涨（见
+#:   core/voice/tts.py 的 TimeoutError 教训），每条压在 90 字上下。
+#: 全部口语化、不说教、不煽情，年代物取 50-70 年代城乡共同记忆。
+STORY_POOL: List[str] = [
+    "过去没电灯，晚上写作业就点一盏煤油灯。灯芯烧着烧着\"啪\"地爆个灯花，"
+    "大人们就说，这是要来喜事了。您小时候是不是也这么点过灯？",
+    "以前村里放露天电影，天还没黑，孩子们就搬着小板凳去占地方。"
+    "银幕反面也坐满了人，看着倒着走路，照样看得有滋有味。"
+    "您还记得那时候看的片子吗？",
+    "那些年夏天热，吃过晚饭就搬个竹床到院子里，摇着蒲扇数星星，"
+    "听老人讲牛郎织女。蚊子嗡嗡的，也舍不得进屋。"
+    "您还记得那样的夏夜吗？",
+    "那时候买东西都去供销社，玻璃柜台里摆着水果糖，一毛钱好几颗。"
+    "买不买不要紧，趴在柜台上瞧一眼，心里都甜滋滋的。"
+    "您还记得供销社吗？",
+    "逢五逢十去赶集，集上人多，热热闹闹的。就为吃一碗热豆腐脑，"
+    "多走十里地也不觉得累，一路上尽是跟街坊打招呼的。"
+    "您赶集最爱吃哪一样？",
+    "放学铃一响，书包一扔就疯跑，男孩滚铁环，女孩跳皮筋。"
+    "铁环一路哗啦啦地响，天擦黑了，大人站在门口喊吃饭，才恋恋不舍地散。"
+    "您小时候玩什么？",
+]
+
+#: 讲故事前的承接句。只说"给您讲一个"不热络，先应一声再进正题。
+_STORY_OPENINGS = [
+    "好嘞，我给您讲个过去的事儿，您听听。",
+    "行，那我给您说一段老底子的事。",
+]
+
+
+def story_reply(rng: Optional[random.Random] = None, last: str = "") -> str:
+    """从 :data:`STORY_POOL` 挑一条怀旧小故事（**只挑本体**，承接句调用方拼）。
+
+    ``last`` 传上次讲过的那条 —— 从剩下的池子里挑，保证连着点播两次
+    不会听到同一个故事。全池都被排除时（理论上只有池子缩到 1 条才会）
+    才放回去。
+    """
+    picker = rng or random.Random()
+    pool = [s for s in STORY_POOL if s != last] or list(STORY_POOL)
+    return picker.choice(pool)
+
+
 # 意图通用兜底
 INTENT_FALLBACK: Dict[str, List[str]] = {
     "identity": [
@@ -944,6 +1610,54 @@ INTENT_FALLBACK: Dict[str, List[str]] = {
     "question": [
         "这个问题我得想想。您先说说您是怎么想的？",
         "您问得挺好，不过这个我拿不太准，咱们一起琢磨琢磨。",
+    ],
+    # 讲故事：story_reply 从预写池挑故事，这句只在拿不到 user_text 的
+    # 兜底路径上出现（意图本身就来自文本匹配，正常到不了这里）。
+    "story": [
+        "您想听故事啊，好嘞，跟我说一声讲个故事，我就给您来一个。",
+        "过去的事情我还存着好几个呢，您想听就说一声。",
+    ],
+    # 「听不清」：老人没听清机器人说的话。reply 由 main.py 的 clarify
+    # 处理路径**运行时构造**（复述上一句机器人说过的话），这里只是兜底——
+    # 如果没有上一句可复述（启动后第一句就"听不清"），给一句安抚。
+    "clarify": [
+        "我刚才说得不够清楚，我再说一遍。",
+        "我声音放大点，慢慢再说一次。",
+    ],
+    # 天气：**诚实**是唯一的正确答案。模型没有实时数据，让它自由发挥
+    # 就是"乱回答"的最典型场景 —— 老人按它编的"晴天"出门挨淋。
+    # 所以 weather 意图永远不进大模型（不在 LLM_ELIGIBLE_INTENTS 里），
+    # 答案只有"我看不到 + 您自己瞧瞧 + 提一句添衣"。
+    "weather": [
+        "外头什么天我看不到。您出门前瞧瞧天，不对劲就添件衣裳。",
+        "天气我这边看不了，怕说错了害您受凉。您瞧瞧窗外再定。",
+    ],
+    # 提醒：机器人没有闹钟和日历。应"好嘞我记下了"是假承诺，
+    # 老人到点等不到，误的是吃药这种正事 —— 只能老实说做不了，
+    # 给个还凑合的替代办法（字条、家里人）。
+    "reminder": [
+        "闹钟提醒我设不了，怕误了您的事。要紧的让家里人帮着记。",
+        "这种要紧事我记不准。您写张字条贴墙上，比什么都稳妥。",
+    ],
+    # 节日：具体日期由 festival_reply 查表算出，这句只在没听清问的
+    # 哪个节、或年份超出表的时候兜底 —— 同样是"我知道的就说，不知道
+    # 的不装知道"。
+    "festival": [
+        "春节端午中秋重阳这些节，日期我都记得，您问哪个？",
+        "哪个节的日期您说，我记着呢。",
+    ],
+    # 体征：A 端没测出（窗口没满 / SNR 不足 / 人刚离开画面）时的兜底。
+    # 诚实说没数、引导重新测 —— **不报 0 也不报旧数**，过期心率比
+    # 没有心率更危险。
+    "vitals": [
+        "这个数我还没测出来，您坐正对着镜头歇稳了，我就给您看看。",
+        "还没测到呢，您坐好别动，等一下我给您报个数。",
+    ],
+    # 用户要求安静：只承认、不追问，并由 main 把主动开口静默一段时间。
+    # 用户随后主动说任何话都会正常回答并自动解除（见 main.handle_chat）。
+    "quiet": [
+        "好，我不说话了。您需要我的时候叫我一声就成。",
+        "好嘞，我安静陪着您，有事您招呼我一声。",
     ],
     "discomfort": [
         "身体不舒服可别硬扛，要不要我帮您叫家里人？",
@@ -983,33 +1697,33 @@ CRISIS_REPLIES: List[str] = [
     "您对我很重要。这种时候我想让家里人陪在您身边，我这就帮您联系。",
 ]
 
+# 身体紧急求助（"救命""叫救护车""喘不上气"）。和危机那组的分工：
+# 危机组先共情、允许问句；紧急组必须像**正在进行的动作** —— 确定、
+# 短促、在布置帮助。main.py 在回复的同时真的发家人通知 + C 端弹窗。
+# ⚠️ 不要承诺"救护车马上到"这种机器人无法保证的结果；只说自己正在做的。
+EMERGENCY_REPLIES: List[str] = [
+    "您别慌，我这就通知家里人过来，我一直陪着您。",
+    "我听见了，马上帮您联系家里人。您撑一下，我就在您身边。",
+    "我这就叫家里人来，您先坐下靠着歇一歇，我马上想办法。",
+]
+
 # --------------------------------------------------------------------------
 # 应声词：用户说完了、回复还没生成出来时，先垫一句
 #
-# **它不是回答**，是"我听见了、我在想"。这一句会让接口那边多等一会儿，
-# 但老人听到的是"立刻有人应我"，而不是"说完之后机器沉默两秒半"。
+# **当前为空：不应答。** 用户明确要求：回答问题前不要任何应答式前置短语，
+# 直接给答案。``thinking_reply()`` 因此返回空串，``on_thinking`` 链路
+# 自动失效（空文本不会触发播报）。保留着一条空表只是为了让调用点不必
+# 改动 —— 想恢复时把文案填回来即可。
 #
-# 三条写作约束，都来自"它必须立刻出声"这个前提：
+# 历史约束（恢复时仍需遵守）：
 #
-#   1. **必须能被预合成缓存命中**（所以静态、无占位符）。它存在的全部意义
-#      就是快 —— 要是它自己还要等 1.2 秒的合成，那还不如不说。
-#      见 static_replies()。
-#   2. **不能有信息量。** 「您今天是不是累了」这种就不行：那是在猜，猜错了
-#      老人会纠正你，然后真正的回答又接上来，一句话变成三句。
-#   3. **长度要压得住沉默。** 大模型那一段本机实测 p50 ≈ 0.9~1.0 秒，
-#      这几句念出来大约 1.0~1.4 秒，刚好盖住。太短会露馅（应声完了还要等），
-#      太长就成了啰嗦。
-#
-# 只在**确实要走大模型**的时候才说（见 respond 的 on_thinking）：
-# 模板回复是本地查表、没有等待，这时候再垫一句纯属废话。
+#   1. **必须能被预合成缓存命中**（所以静态、无占位符），否则它自己还要
+#      等 1.2 秒的合成，比沉默更糟。
+#   2. **不能有信息量。** 那是在猜，猜错了老人会纠正你。
+#   3. **长度要压得住沉默。** 太短露馅，太长啰嗦。
 # --------------------------------------------------------------------------
 
-ACK_REPLIES: List[str] = [
-    "嗯，我听着呢。",
-    "嗯，让我想想。",
-    "哎，您说。",
-    "嗯…我想想啊。",
-]
+ACK_REPLIES: List[str] = []
 
 # --------------------------------------------------------------------------
 # 主动开口的文案（api_doc §5 V1.2 的 proactive 报文用它）
@@ -1049,6 +1763,27 @@ PROACTIVE_TEMPLATES: Dict[str, List[str]] = {
         "回来啦，我一直在呢。",
         "可算见着您了。坐着歇一会吧。",
     ],
+
+    # 空闲闲聊（交互规则③）：画面里有人、连着 15 秒没有语音输入。
+    # 和关怀类不一样，这里**要**用问句 —— 问候的目的就是邀请老人搭话，
+    # 「不回应就不再重复」由调度器的 awaiting_reply 门禁保证。
+    "idle_chat": [
+        "您在呀，今天过得怎么样？",
+        "要不要和我聊聊天？",
+        "我陪您说说话，好不好？",
+        "坐有一会了，要不要喝口水？",
+    ],
+
+    # 走神提醒：VAI 持续偏低（人还在画面里，只是分神了）。
+    # 用问句邀请老人搭话 —— 和 idle_chat 同属"邀请式问候"，豁免"主动关怀
+    # 不用问句"那条约束。话术要带"我看您有点走神"的观察，让老人知道
+    # 这不是泛泛闲聊，是机器人注意到他分心了。
+    "care_distracted": [
+        "您看起来走神了，需要陪您聊聊天吗？",
+        "我看您眼神有点飘，要不咱说说话？",
+        "想什么呢？跟我聊聊呗，您说说我听着。",
+        "走神了？没事，我也陪着您呢，说点啥都行。",
+    ],
 }
 
 
@@ -1087,8 +1822,11 @@ def static_replies() -> List[str]:
         add(text)
     for text in CRISIS_REPLIES:
         add(text)
-    # 应声词**尤其**不能漏：它整句的意义就是"立刻出声"，要是没被预合成，
-    # 它自己就得先等一次网络往返，那还不如沉默。
+    # 紧急话术和危机话术同级 —— 真到喊"救命"时，绝不能再等一次联网合成。
+    for text in EMERGENCY_REPLIES:
+        add(text)
+    # 应声词（当前为空表）：恢复文案后**尤其**不能漏 —— 它整句的意义就是
+    # "立刻出声"，要是没被预合成，它自己就得先等一次网络往返，那还不如沉默。
     for text in ACK_REPLIES:
         add(text)
 

@@ -309,7 +309,9 @@ class StatusBroadcaster(_BaseTcpServer):
 VAI_NOTE = "研究趋势（非认知专注）；日常参考，非医疗结论"
 
 
-def build_vai_message(snapshot: object, timestamp: Optional[float] = None) -> dict:
+def build_vai_message(
+    snapshot: object, distracted: Optional[bool] = None
+) -> dict:
     """把 :class:`~core.focus.FocusSnapshot` 投影成给 C 看的展示报文。
 
     **逐字段原样转发，不做任何加工。**
@@ -321,12 +323,18 @@ def build_vai_message(snapshot: object, timestamp: Optional[float] = None) -> di
     ``index`` 允许是 ``None``（校准没锁定 / 有效观察不够 / 门控拦了）：
     **那不是"0 分"，是没有分数**，前端必须分开显示，不能当低分处理。
 
+    ``distracted``：B 端主动关怀调度器记的走神账（VAI 持续低于走神门槛、
+    持续时长达到 ``distract_sustain`` 的**确认结果**）。``None`` 表示调用方
+    没提供（旧调用点 / 未开主动关怀），此时**不下发该字段** —— C 端按
+    缺字段处理（不显示走神），新旧两端因此可以任意先后升级。
+    判定产物由调度器 ``tick`` 记账，本函数只转发，不参与判定。
+
     这里用鸭子类型读属性而不是 import ``FocusTracker``：本模块是纯粹的对 C
     传输层，不该认识专注度那个领域对象；传给它的只要是个"长得像快照"的东西。
     """
     index = getattr(snapshot, "index", None)
     status = getattr(snapshot, "status", None)
-    return {
+    message = {
         "type": "vai",
         "index": None if index is None else round(float(index), 1),
         "index_status": str(getattr(snapshot, "index_status", "") or ""),
@@ -340,8 +348,11 @@ def build_vai_message(snapshot: object, timestamp: Optional[float] = None) -> di
         "formula_version": str(getattr(snapshot, "formula_version", "") or ""),
         "weight_version": str(getattr(snapshot, "weight_version", "") or ""),
         "note": VAI_NOTE,
-        "timestamp": time.time() if timestamp is None else float(timestamp),
+        "timestamp": time.time(),
     }
+    if distracted is not None:
+        message["distracted"] = bool(distracted)
+    return message
 
 
 class ChatServer(_BaseTcpServer):
@@ -551,11 +562,31 @@ class ChatServer(_BaseTcpServer):
             "timestamp": time.time(),
         }))
 
-    def publish_vai(self, snapshot: object, force: bool = False) -> bool:
+    def broadcast_emergency(self, kind: str, text: str) -> int:
+        """广播一条**紧急事件**（身体求助 / 危机语句）。
+
+        与 ``reply`` 分开：这不是普通应答，C 端要弹醒目警示、家属端
+        （webhook）走另一条通道。``kind`` 为 ``emergency`` 或 ``crisis``。
+        返回成功送达的客户端数。
+        """
+        return self._broadcast(encode_line({
+            "type": "emergency",
+            "kind": kind,
+            "text": text,
+            "timestamp": time.time(),
+        }))
+
+    def publish_vai(
+        self, snapshot: object, force: bool = False, distracted: Optional[bool] = None
+    ) -> bool:
         """推一条专注度展示报文。签名没变且没到心跳时间就不发。返回是否真发了。
 
         语义与 :meth:`StatusBroadcaster.publish` 对齐（变化 + 心跳），
         理由也一样：C 端要能分辨「数值没变」与「B 挂了」。
+
+        ``distracted`` 透传给 :func:`build_vai_message`；**走神翻转也进签名**
+        —— 不进签名的话，VAI 分值没变而走神状态变了时，去重会把这次翻转
+        压到 5 秒心跳之后，C 端的「走神中」显示就迟了 5 秒。
 
         ⚠️ **本方法以及它的调用者，都不许碰判决。** 它只读 ``snapshot()``
         这一个只读快照，绝不调 ``should_stay_silent`` / ``focus_is_live`` /
@@ -565,14 +596,16 @@ class ChatServer(_BaseTcpServer):
         if snapshot is None:
             return False
 
-        message = build_vai_message(snapshot)
+        message = build_vai_message(snapshot, distracted=distracted)
         # 签名里带模态：模态一变，同一个分值不再等价（权重重归一化了），
         # 只比分数会让 C 端停留在上一组证据的解读上。
+        # 走神状态同理：C 端的「走神中」提示跟着它走，翻转必须立刻发。
         signature = (
             message["status"],
             message["index"],
             message["index_status"],
             message["modality_config_id"],
+            message.get("distracted"),
         )
         now = time.monotonic()
 

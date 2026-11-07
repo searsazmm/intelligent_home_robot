@@ -187,6 +187,20 @@ class TestBuildVaiMessage(unittest.TestCase):
         self.assertIsNone(msg["index"])
         self.assertEqual(msg["status"], "")
 
+    def test_distracted_field_is_forwarded_and_not_invented(self):
+        """走神字段：传了才带、原样布尔。它和主动开口用的是同一个判定账本。"""
+        msg = build_vai_message(valid_snapshot(), distracted=True)
+        self.assertIs(msg["distracted"], True)
+        self.assertFalse(build_vai_message(valid_snapshot(), distracted=False)["distracted"])
+
+    def test_distracted_absent_when_not_provided(self):
+        """不传 ``distracted``（旧调用点 / 未开主动关怀）→ 报文**没有**该字段。
+
+        C 端按缺字段处理（不显示走神），新旧两端因此可以任意先后升级。
+        """
+        msg = build_vai_message(valid_snapshot())
+        self.assertNotIn("distracted", msg)
+
 
 # ===========================================================================
 # 发送节流：变化 / 心跳 / 补发
@@ -253,6 +267,16 @@ class TestPublishVaiThrottling(unittest.TestCase):
         self.server.publish_vai(valid_snapshot())
         self.assertTrue(self.server.publish_vai(valid_snapshot(), force=True))
 
+    def test_distracted_flip_alone_is_sent_even_with_same_index(self):
+        """走神翻转必须立刻发 —— C 端的「走神中」提示跟着它走。
+
+        不进签名的话，VAI 分值没变（分值本来就是慢变量）而走神状态变了时，
+        去重会把这次翻转压到 5 秒心跳之后，界面提示就迟了 5 秒。
+        """
+        self.server.publish_vai(valid_snapshot(), distracted=False)
+        self.assertTrue(self.server.publish_vai(valid_snapshot(), distracted=True))
+        self.assertTrue(self.server.publish_vai(valid_snapshot(), distracted=False))
+
 
 class TestSendInitialVai(unittest.TestCase):
     """新客户端连上时补发：与 ``_send_initial_state`` 同一条理由。
@@ -315,9 +339,16 @@ class TestDisplayPathIsReadOnly(unittest.TestCase):
     （那要拉起视觉源、历史文件、语音层）。替身刚好够钉住"它调了谁"。
     """
 
-    def make_stub(self, *, vai_display=True, tracker=None):
+    def make_stub(self, *, vai_display=True, tracker=None, proactive=False):
         stub = mock.Mock()
         stub.args.vai_display = vai_display
+        # 显式给布尔而不是让 Mock 冒充真值：``_publish_vai`` 读
+        # ``proactive.distracted_held >= policy.distract_sustain``，
+        # 未开主动关怀（默认）时根本不该碰那本账。
+        stub.args.proactive = proactive
+        if proactive:
+            stub.proactive.distracted_held = 0.0
+            stub.proactive.policy.distract_sustain = 3.0
         stub.focus_tracker = tracker
         return stub
 
@@ -338,6 +369,30 @@ class TestDisplayPathIsReadOnly(unittest.TestCase):
         stub.chat_server.publish_vai.assert_called_once()
         stub._publish_state.assert_not_called()
         stub._focus_liveness.assert_not_called()
+
+    def test_distracted_ledger_is_forwarded_not_recomputed(self):
+        """走神字段随报文下发，但取自调度器的账（读账，不重新判定）。"""
+        tracker = SnapshotOnlyTracker(valid_snapshot())
+        stub = self.make_stub(tracker=tracker, proactive=True)
+        stub.proactive.distracted_held = 4.0     # ≥ 3.0 → 已确认走神
+        self._call(stub)
+        self.assertTrue(
+            stub.chat_server.publish_vai.call_args.kwargs["distracted"])
+
+    def test_distracted_ledger_below_sustain_is_false(self):
+        stub = self.make_stub(tracker=SnapshotOnlyTracker(valid_snapshot()),
+                              proactive=True)
+        stub.proactive.distracted_held = 1.0     # < 3.0 → 还没确认
+        self._call(stub)
+        self.assertFalse(
+            stub.chat_server.publish_vai.call_args.kwargs["distracted"])
+
+    def test_distracted_omitted_when_proactive_disabled(self):
+        """未开主动关怀 → 不传该参数，报文不带走神字段（缺字段 C 不显示）。"""
+        stub = self.make_stub(tracker=SnapshotOnlyTracker(valid_snapshot()))
+        self._call(stub)
+        call = stub.chat_server.publish_vai.call_args
+        self.assertIsNone(call.kwargs.get("distracted"))
 
     def test_does_not_touch_the_silence_decision(self):
         """约束 2：不调 ``should_stay_silent`` / ``focus_is_live``。

@@ -201,6 +201,14 @@ class VoskRecognizer:
             vosk.SetLogLevel(-1)                      # 关掉 vosk 自己的刷屏日志
             self._model = vosk.Model(path)
             self._available = True
+            if "small" in os.path.basename(path.rstrip("\\/")):
+                # small 模型只有 40MB，中文识别乱码率高（"你好"都能听成
+                # 无关词）—— 识别错 = 答非所问，这是"机器人不搭理人"
+                # 感受的最大来源，值得在启动时就提醒一句。
+                logger.info(
+                    "当前用的是 vosk small 小模型（识别率有限）。建议下载通用"
+                    "大模型 vosk-model-cn-0.22（约 1.3GB）解压到 %s，会自动优先使用。",
+                    LOCAL_MODELS_DIR)
             logger.info("vosk 识别已就绪（模型 %s）", path)
         except Exception:
             logger.exception("加载 vosk 模型失败，语音识别降级为不可用")

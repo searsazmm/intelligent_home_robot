@@ -301,6 +301,46 @@ def supported_output_rate(device: Optional[int], preferred: int,
     return preferred
 
 
+def _apply_volume(pcm: bytes, volume: float) -> bytes:
+    """对 16bit 单声道 PCM 做音量增益，钳位到 [-32768, 32767]。
+
+    volume=1.0 时原样返回。volume>1 时放大（可能削顶），<1 时衰减。
+    优先用 numpy（快几十倍），没装时退回纯 Python ``array`` 循环 ——
+    和 :func:`resample_pcm` 同一套降级策略，保证零第三方依赖也能跑。
+    """
+    if not pcm or volume == 1.0:
+        return pcm
+
+    usable = len(pcm) - (len(pcm) % 2)
+    if usable <= 0:
+        return pcm
+
+    try:
+        import numpy
+
+        samples = numpy.frombuffer(pcm[:usable], dtype="<i2").astype("i4")
+        scaled = numpy.clip(samples * volume, -32768, 32767).astype("<i2")
+        return scaled.tobytes()
+    except ImportError:
+        pass
+
+    source = array.array("h")
+    source.frombytes(pcm[:usable])
+    if sys.byteorder == "big":
+        source.byteswap()
+    out = array.array("h", bytes(2 * len(source)))
+    for i, val in enumerate(source):
+        boosted = int(val * volume)
+        if boosted > 32767:
+            boosted = 32767
+        elif boosted < -32768:
+            boosted = -32768
+        out[i] = boosted
+    if sys.byteorder == "big":
+        out.byteswap()
+    return out.tobytes()
+
+
 def _downmix(pcm: bytes, channels: int) -> bytes:
     """多声道交错 PCM 取第一声道。"""
     import array as _array
@@ -326,11 +366,19 @@ class Player:
 
     # ------------------------------------------------------------------
 
-    def play_wav(self, path: str, block_ms: int = 100) -> bool:
+    def play_wav(self, path: str, block_ms: int = 100, *,
+                 volume: float = 1.0) -> bool:
         """同步播放一个 WAV。播放期间调用 ``stop()`` 可以打断。
 
         同步是刻意的：调用方（语音循环）需要知道"说完了"才能恢复采集，
         否则会把自己的声音录进去。
+
+        参数
+        ----
+        volume:
+            增益系数（1.0 = 原始音量，1.2 = +20%）。对 16bit PCM 做
+            int 乘法后钳位到 ``[-32768, 32767]``，**纯标准库**。
+            用于「听不清」响应：老人说"听不清"时临时提高音量。
 
         采样率会对齐到设备真正支持的值（见 :func:`resample_pcm`）——
         SAPI 给的是 16kHz，而本机真正出声的 2 声道端点只吃 48kHz，
@@ -370,6 +418,14 @@ class Player:
         # 这里只是防御一个意外带声道的 WAV。
         if channels > 1:
             raw = _downmix(raw, channels)
+
+        # 音量增益（「听不清」响应）：对 16bit PCM 做 int 乘法后钳位到
+        # [-32768, 32767]。volume=1.0 时直通，1.2 = +20%。
+        # 钳位即"不超过系统最大音量限制"——int16 的范围就是 PCM 的上限，
+        # 再大会削顶失真。用 array 做逐样本运算，**纯标准库**；numpy
+        # 装了时优先走它（快几十倍，长句不至于卡）。
+        if volume != 1.0 and raw:
+            raw = _apply_volume(raw, volume)
 
         play_rate = supported_output_rate(self._device, wav_rate)
         if play_rate != wav_rate:

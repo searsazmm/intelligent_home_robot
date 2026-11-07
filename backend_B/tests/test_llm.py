@@ -369,6 +369,18 @@ class TestBuildSystemPrompt(unittest.TestCase):
         self.assertIn("医疗建议", prompt)
         self.assertIn("剂量", prompt)
 
+    def test_demands_honesty_no_fabrication(self):
+        """反编造条款必须钉在提示词里 —— 这是"乱回答"的治本处。
+
+        老人问它答不上的事（天气、日期、家里的事），模型最顺手的做法
+        是编一个像样的答案。提示词必须写明：不知道就承认、贴着原话答、
+        别做做不到的承诺。哪天有人精简提示词把这几条删了，这条测试顶住。
+        """
+        prompt = build_system_prompt(config.STATE_NORMAL, "chat", "neutral")
+        self.assertIn("不知道就说不知道", prompt)
+        self.assertIn("别岔开话题", prompt)
+        self.assertIn("我到时候提醒你", prompt)   # 假承诺的反例必须还在
+
 
 # ==========================================================================
 # 客户端（假 transport，不联网）
@@ -677,7 +689,11 @@ class FakeLlm:
 class TestThinkingReply(unittest.TestCase):
     """应声词：用户说完、大模型还没答上来时先垫一句。
 
-    它整句的价值就在**快**，所以两条最要紧的断言是：
+    **当前行为：:data:`ACK_REPLIES` 为空**（用户要求回答问题前不加任何
+    应答式前置短语），应声通路整体静默 —— 这组测试钉住的就是"静默"
+    这件事本身，以及回调时机不因此改变。
+
+    恢复文案后的历史约束（那时要同时改回断言）：
       - 只在确实要走大模型时才说 —— 模板回复是本地查表，没有等待，
         垫一句纯属废话，还容易让老人以为机器人没听懂；
       - 说出口的那句必须在预合成缓存里（见 test_core.py），否则它自己
@@ -688,14 +704,16 @@ class TestThinkingReply(unittest.TestCase):
     TOPIC = "我年轻时候在东北待过"
 
     def test_fires_when_the_llm_will_be_used(self):
+        """回调仍然被调一次（时机不变），但挑出来的应声词是空串 ——
+        播报层对空文本是 no-op，用户听到的就是"说完 → 直接回答"。"""
         engine = DialogueEngine(llm=FakeLlm())
         seen = []
         engine.respond(self.TOPIC, on_thinking=seen.append)
-        self.assertEqual(len(seen), 1, "要走大模型却没垫应声词")
-        self.assertIn(seen[0], ACK_REPLIES)
+        self.assertEqual(len(seen), 1, "应声回调没被触发，时机变了")
+        self.assertEqual(seen[0], "", "ACK_REPLIES 为空时应声词必须是空串")
 
     def test_fires_before_the_request_is_sent(self):
-        """顺序必须是 应声词 → 请求。反了它就不叫应声词了。"""
+        """回调（哪怕是空串）必须在请求发出之前触发。反了就会丢应声。"""
         order = []
 
         class RecordingLlm(FakeLlm):
@@ -708,7 +726,7 @@ class TestThinkingReply(unittest.TestCase):
         self.assertEqual(order, ["ack", "llm"])
 
     def test_does_not_fire_for_crisis_text(self):
-        """危机语句绝不出门给大模型 —— 也就不该垫应声词。"""
+        """危机语句绝不出门给大模型 —— 也就不该触发应声回调。"""
         engine = DialogueEngine(llm=FakeLlm())
         seen = []
         engine.respond("我不想活了", on_thinking=seen.append)
@@ -738,22 +756,15 @@ class TestThinkingReply(unittest.TestCase):
         reply = engine.respond(self.TOPIC, on_thinking=boom)
         self.assertEqual(reply.reply, "我在这儿呢。")
 
-    def test_thinking_reply_avoids_repeating_itself(self):
-        """连着两轮同一句"嗯，我想想"，听起来就是卡带。"""
+    def test_thinking_reply_is_empty_when_disabled(self):
+        """ACK_REPLIES 为空时 thinking_reply() 必须始终返回空串。"""
         engine = DialogueEngine()
-        first = engine.thinking_reply()
-        second = engine.thinking_reply()
-        self.assertIn(first, ACK_REPLIES)
-        self.assertIn(second, ACK_REPLIES)
-        self.assertNotEqual(first, second)
+        self.assertEqual(engine.thinking_reply(), "")
+        self.assertEqual(engine.thinking_reply(), "")
 
-    def test_ack_replies_are_plain_text(self):
-        """带占位符就进不了预合成缓存；带标点以外的花样则会被念得很怪。"""
-        for text in ACK_REPLIES:
-            with self.subTest(text=text):
-                self.assertNotIn("{", text)
-                self.assertEqual(text, text.strip())
-                self.assertTrue(text)
+    def test_ack_replies_is_currently_empty(self):
+        """当前设定：不应答式前置短语，列表必须为空。"""
+        self.assertEqual(ACK_REPLIES, [])
 
 
 class TestLlmRouting(unittest.TestCase):
@@ -1161,6 +1172,70 @@ class TestRecentDialogueSessionFilter(unittest.TestCase):
 
     def test_zero_turns_returns_empty(self):
         self.assertEqual(self.mine.recent_dialogue(turns=0), [])
+
+
+# ==========================================================================
+# 体征提示注入（build_system_prompt 的可选 vitals_hint）
+# ==========================================================================
+
+class TestSystemPromptVitalsHint(unittest.TestCase):
+    """体征数值经提示词进入大模型；默认不传时提示词必须逐字不变。"""
+
+    def test_without_hint_prompt_is_byte_identical(self):
+        base = build_system_prompt(config.STATE_NORMAL, "chat", "neutral")
+        self.assertEqual(build_system_prompt(config.STATE_NORMAL, "chat", "neutral", ""),
+                         base)
+        self.assertEqual(
+            build_system_prompt(config.STATE_NORMAL, "chat", "neutral", vitals_hint=""),
+            base)
+
+    def test_hint_is_appended_with_ranges_and_note(self):
+        base = build_system_prompt(config.STATE_NORMAL, "question", "neutral")
+        got = build_system_prompt(
+            config.STATE_NORMAL, "question", "neutral",
+            vitals_hint="心率约每分钟110次（静息常见60到100）；视觉测量，仅供参考，非医疗结论")
+        self.assertTrue(got.startswith(base), "追加段必须接在原提示词尾部")
+        self.assertIn("心率约每分钟110次", got)
+        self.assertIn("静息常见60到100", got)
+        self.assertIn("视觉测量", got)
+
+    def test_hint_line_has_no_braces(self):
+        """追加段和主模板同一条红线：不能有花括号，否则模型会模仿着输出、
+        被 sanitize_reply 判死，整条大模型链路被静默废掉。"""
+        got = build_system_prompt(config.STATE_NORMAL, "chat", "neutral",
+                                  vitals_hint="心率约每分钟75次")
+        self.assertNotIn("{", got)
+        self.assertNotIn("}", got)
+
+    def test_dialogue_engine_injects_hint_into_llm_messages(self):
+        import time
+        from core.typed_messages import RppgReading
+        engine = DialogueEngine(care_interval=0.0)
+        engine._vitals_provider = lambda: RppgReading(
+            timestamp=time.time(), hr=110, rr=25.0, ibi_ms=())
+        emotion = engine.analyzer.analyze("我是不是不舒服")
+        messages = engine._llm_messages(config.STATE_NORMAL, "question",
+                                        emotion, "我是不是不舒服")
+        system = messages[0]["content"]
+        self.assertIn("心率约每分钟110次", system)
+        self.assertIn("呼吸约每分钟25次", system)
+        self.assertIn("视觉测量", system)
+
+    def test_no_hint_when_nothing_measured(self):
+        import time
+        from core.typed_messages import RppgReading
+        engine = DialogueEngine(care_interval=0.0)
+        emotion = engine.analyzer.analyze("你好")
+        # 没有 provider
+        messages = engine._llm_messages(config.STATE_NORMAL, "chat",
+                                        emotion, "你好")
+        self.assertNotIn("体征", messages[0]["content"])
+        # 读数全是 None（窗口没满）也一样 —— 没数就不提，别诱导模型拿它当话题
+        engine._vitals_provider = lambda: RppgReading(
+            timestamp=time.time(), hr=None, rr=None, ibi_ms=())
+        messages = engine._llm_messages(config.STATE_NORMAL, "chat",
+                                        emotion, "你好")
+        self.assertNotIn("体征", messages[0]["content"])
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from core.voice.base import (                                            # noqa:
 )
 from core.voice.loop import (                                            # noqa: E402
     ECHO_SIMILARITY,
+    ChatterGuard,
     LoopConfig,
     Speaker,
     VoiceLoop,
@@ -39,7 +40,9 @@ from core.voice.loop import (                                            # noqa:
     _wav_seconds,
     is_meaningful,
     looks_like_echo,
+    window_overlaps_playback,
 )
+from core.voice.vad import SpeechSegment                                 # noqa: E402
 
 
 def executable_lines(script: str) -> str:
@@ -103,7 +106,7 @@ class FakePlayer:
         self._lock = threading.Lock()
         self.delay = 0.0
 
-    def play_wav(self, path: str) -> bool:
+    def play_wav(self, path: str, *, volume: float = 1.0) -> bool:
         with self._lock:
             self._in_play += 1
             self.max_concurrent = max(self.max_concurrent, self._in_play)
@@ -1179,18 +1182,20 @@ class TestSpeakerStreaming(unittest.TestCase):
         self.assertTrue(speaker.say("您好呀"))
         self.assertEqual(len(synth.calls), 1, "没有落回整句合成")
 
-    def test_does_not_replay_after_audio_was_already_heard(self):
-        """**已经出声之后**断流：绝不能重念。
+    def test_replays_as_whole_sentence_after_stream_broke_midway(self):
+        """**已经出声之后**断流：落回整句合成**重念一遍**。
 
-        这是流式改造里唯一会直接伤到用户的错误 —— 老人会听到同一句话
-        被念两遍（而且第二遍还是从头开始）。
+        2026-10-09 推翻了旧版"绝不重念"的取舍：实测豆包长句合成中途
+        停发音频块、等满 30 秒 socket 超时，旧版话只播一半就戛然而止
+        （"播报突然中断"）—— 比重听一遍糟糕得多，老人只会觉得机器人
+        坏了，不会意识到该要求"再说一遍"。
         """
         synth = FakeStreamingSynthesizer(
             chunks=[b"\x00\x01" * 10] * 4, fail_after=1)
         speaker = Speaker(synthesizer=synth, player=self.player)
         self.addCleanup(speaker.close)
-        speaker.say("您好呀")
-        self.assertEqual(synth.calls, [], "已经出声了还重念了一遍")
+        self.assertTrue(speaker.say("您好呀"))
+        self.assertEqual(len(synth.calls), 1, "断流后没有落回整句合成重念")
 
     def test_cache_hit_never_opens_a_stream(self):
         """缓存命中就直接播文件 —— 那句已经在本机了，没有任何理由再走网络。"""
@@ -1485,6 +1490,88 @@ class TestEchoSuppression(unittest.TestCase):
         self.assertFalse(looks_like_echo("我今天有点累", combined))
 
 
+class TestEchoWindowFilter(unittest.TestCase):
+    """时间窗回声过滤（过滤 3）：识别音频段与播报窗口重叠 ⇒ 不可信。
+
+    远场失真的回声识别出的文本和原句完全不像（'那个肥满我刚从啊'），
+    文本相似度抓不住，只能靠时间对齐。
+    """
+
+    def test_none_window_never_overlaps(self):
+        self.assertFalse(window_overlaps_playback(0.0, 1.0, None))
+
+    def test_segment_inside_playback_window(self):
+        self.assertTrue(window_overlaps_playback(11.0, 12.0, (10.0, 14.0)))
+
+    def test_segment_in_reverb_tail(self):
+        """播完 0.4 秒内的混响尾段（< ECHO_REVERB_TAIL）要拦住。"""
+        self.assertTrue(window_overlaps_playback(
+            14.1, 15.0, (10.0, 14.0)))          # 起点 14.1 <= 14.0+0.5
+
+    def test_segment_after_tail_passes(self):
+        """播完 2 秒后老人接话 —— 必须放行，不能把真接话吞掉。"""
+        self.assertFalse(window_overlaps_playback(
+            16.0, 17.5, (10.0, 14.0)))
+
+    def test_segment_before_lead_passes(self):
+        """播报开始前 1 秒拾的段（用户先开口，机器人后答）要放行。"""
+        self.assertFalse(window_overlaps_playback(
+            8.0, 9.0, (10.0, 14.0)))            # 终点 9.0 < 10.0-0.3
+
+
+class TestChatterGuard(unittest.TestCase):
+    """连续杂音应答的冷静闸（过滤 4）。
+
+    复现现场三连：'那个肥满我刚从啊' → '实话说一句不行行不行' →
+    '害别人'，第三轮必须被拦下。
+    """
+
+    def setUp(self):
+        self.guard = ChatterGuard(window=60.0, threshold=2,
+                                  cooldown=60.0, max_chars=10)
+
+    def test_first_two_noise_replies_go_through(self):
+        self.assertFalse(self.guard.should_drop("那个肥满我刚从啊", 100.0))
+        self.guard.on_reply("那个肥满我刚从啊", 100.0)
+        self.assertFalse(self.guard.should_drop("实话说一句不行行不行", 122.0))
+        self.guard.on_reply("实话说一句不行行不行", 122.0)
+
+    def test_third_noise_in_window_is_dropped(self):
+        self.guard.on_reply("那个肥满我刚从啊", 100.0)
+        self.guard.on_reply("实话说一句不行行不行", 122.0)
+        self.assertTrue(self.guard.should_drop("害别人", 148.0))
+
+    def test_cooldown_expires(self):
+        self.guard.on_reply("那个肥满我刚从啊", 100.0)
+        self.guard.on_reply("实话说一句不行行不行", 122.0)
+        self.assertTrue(self.guard.should_drop("害别人", 148.0))
+        # 冷静 60 秒后恢复
+        self.assertFalse(self.guard.should_drop("我坐一会儿", 250.0))
+
+    def test_question_word_lets_text_through(self):
+        """疑问句是真实对话的证据：冷静期内也放行，并解除冷静。"""
+        self.guard.on_reply("那个肥满我刚从啊", 100.0)
+        self.guard.on_reply("实话说一句不行行不行", 122.0)
+        self.assertTrue(self.guard.should_drop("害别人", 148.0))  # 冷静中
+        self.assertFalse(self.guard.should_drop("今天天气怎么样", 150.0))
+        self.guard.on_reply("今天天气怎么样", 150.0)              # 疑问 → 解除
+        self.assertFalse(self.guard.should_drop("我有点累", 152.0))
+
+    def test_long_text_is_real_speech_and_resets(self):
+        """长句（>10 字）是真实话语：放行且清账。"""
+        self.guard.on_reply("那个肥满我刚从啊", 100.0)
+        self.assertFalse(self.guard.should_drop("我今天早上出去买菜遇到了老邻居", 120.0))
+        self.guard.on_reply("我今天早上出去买菜遇到了老邻居", 120.0)
+        # 账被清了：再来一条短杂音也不触发冷静
+        self.assertFalse(self.guard.should_drop("害别人", 130.0))
+
+    def test_short_agreement_still_counts_as_noise(self):
+        """短附和（'好的''挺好的'）与杂音无法区分，同一条规则管。"""
+        self.guard.on_reply("好的", 100.0)
+        self.guard.on_reply("挺好的", 130.0)
+        self.assertTrue(self.guard.should_drop("行", 150.0))
+
+
 class TestMeaningfulFilter(unittest.TestCase):
 
     def test_empty_and_whitespace_rejected(self):
@@ -1700,6 +1787,206 @@ class TestVoiceLoop(unittest.TestCase):
         loop = self.build(recorder=None)
         loop.say("主动关怀的话")
         self.assertEqual(self.synth.calls[0][0], "主动关怀的话")
+
+
+# --------------------------------------------------------------------------
+# 续句合并：长句里的停顿不再被切成多段、答两遍
+# --------------------------------------------------------------------------
+
+class TestVoiceLoopContinuation(unittest.TestCase):
+    """「半夜醒了好几次……头有点昏……手还有点发麻」被答两遍的修复。
+
+    旧逻辑：VAD 判出一句就立刻识别+应答，句中停顿超过 end_silence_ms
+    就被切成分段，每段各应答一次 —— 表现为回答有间歇、同一件事答两遍。
+    新逻辑：切出的片段先攒进缓冲，``continuation_wait`` 秒内来了新片段
+    就拼成一段 PCM，**只识别一次、只应答一次**。
+    """
+
+    SEG = SpeechSegment  # 简写
+
+    def build(self, segments_text=None, wait=1.5, **config_overrides):
+        """造一个带假时钟的 loop。``fake_now`` 可在断言前手动推进。"""
+        self.fake_now = [1000.0]
+        synth, player = FakeSynthesizer(), FakePlayer()
+        self.speaker = Speaker(synthesizer=synth, player=player)
+        self.received = []
+        # 每次识别按顺序吐一个文本；seen 仍按原 FakeRecognizer 的方式记账
+        self.recognizer = FakeRecognizer("第一段")
+        if segments_text is not None:
+            texts = list(segments_text)
+            seen = self.recognizer.seen
+
+            def transcribe(pcm, rate, _texts=texts, _seen=seen):
+                _seen.append(len(pcm))
+                return _texts.pop(0) if _texts else ""
+
+            self.recognizer.transcribe = transcribe
+        config = LoopConfig(continuation_wait=wait, **config_overrides)
+        loop = VoiceLoop(
+            on_text=lambda text: (self.received.append(text),
+                                  mock.Mock(reply="我听着呢"))[1],
+            speaker=self.speaker,
+            recognizer=self.recognizer,
+            recorder=FakeRecorder([]),
+            config=config,
+            clock=lambda: self.fake_now[0],
+        )
+        return loop
+
+    def test_pause_within_window_merges_into_one_reply(self):
+        """1.5 秒内的两段 = 一句话：只应答一次。
+
+        识别会看到两次调用：第一段入缓冲时投机识别提前跑的那次（结果
+        作废）+ flush 时对合并音频的一次 —— 但 on_text 只来一次。
+        """
+        loop = self.build()
+        first = SpeechSegment(pcm=b"\x01\x01" * 1600, sample_rate=16000,
+                              reason="silence")
+        second = SpeechSegment(pcm=b"\x02\x02" * 1600, sample_rate=16000,
+                               reason="silence")
+        loop._enqueue_segment(first)
+        self.fake_now[0] += 0.8                     # 停顿 0.8s 后接着说
+        loop._enqueue_segment(second)
+        loop._flush_pending()
+
+        self.assertEqual(self.received, ["第一段"],
+                         "两段被拼成一句话，却应答了两次")
+        self.assertEqual(self.recognizer.seen,
+                         [len(first.pcm), len(first.pcm) + len(second.pcm)],
+                         "第二次识别必须针对合并后的完整音频")
+
+    def test_single_segment_is_transcribed_exactly_once(self):
+        """投机识别的结果要被 flush 复用，而不是再同步重识一遍。
+
+        单段一句话（最常见的"问一句答一句"）：识别调用总数必须是 1 ——
+        出现 2 次说明投机白跑 + 用户多等了一次串行识别。
+        """
+        loop = self.build(segments_text=["现在几点了"])
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 6400, sample_rate=16000, reason="silence"))
+        loop._flush_pending()
+
+        self.assertEqual(self.received, ["现在几点了"])
+        self.assertEqual(len(self.recognizer.seen), 1,
+                         "投机结果没被复用，识别跑了两遍")
+
+    # ---- 问句早放：问句不等窗口，故事片段继续合并 ----
+
+    def test_question_is_released_before_window_expires(self):
+        """「现在几点了」投机一出结果就该回答，不等满 1.2s。"""
+        loop = self.build(segments_text=["现在几点了"])
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 100, sample_rate=16000, reason="silence"))
+        if loop._spec_thread is not None:
+            loop._spec_thread.join(timeout=1.0)     # 投机识别收工
+        # 时钟不动 —— 续句窗口远没到期
+        loop._loop_once()
+
+        self.assertEqual(self.received, ["现在几点了"],
+                         "完整问句被窗口拖着没回答")
+
+    def test_story_fragment_waits_for_continuation(self):
+        """「头有点昏」不是问句 —— 必须等满窗口等下文，不能抢跑。"""
+        loop = self.build(segments_text=["头有点昏"])
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 100, sample_rate=16000, reason="silence"))
+        if loop._spec_thread is not None:
+            loop._spec_thread.join(timeout=1.0)
+        loop._loop_once()                           # 窗口未到，也不该早放
+
+        self.assertEqual(self.received, [], "故事片段被当成问句提前送出")
+        # 推过窗口后才正常送出
+        self.fake_now[0] += 1.6
+        loop._loop_once()
+        self.assertEqual(self.received, ["头有点昏"])
+
+    def test_grown_buffer_blocks_early_flush(self):
+        """窗口里又说了半句 → 缓冲变大 → 投机结果过期，不许早放。
+
+        假识别器按音频长度出文本（真实引擎转写的就是合并后的整段话）：
+        100 字节 → 问句；200 字节 → 问句+下文，不再是问句。
+        """
+        loop = self.build()
+        loop.recognizer.transcribe = lambda pcm, rate: (
+            "现在几点了" if len(pcm) <= 100 else "现在几点了头还有点发麻")
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 100, sample_rate=16000, reason="silence"))
+        if loop._spec_thread is not None:
+            loop._spec_thread.join(timeout=1.0)
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x02" * 100, sample_rate=16000, reason="silence"))
+        if loop._spec_thread is not None:
+            loop._spec_thread.join(timeout=1.0)     # 合并音频的投机也收工
+        loop._loop_once()
+
+        self.assertEqual(self.received, [],
+                         "用户还在接着说，合并后的整段不是问句，不能抢跑")
+
+    def test_silence_beyond_window_flushes_separately(self):
+        """超过等待窗口还没下文 = 真说完了，正常送出；下一句是新一轮。"""
+        loop = self.build(segments_text=["第一段", "第二段"])
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 100, sample_rate=16000, reason="silence"))
+        self.fake_now[0] += 2.0                     # 远超 1.5s
+        loop._loop_once()                           # 空转一拍：应触发 flush
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x02" * 100, sample_rate=16000, reason="silence"))
+        loop._flush_pending()
+
+        self.assertEqual(self.received, ["第一段", "第二段"])
+        self.assertEqual(self.recognizer.seen, [100, 100],
+                         "隔了很久的两句不该被拼进同一次识别")
+
+    def test_flush_happens_even_when_microphone_is_quiet(self):
+        """安静环境里老人说完就没了下文 —— 不能靠下一块音频才触发 flush。"""
+        loop = self.build(segments_text=["只有一句"])
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 200, sample_rate=16000, reason="silence"))
+        self.fake_now[0] += 1.6
+        loop._loop_once()                           # recorder.read 返回 None
+        self.assertEqual(self.received, ["只有一句"])
+
+    def test_sample_rate_change_flushes_old_buffer_first(self):
+        """设备重连换采样率时，旧缓冲不能和新音频拼在一起。"""
+        loop = self.build(segments_text=["旧的", "新的"])
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 100, sample_rate=16000, reason="silence"))
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x02" * 100, sample_rate=8000, reason="silence"))
+        loop._flush_pending()
+
+        self.assertEqual(self.received, ["旧的", "新的"])
+        self.assertEqual(self.recognizer.seen, [100, 100])
+
+    def test_cap_flushes_early_when_speech_never_stops(self):
+        """连续说个不停时攒够上限就送出，不无限拼接。
+
+        用固定文本的假识别器：投机识别会先把固定文本吃掉一次（真实引擎
+        会转写合并后的完整音频，假件模拟不了"文本随音频变长"），所以
+        这里只钉两件事 —— 上限一到缓冲立刻清空、文本确实送出了一次。
+        """
+        loop = self.build(segments_text=None, continuation_max_total=1.5)
+        loop.recognizer.transcribe = lambda pcm, rate: "连续说话"[: 1 + len(pcm) // 32000]
+        one_second = b"\x00\x00" * 16000
+        loop._enqueue_segment(SpeechSegment(pcm=one_second, sample_rate=16000,
+                                            reason="max_length"))
+        self.assertEqual(loop._pending_pcm, [one_second], "还没到上限不应送出")
+        # 等第一段的投机线程收工，保证第二段一定起新的投机（消除线程时序）
+        if loop._spec_thread is not None:
+            loop._spec_thread.join(timeout=1.0)
+        loop._enqueue_segment(SpeechSegment(pcm=one_second, sample_rate=16000,
+                                            reason="max_length"))
+        self.assertEqual(loop._pending_pcm, [], "超上限后缓冲应当已清空")
+        self.assertEqual(self.received, ["连续说"],
+                         "送出的是合并后的完整音频（假件按字节数出字）")
+
+    def test_single_segment_still_flows_through(self):
+        """正常一句话（没有停顿）行为不变：识别一次、应答一次。"""
+        loop = self.build(segments_text=["我有点累"])
+        loop._enqueue_segment(
+            SpeechSegment(pcm=b"\x01" * 100, sample_rate=16000, reason="silence"))
+        loop._flush_pending()
+        self.assertEqual(self.received, ["我有点累"])
 
 
 # --------------------------------------------------------------------------

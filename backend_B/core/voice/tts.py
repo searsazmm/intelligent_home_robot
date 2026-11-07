@@ -950,8 +950,10 @@ class DoubaoSynthesizer:
 
         - **吐出第一块音频之前**失败 → 抛 ``ValueError``。此时一个字都没念出去，
           调用方可以干净地落回 :meth:`synthesize_wav`（那条路还带本地兜底）。
-        - **已经吐过音频之后**失败 → 只记日志然后结束。说出去的半句话收不回来，
-          抛异常只会让调用方把整句重念一遍 —— 用户会听到"豆…豆包合成失败"。
+        - **已经吐过音频之后**失败 → **同样往上抛**（原异常）。loop 层收到后
+          落回整句合成重念一遍 —— 播一半戛然而止比重听一遍糟糕得多。
+          （旧版在这里吞异常只记日志，实测长句合成中途超时时话只播一半，
+          表现就是"播报突然中断"。）
         """
         if not self._usable or not text.strip():
             raise ValueError("豆包合成不可用：%s" % (self._reason or "文本为空"))
@@ -1000,11 +1002,13 @@ class DoubaoSynthesizer:
                 raise ValueError(message) from exc
             return
         except Exception as exc:
-            # 断网、超时、连接被重置都是常态。
+            # 断网、超时、连接被重置都是常态。**无论有没有播出过音频都
+            # 往上抛**：loop 层（_stream_locked）靠这个异常知道"这句断了"，
+            # 才会落回整句合成重念一遍。旧版在这里吞掉异常只记日志，
+            # 结果长句合成中途超时（实测豆包服务端停发音频块等满 30 秒
+            # socket 超时）时话只播一半就戛然而止 —— 播报"突然中断"。
             logger.warning("豆包流式合成中断：%r", exc)
-            if not started:
-                raise ValueError("豆包流式合成失败：%r" % (exc,)) from exc
-            return
+            raise
 
         if parser.failure:
             logger.warning("豆包流式合成服务端报错：%s", parser.failure)
