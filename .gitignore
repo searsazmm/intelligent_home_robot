@@ -65,3 +65,13 @@ backend_A/models/
 # Claude Code 的本地配置（.claude/settings.json 里的权限白名单是**本机**的、
 # 而且可能是从别的项目带过来的，对别人没有意义，不入库）
 .claude/
+
+# Generi-Chan 形象的设计工程源文件（Live2D .cmo3 / Krita .psd / Inkscape .svg
+# 与导出 PNG，共约 78MB）。代码零引用，属于美术同学生产工具的本地文件，
+# 体积远超 git 承受范围，不入库。
+Generi-Chan/
+
+# 项目报告：生成脚本（python-docx）与产出的 Word 文档。
+# 课程交付物，不随代码仓库分发；脚本留在本地按需重新生成。
+generate_report.py
+项目报告.docx
