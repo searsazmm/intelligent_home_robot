@@ -1,28 +1,31 @@
 # -*- coding: utf-8 -*-
-"""窗口渲染的单元测试（需要 PyQt5；没有图形环境时自动跳过）。
+"""FaceWindow 的单元测试（需要 PyQt5；没有图形环境时自动跳过）。
 
 跑法（在 frontend_C 目录下）：
     python -m pytest tests/ -v
     python tests/test_window.py
 
-    # 想在真机平台下跑（断言更强，见下），显式指定平台：
+    # 想在真机平台下跑：
     QT_QPA_PLATFORM=windows python tests/test_window.py
 
 --------------------------------------------------------------------------
-关于「离屏平台什么都画不出来」—— 这条必须先讲清楚
+关于「离屏平台没有字体」—— 这条必须先讲清楚
 --------------------------------------------------------------------------
-默认用 ``QT_QPA_PLATFORM=offscreen`` 跑，好处是无需图形环境。
-但实测该平台下 **``QFontDatabase().families()`` 返回 0 个字体族**，
-于是 Qt 一个字都画不出来 —— 截出来的图是全黑的（实测非黑像素计数为 0）。
+左侧是**白色颜文字**（``drawText`` 画在纯黑底上），本身就是字。
+纯黑底这类结构断言**任何平台都跑**；但「真的切出了白色的字 / 眨眼帧不同 /
+四态看起来不同」依赖字体度量，离屏平台的 ``QFontDatabase().families()``
+返回 0 个字体族，那时颜文字画不出来 —— 这些断言与 ``--dump-glyphs``
+的字形比对、豆腐块检测一起，在无字体平台必然失败且误导。
 
-这意味着：**在离屏平台下断言「脸上有白色像素」是错的**，它必然失败，
-而且失败信息会让人以为窗口坏了（其实是平台没字体）。所以本文件分两档：
+所以本文件分两档：
 
-  * 「结构」档 —— 背景纯黑、尺寸、不崩溃、按键、关闭清理。**任何平台都跑。**
-  * 「字形」档 —— 真切出白色的脸。**只在字体库非空的平台跑**，否则跳过并说明原因。
+  * 「结构」档 —— 背景纯黑、尺寸、字号自适应、不崩溃、按键、关闭清理。
+    **任何平台都跑。**
+  * 「字形」档 —— 颜文字字符串（``--dump-glyphs`` 的输入）逐字比对。
+    **只在字体库非空的平台跑**，否则跳过并说明原因。
 
-字形是否真的可用，最终以 ``main.py --dump-glyphs``（或 ``--screenshot``）
-在**演示机上**肉眼确认为准，不靠这个测试。这里的两档只是防回归。
+颜文字字形是否真的可用，最终以 ``main.py --dump-glyphs`` 在**演示机上**
+肉眼确认为准，不靠这个测试。
 """
 
 from __future__ import annotations
@@ -197,19 +200,22 @@ class TestRendering(unittest.TestCase):
         window = make_window()
         self.addCleanup(window.close)
         for state in VALID_STATES:
-            window.set_state(state)
+            # set_state 带确认窗口（连续 2 次才切），这里直接走 _apply_state
+            # 绕过确认——本条测的是"四种状态都能渲染"，不是确认逻辑。
+            window._apply_state(state)
             self.assertEqual(window._state, state)
 
     def test_set_state_is_idempotent(self):
         """重复设同一状态不该重启动画（否则 15 秒心跳会让脸闪一下）。"""
         window = make_window()
         self.addCleanup(window.close)
-        window.set_state(STATE_SAD)
+        window._apply_state(STATE_SAD)
         window.snapshot(STATE_SAD)              # 把淡入停掉
-        window.set_state(STATE_SAD)
+        window._apply_state(STATE_SAD)
         self.assertFalse(window._fade.state(), "同一状态不该重启淡入动画")
 
     def test_fixed_font_size_is_respected(self):
+        """``--font-size`` 显式给值时不做任何钳制。"""
         window = make_window(font_size=42)
         self.addCleanup(window.close)
         self.assertEqual(window._font_point_size(), 42)
@@ -221,7 +227,6 @@ class TestRendering(unittest.TestCase):
         同时受宽度约束（见 ``ui/window.py`` 的 ``EDGE_MARGIN`` 与
         ``_largest_fitting_point_size``）。窄窗口下宽度是那个约束，
         再高也不会变大 —— 那时这条断言测的就不是"随高度变"了。
-        2600 宽是为了让它在任何字体度量下都不成为瓶颈。
         """
         window = make_window()
         self.addCleanup(window.close)
@@ -231,15 +236,17 @@ class TestRendering(unittest.TestCase):
         self.assertGreater(window._font_point_size(), small)
 
     def test_auto_font_size_has_a_floor(self):
-        """窗口被拉得极小时字号不能变成 0（会画不出来）。"""
+        """窗口被拉得极小时字号不能变成 0（会画不出来），且渲染绝不崩。"""
         window = make_window()
         self.addCleanup(window.close)
         window.resize(800, 10)
         self.assertGreaterEqual(window._font_point_size(), 8)
+        self.assertFalse(
+            window.snapshot(STATE_NORMAL, width=800, height=10).isNull())
 
     @unittest.skipUnless(has_real_fonts(), skip_reason())
     def test_face_is_actually_drawn(self):
-        """真切出白色的字 —— 这是「白色颜文字」这条需求的自动化版本。"""
+        """四态都真切出白色的字 —— 「展示表情」这条需求的自动化版本。"""
         window = make_window()
         self.addCleanup(window.close)
         for state in VALID_STATES:

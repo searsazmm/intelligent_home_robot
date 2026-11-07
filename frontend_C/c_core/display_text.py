@@ -39,6 +39,11 @@ NO_INDEX = "——"
 #: 一直没收到 ``vai`` 报文时的说法。分两种原因，见 :func:`format_vai_lines`。
 VAI_NOT_DELIVERED = "未提供 —— B 未下发（可能没开专注度展示，或 B 是旧版本）"
 
+#: 专注度区块的标签。图形化右栏把标签与数值**分两行**画（标签小字、数值大字），
+#: headline 仍由两者拼出 —— 文案只在这里写一份，``ui/camera.py`` 引用这个常量，
+#: 不要再写字面量。
+VAI_LABEL = "专注度 VAI"
+
 #: ``vai`` 报文里缺少 ``note`` 字段时的兜底（含旧版 B 的情况）。
 #: 与 ``backend_B/core/ui_channel.py`` 的 ``VAI_NOTE`` 逐字相同 ——
 #: C 不许自己发明一句更顺口的免责声明。
@@ -60,6 +65,11 @@ STREAM_HINT = "启动 A 时加 --stream，并给 C 加 --stream-url"
 #: 画面通道连上了但还没收到第一帧（步骤②的 MJPEG 拉流会用到）
 STREAM_WAITING = "画面通道已连接，等待第一帧"
 
+#: 画面框右上角的实时徽标文字（右栏图形化升级新增）。
+#: 属于界面装饰文案，但按本模块的约定仍与数据文案放在一起，
+#: ``ui/camera.py`` 不要写字面量。
+STREAM_LIVE_BADGE = "实时画面"
+
 #: 进度条字符（实心 / 空心）。U+25A0 / U+25A1 在 Microsoft YaHei UI 里有字形，
 #: 但**必须**在演示机上用 ``--screenshot`` 肉眼过一遍（字体回退会让缺字形静默变方块）。
 BAR_FILLED = "■"
@@ -67,6 +77,12 @@ BAR_EMPTY = "□"
 
 #: 进度条格子数
 BAR_CELLS = 10
+
+#: ``vai.distracted`` 为真时的提示语。B 端只在走神**确认**（VAI 持续低于
+#: 走神门槛达到 ``distract_sustain`` 秒）后才下发该字段 —— 和主动开口说
+#: "您看起来走神了"用的是同一个判定账本，所以界面上出现这两个字时，
+#: 机器人嘴上也正说着同一件事。缺字段（旧版 B / 未开主动关怀）不显示。
+DISTRACTED_BADGE = "走神中"
 
 
 # --------------------------------------------------------------------------
@@ -122,12 +138,16 @@ def format_modalities(keys: Optional[Iterable[str]]) -> str:
 def format_vai_headline(vai: Optional[dict]) -> str:
     """第一行：「专注度 VAI 63.5」/「专注度 VAI ——」。"""
     if not isinstance(vai, dict):
-        return f"专注度 VAI {NO_INDEX}"
-    return f"专注度 VAI {format_index(vai.get('index'))}"
+        return f"{VAI_LABEL} {NO_INDEX}"
+    return f"{VAI_LABEL} {format_index(vai.get('index'))}"
 
 
 def format_vai_detail(vai: Optional[dict]) -> str:
-    """第二行：测量状态 + 模态 + 已测时长。没有分数时改成解释为什么。"""
+    """第二行：测量状态 + 模态 + 已测时长。没有分数时改成解释为什么。
+
+    B 明确说走神（``distracted`` 为真）时，提示语放**最前** ——
+    它是这一行里唯一需要老人立刻注意到的事。
+    """
     if not isinstance(vai, dict):
         return VAI_NOT_DELIVERED
 
@@ -142,6 +162,9 @@ def format_vai_detail(vai: Optional[dict]) -> str:
         parts = [why]
     else:
         parts = [status] if status else []
+
+    if vai.get("distracted"):
+        parts.insert(0, DISTRACTED_BADGE)
 
     if modalities:
         parts.append(f"模态 {modalities}")
@@ -169,6 +192,62 @@ def format_note(vai: Optional[dict]) -> str:
         if note:
             return note
     return FALLBACK_NOTE
+
+
+# --------------------------------------------------------------------------
+# 心率 / 呼吸（vitals 报文）
+# --------------------------------------------------------------------------
+# 与 vai 同一条约定：**hr/rr 是 None 不等于 0**。A 的窗口未满 8 秒、SNR
+# 不足时都会置灰 —— 那是"没有测量值"，不是"心率 0"。这两样在界面上
+# 必须长得不一样，否则老人看到的是系统在报一个危险的心跳数。
+
+#: 体征区块的标签。``ui/camera.py`` 引用这个常量，不要写字面量。
+VITALS_LABEL = "心率 / 呼吸"
+
+#: 一直没收到 ``vitals`` 报文时的说法。
+VITALS_NOT_DELIVERED = "未提供 —— B 未下发（可能 A 没在测，或 B 是旧版本）"
+
+#: 收到了报文但 hr/rr 都是 ``None`` 时的说法（A 明确说"没检出"）。
+VITALS_NOT_DETECTED = "未检出（测量窗口未满或画面质量不足）"
+
+#: ``vitals`` 报文里缺少 ``note`` 字段时的兜底（含旧版 B 的情况）。
+#: 与 ``backend_B/core/vitals.py`` 的 ``VITALS_NOTE`` 逐字相同 ——
+#: C 不许自己发明一句更顺口的免责声明。
+VITALS_FALLBACK_NOTE = "视觉测量，仅供参考，非医疗结论"
+
+
+def _vitals_slot(vitals: dict, key: str, unit: str) -> str:
+    """一个数值槽：有值 →「72 bpm」这样的带单位串；没有 → 破折号（**不是 0**）。"""
+    value = vitals.get(key)
+    if value is None:
+        return NO_INDEX
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return NO_INDEX
+    return f"{number:.0f} {unit}"
+
+
+def format_vitals_values(vitals: Optional[dict]) -> str:
+    """数值行：「72 bpm · 16 次/分」。缺哪个补哪个的破折号 —— 永不显示成 0。"""
+    if not isinstance(vitals, dict):
+        return f"{NO_INDEX} · {NO_INDEX}"
+    return f"{_vitals_slot(vitals, 'hr', 'bpm')} · {_vitals_slot(vitals, 'rr', '次/分')}"
+
+
+def format_vitals_detail(vitals: Optional[dict]) -> str:
+    """细节行。三种情况要说得**不一样**：
+
+    - 从没收到过报文 →「未提供」（B 没下发，可能是旧版本）；
+    - 收到了但 hr/rr 都是 None →「未检出」（A 在测，但窗口/画质不够）；
+    - 有值 → B 给的免责声明原文（缺字段时用逐字相同的兜底）。
+    """
+    if not isinstance(vitals, dict):
+        return VITALS_NOT_DELIVERED
+    if vitals.get("hr") is None and vitals.get("rr") is None:
+        return VITALS_NOT_DETECTED
+    note = str(vitals.get("note") or "").strip()
+    return note or VITALS_FALLBACK_NOTE
 
 
 # --------------------------------------------------------------------------

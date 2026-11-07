@@ -31,8 +31,10 @@ from PyQt5.QtWidgets import QFrame, QHBoxLayout, QWidget
 from ui.camera import CameraPane
 from ui.window import FaceWindow
 
-#: 分隔线颜色。两栏都是纯黑底，没有这条线就看不出哪里是分界。
-DIVIDER_COLOR = "#3a3a3a"
+#: 分隔线颜色。两栏都是黑底（右栏带了极轻的纵向渐变），没有这条线
+#: 就看不出哪里是分界。比两栏的底色都亮一档，但压在 0x33 档 ——
+#: 是"分界"，不是"边框"。
+DIVIDER_COLOR = "#333338"
 
 
 class SplitWindow(QWidget):
@@ -66,7 +68,9 @@ class SplitWindow(QWidget):
         # 所以脸的 _refresh_title 那一套在分栏模式下看不到 —— 通道状态因此
         # 也显示在右栏的文本块里（见 display_text.format_link_block）。
         self.setWindowTitle("居家陪伴机器人")
-        self.resize(1440, 600)
+        # 默认开在 2:1 高宽（16:9 投影/大屏友好）：右栏文本块变高之后，
+        # 600px 高会让画面框被压得太扁。
+        self.resize(1440, 720)
 
     # ------------------------------------------------------------------
 
@@ -94,6 +98,14 @@ class SplitWindow(QWidget):
 
     def set_vai(self, message: Optional[dict]) -> None:
         self._camera.set_vai(message)
+
+    def set_vitals(self, message: Optional[dict]) -> None:
+        """心率 / 呼吸展示报文只转发给右栏 —— 左栏那张脸**不认**体征。
+
+        与 ``set_vai`` 同一条红线：``vitals`` 报文不带 ``state`` 字段，
+        它只是右栏的另一行数字，绝不新增状态源。
+        """
+        self._camera.set_vitals(message)
 
     def note_message(self, text: str) -> None:
         """只进 HUD，不上屏 —— 右栏**不是**聊天记录区（需求原话：只展示表情）。"""

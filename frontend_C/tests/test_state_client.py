@@ -162,8 +162,10 @@ class Recorder:
     def __init__(self) -> None:
         self.states: list[tuple[str, str, str]] = []
         self.vais: list[dict] = []
+        self.vitals: list[dict] = []
         self.replies: list[dict] = []
         self.proactives: list[dict] = []
+        self.emergencies: list[dict] = []
         self.links: list[tuple[str, bool]] = []
         self._event = threading.Event()
         self._lock = threading.Lock()
@@ -178,6 +180,11 @@ class Recorder:
             self.vais.append(msg)
         self._event.set()
 
+    def on_vitals(self, msg: dict) -> None:
+        with self._lock:
+            self.vitals.append(msg)
+        self._event.set()
+
     def on_reply(self, msg: dict) -> None:
         with self._lock:
             self.replies.append(msg)
@@ -186,6 +193,11 @@ class Recorder:
     def on_proactive(self, msg: dict) -> None:
         with self._lock:
             self.proactives.append(msg)
+        self._event.set()
+
+    def on_emergency(self, msg: dict) -> None:
+        with self._lock:
+            self.emergencies.append(msg)
         self._event.set()
 
     def on_link(self, source: str, connected: bool) -> None:
@@ -210,6 +222,28 @@ class Recorder:
         while time.monotonic() < deadline:
             with self._lock:
                 if len(self.vais) >= count:
+                    return True
+            self._event.wait(0.05)
+            self._event.clear()
+        return False
+
+    def wait_for_vitals(self, count: int = 1, timeout: float = TIMEOUT) -> bool:
+        """等体征展示报文攒够 ``count`` 条。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if len(self.vitals) >= count:
+                    return True
+            self._event.wait(0.05)
+            self._event.clear()
+        return False
+
+    def wait_for_emergency(self, count: int = 1, timeout: float = TIMEOUT) -> bool:
+        """等紧急事件报文攒够 ``count`` 条。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if len(self.emergencies) >= count:
                     return True
             self._event.wait(0.05)
             self._event.clear()
@@ -243,8 +277,10 @@ def build_link(recorder: Recorder, port: int, status_port: int | None = None) ->
         status_port=status_port,
         on_state=recorder.on_state,
         on_vai=recorder.on_vai,
+        on_vitals=recorder.on_vitals,
         on_reply=recorder.on_reply,
         on_proactive=recorder.on_proactive,
+        on_emergency=recorder.on_emergency,
         on_link=recorder.on_link,
         reconnect_initial=0.1,
         reconnect_max=0.3,
@@ -587,6 +623,97 @@ class TestVaiReception(LinkTestCase):
         self.server.send_json({"type": "error", "message": "模块 B 内部错误"})
         self.server.send_state(STATE_SAD)
         self.assertTrue(self.recorder.wait_for_states(1))
+
+
+class TestVitalsReception(LinkTestCase):
+    """心率 / 呼吸展示报文：与 vai 同一条红线 —— **只派发，绝不碰状态**。
+
+    ``hr`` 看着最像"该驱动点什么"的数字。一旦有人把它接到表情上（比如
+    "心率高了就切 sad"），体征就变成第二个状态源 —— 所以这里用**同一个
+    连接**同时喂 vitals 与 state，断言状态序列只由后者决定。
+    """
+
+    VITALS = {
+        "type": "vitals",
+        "hr": 72,
+        "rr": 16.0,
+        "ibi_ms": [833, 841, 828],
+        "note": "视觉测量，仅供参考，非医疗结论",
+        "timestamp": 1.0,
+    }
+
+    def test_vitals_is_dispatched_with_every_field_intact(self):
+        """整条报文原样交给上层 —— 挑字段是 display_text 的事。"""
+        self.start_link()
+        self.server.send_json(self.VITALS)
+        self.assertTrue(self.recorder.wait_for_vitals())
+        self.assertEqual(self.recorder.vitals[0], self.VITALS)
+
+    def test_vitals_does_not_change_the_expression(self):
+        self.start_link()
+        self.server.send_json(self.VITALS)
+        self.assertTrue(self.recorder.wait_for_vitals())
+        time.sleep(0.2)
+        self.assertEqual(self.recorder.states, [])
+
+    def test_a_stray_state_field_in_vitals_is_still_not_a_state(self):
+        """就算报文里混进了 ``state`` 字段，也不许它改表情。"""
+        self.start_link()
+        self.server.send_json({**self.VITALS, "state": STATE_SAD})
+        self.assertTrue(self.recorder.wait_for_vitals())
+        self.server.send_state(STATE_TIRED)
+        self.assertTrue(self.recorder.wait_for_states(1))
+        self.assertEqual(self.recorder.states, [(STATE_TIRED, "", SOURCE_CHAT)])
+
+    def test_null_hr_is_passed_through_as_none(self):
+        """``hr: null`` = 没检出（窗口未满），不是心率 0。传输层不许改成 0。"""
+        self.start_link()
+        self.server.send_json({**self.VITALS, "hr": None, "rr": None})
+        self.assertTrue(self.recorder.wait_for_vitals())
+        self.assertIsNone(self.recorder.vitals[0]["hr"])
+        self.assertIsNone(self.recorder.vitals[0]["rr"])
+
+    def test_malformed_vitals_does_not_kill_the_thread(self):
+        self.start_link()
+        self.server.send_json({"type": "vitals", "hr": "很快", "ibi_ms": 833})
+        self.assertTrue(self.recorder.wait_for_vitals())
+        self.server.send_state(STATE_SAD)
+        self.assertTrue(self.recorder.wait_for_states(1), "线程在脏报文之后死了")
+
+
+class TestEmergencyReception(LinkTestCase):
+    """紧急事件报文（emergency/crisis）：整条原样投给上层弹窗。
+
+    这不是普通应答 —— C 端要拿它弹醒目警示。它**不该**改表情，
+    也不该被去重逻辑吃掉。
+    """
+
+    EMERGENCY = {
+        "type": "emergency",
+        "kind": "emergency",
+        "text": "救命啊快来人",
+        "timestamp": 1.0,
+    }
+
+    def test_emergency_is_dispatched_intact(self):
+        self.start_link()
+        self.server.send_json(self.EMERGENCY)
+        self.assertTrue(self.recorder.wait_for_emergency())
+        self.assertEqual(self.recorder.emergencies[0], self.EMERGENCY)
+
+    def test_emergency_does_not_change_the_expression(self):
+        self.start_link()
+        self.server.send_json(self.EMERGENCY)
+        self.assertTrue(self.recorder.wait_for_emergency())
+        time.sleep(0.2)
+        self.assertEqual(self.recorder.states, [])
+
+    def test_crisis_kind_passes_through(self):
+        self.start_link()
+        self.server.send_json({**self.EMERGENCY, "kind": "crisis",
+                               "text": "我不想活了"})
+        self.assertTrue(self.recorder.wait_for_emergency())
+        self.assertEqual(self.recorder.emergencies[0]["kind"], "crisis")
 
 
 class TestStatusChannel(unittest.TestCase):

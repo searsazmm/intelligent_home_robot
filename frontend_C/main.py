@@ -78,6 +78,17 @@ _SAMPLE_VAI = {
     "note": "研究趋势（非认知专注）；日常参考，非医疗结论",
 }
 
+#: ``--screenshot`` 导出右栏用的**样例**体征报文。``note`` 逐字照抄 B 侧
+#: 的 VITALS_NOTE（core/vitals.py）—— 兜底时自己编一句更顺口的说法
+#: 等于替它下医疗结论。
+_SAMPLE_VITALS = {
+    "type": "vitals",
+    "hr": 72,
+    "rr": 16.0,
+    "ibi_ms": [833, 841, 828],
+    "note": "视觉测量，仅供参考，非医疗结论",
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -97,12 +108,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--also-status", action="store_true",
                         help="额外连 8001 状态通道（默认只连 8002，单一状态源更稳）")
 
-    parser.add_argument("--font-size", type=int, default=None,
-                        help="颜文字字号（磅）。默认按窗口高度自适应")
     parser.add_argument("--fullscreen", action="store_true",
                         help="无边框全屏。ESC 退出全屏，Q 退出程序")
     parser.add_argument("--debug-hud", action="store_true",
                         help="左上角叠一行调试灰字（默认关，只供联调）")
+    parser.add_argument("--font-size", type=int, default=None, metavar="N",
+                        help="颜文字字号（磅）。默认按窗口高度自适应、按半宽钳制；"
+                             "显式给值时不做任何钳制")
     parser.add_argument("--log-file", default=None,
                         help="同时写日志到文件（全屏时看不到控制台，建议加上）")
     parser.add_argument("--log-level", default="INFO",
@@ -209,14 +221,17 @@ def _run_screenshots(window, dump_window, out_dir: str, camera=None) -> int:
 
     if camera is not None:
         pane_path = os.path.abspath(os.path.join(out_dir, "pane.png"))
-        pane = camera.snapshot(vai=_SAMPLE_VAI, state="tired")
+        pane = camera.snapshot(vai=_SAMPLE_VAI, state="tired",
+                               vitals=_SAMPLE_VITALS)
         if pane.save(pane_path, "PNG"):
             written.append(pane_path)
             logger.info("已导出 %s", pane_path)
 
     print(f"\n共导出 {len(written)} 张到 {os.path.abspath(out_dir)}")
-    print("请**肉眼**确认：背景纯黑、颜文字是白色且没有任何方块（豆腐块）；")
-    print("pane.png 里的中文、进度条方块（■ □）与破折号也都要能看清。")
+    print("请**肉眼**确认：四角纯黑、四态白色颜文字区分明显（笑脸/哭泣/")
+    print("疲惫闭眼/走神问号）、眨眼帧与睁眼帧不同；状态氛围光颜色正确。")
+    print("pane.png 里的中文、圆角进度条、状态胶囊、心率 / 呼吸区块、破折号")
+    print("与各区块颜色也要能看清。")
     return EXIT_OK
 
 
@@ -257,7 +272,8 @@ def main(argv: list[str] | None = None) -> int:
     # 输出就不再可复现，而"每次导出的图都一样"正是它们存在的意义。
     if args.dump_glyphs or args.screenshot:
         from ui.camera import CameraPane
-        window = FaceWindow(family, font_size=args.font_size, debug_hud=args.debug_hud)
+        window = FaceWindow(family, font_size=args.font_size,
+                            debug_hud=args.debug_hud)
         dump_window = GlyphDumpWindow(family)
         if args.screenshot:
             return _run_screenshots(window, dump_window, args.screenshot,
@@ -282,7 +298,8 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 主窗口：默认左右分栏，--no-camera 退回单脸 ----
     camera = None
     stream_link = None
-    face = FaceWindow(family, font_size=args.font_size, debug_hud=args.debug_hud)
+    face = FaceWindow(family, font_size=args.font_size,
+                      debug_hud=args.debug_hud)
     if args.no_camera:
         window = face
         logger.info("单脸模式（--no-camera）：只显示表情，不显示画面栏")
@@ -303,12 +320,20 @@ def main(argv: list[str] | None = None) -> int:
     bridge.linkChanged.connect(window.set_link)
     bridge.replyArrived.connect(window.note_message)
     bridge.proactiveArrived.connect(window.note_message)
+    # 紧急事件弹窗连到 face 的绑定方法（face 在单脸/分栏两种模式下都在），
+    # Qt 据此用排队连接把调用切回 GUI 线程 —— 绝不能在 socket 线程里弹窗。
+    bridge.emergencyArrived.connect(face.show_emergency)
+    # 走神确认连到脸：B 确认走神（VAI 持续偏低到点）时左边的小表情要变。
+    # 与 emergency 同理，face 的绑定方法保证槽在 GUI 线程执行。
+    # 单脸/分栏两种模式下 face 都存在，所以这条连接不挂在 camera 判断里。
+    bridge.distractedArrived.connect(face.set_distracted)
     if camera is not None:
         # 右栏的状态文字要带判定原因。两条信号都会打到 camera 上：
         # stateChanged 先发（只带状态），stateReasonChanged 后发（带原因），
         # Qt 的排队投递在同一接收线程里是先进先出，所以最终留下的是带原因的那条。
         bridge.stateReasonChanged.connect(camera.set_state)
         bridge.vaiArrived.connect(camera.set_vai)
+        bridge.vitalsArrived.connect(camera.set_vitals)
 
     # ---- 画面通道：A 侧 MJPEG（真的给 --stream-url 了才拉）----
     # ⚠️ 顺序：**先接信号，再起线程**。反过来的话，第一帧连接状态可能在
@@ -340,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
         window.show()
 
     window.set_state(DEFAULT_STATE)   # 初始就是 normal（api_doc §4.3）
-    logger.info("字体=%s 字号=%s", family, args.font_size or "自适应")
+    logger.info("HUD 字体=%s", family)
 
     try:
         code = app.exec_()
@@ -398,8 +423,21 @@ def _build_link(args, bridge):
 
         这里**不做任何解释**（不挑字段、不算文案）—— 显示什么由
         ``c_core/display_text.py`` 决定，而它是可以脱离 Qt 单测的。
+
+        唯一的例外是走神字段：B 端确认走神（``distracted`` 为真，与主动
+        开口同一本判定账）要单独转发给**左栏的脸**（用户点名要求走神时
+        表情要变）。仍不做解释 —— 只是布尔转发，True/False 原样过去。
         """
         bridge.vaiArrived.emit(msg)
+        bridge.distractedArrived.emit(bool(msg.get("distracted")))
+
+    def emit_vitals(msg: dict) -> None:
+        """心率 / 呼吸展示报文：整条原样投到 GUI 线程（理由同 emit_vai）。"""
+        bridge.vitalsArrived.emit(msg)
+
+    def emit_emergency(msg: dict) -> None:
+        """紧急事件报文：整条原样投到 GUI 线程，由 face 弹窗（理由同 emit_vai）。"""
+        bridge.emergencyArrived.emit(msg)
 
     def emit_link(source: str, connected: bool) -> None:
         """连接状态变化 → GUI 线程。
@@ -412,13 +450,19 @@ def _build_link(args, bridge):
         状态那条有兜底（``state_client`` 断线回落 normal），专注度没有，
         所以补在这里。**只认对话通道**：``--also-status`` 下 8001 掉了
         不影响 8002 上的专注度，那时不该把它清掉。
+
+        心率 / 呼吸同理 —— 同样是一栏"当下的数值"，同样在对话通道断开时
+        作废，不然屏幕上会挂着一份看起来像活着的旧体征。
         """
         bridge.linkChanged.emit(source, connected)
         if not connected and source == SOURCE_CHAT:
             # 这一行是为了"怎么看出来"：右栏只是从 `专注度 VAI 63.5` 变成
             # `专注度 VAI ——`，两者都不报错，没有日志就只能靠盯屏幕。
-            logger.info("对话通道已断开，右栏专注度作废（改显示未提供）")
+            logger.info("对话通道已断开，右栏专注度与体征作废（改显示未提供）")
             bridge.vaiArrived.emit(None)
+            bridge.vitalsArrived.emit(None)
+            # 走神叠加一并解除：脸回到状态机表情（跟报文断供同一道理）
+            bridge.distractedArrived.emit(False)
 
     return BackendLink(
         host=args.host,
@@ -426,9 +470,11 @@ def _build_link(args, bridge):
         status_port=args.status_port if args.also_status else None,
         on_state=emit_state,
         on_vai=emit_vai,
+        on_vitals=emit_vitals,
         on_link=emit_link,
         on_reply=lambda msg: bridge.replyArrived.emit(str(msg.get("text") or "")),
         on_proactive=lambda msg: bridge.proactiveArrived.emit(str(msg.get("text") or "")),
+        on_emergency=emit_emergency,
     )
 
 

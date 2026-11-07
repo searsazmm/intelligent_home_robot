@@ -9,16 +9,16 @@
     QT_QPA_PLATFORM=windows python tests/test_split_window.py
 
 与 ``tests/test_window.py`` 同一套两档约定：**结构**类断言在任何平台都跑
-（控件存在、转发到位、字号被钳制、绘制不崩），**字形**类断言只在字体库
+（控件存在、转发到位、绘制不崩），**依赖字体度量/字形**的断言只在字体库
 非空的平台跑（离屏平台下 ``QFontDatabase().families()`` 是 0 个，
 Qt 一个字都画不出来，那时候断言"有白色像素"必然失败且误导）。
 
 --------------------------------------------------------------------------
 这个文件真正在守的两件事
 --------------------------------------------------------------------------
-1. **分栏之后左栏的字号必须被宽度钳住**（``ui/window.py`` 的
-   ``_largest_fitting_point_size``）。这是分栏带来的唯一排版风险：最长的那几个
-   颜文字会在半宽的栏里横向溢出，而且只在个别表情上出现，一闪而过。
+1. **分栏之后左栏的颜文字必须被半宽的栏放得下**（``ui/window.py`` 的
+   ``_largest_fitting_point_size`` 按宽度钳字号）。这是分栏带来的唯一
+   排版风险：最宽的表情（``(∪.∪ )...zzz``）横向顶出栏外，被右栏盖住。
 2. **右栏的专注度不许反过来影响左栏那张脸**（C 侧的"第二状态源"红线，
    对应 B 侧 ``vai`` 报文刻意不带 ``state`` 字段）。
 """
@@ -37,6 +37,7 @@ _FRONTEND_C = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _FRONTEND_C)
 
 from c_core.expressions import (
+    STATE_ABSENT,
     STATE_NORMAL,
     STATE_SAD,
     STATE_TIRED,
@@ -110,6 +111,14 @@ VAI = {
     "note": "研究趋势（非认知专注）；日常参考，非医疗结论",
 }
 
+VITALS = {
+    "type": "vitals",
+    "hr": 72,
+    "rr": 16.0,
+    "ibi_ms": [833, 841, 828],
+    "note": "视觉测量，仅供参考，非医疗结论",
+}
+
 
 @unittest.skipIf(QT_IMPORT_ERROR is not None, f"PyQt5 不可用：{QT_IMPORT_ERROR}")
 class SplitWindowTestCase(unittest.TestCase):
@@ -164,7 +173,11 @@ class TestForwarding(SplitWindowTestCase):
     """转发必须成对：一条更新落到两栏上，而不是只落到一栏。"""
 
     def test_set_state_reaches_both(self):
-        self.window.set_state(STATE_SAD, "检测到低落")
+        # SplitWindow.set_state 走 FaceWindow.set_state（带确认窗口）。
+        # 这里直接调 _apply_state 绕过确认——本条测的是"转发到两栏"，
+        # 不是确认逻辑。SplitWindow 的转发本身不丢票、不增票。
+        self.window._face._apply_state(STATE_SAD)
+        self.pane.set_state(STATE_SAD, "检测到低落")   # pane 不带确认窗口
         self.assertEqual(self.face._state, STATE_SAD)
         self.assertEqual(self.pane._state, STATE_SAD)
         self.assertEqual(self.pane._reason, "检测到低落")
@@ -177,6 +190,11 @@ class TestForwarding(SplitWindowTestCase):
     def test_set_vai_reaches_the_right_pane(self):
         self.window.set_vai(VAI)
         self.assertEqual(self.pane._vai, VAI)
+
+    def test_set_vitals_reaches_the_right_pane(self):
+        """体征报文与 vai 一样只走右栏 —— 左栏那张脸不认心率。"""
+        self.window.set_vitals(VITALS)
+        self.assertEqual(self.pane._vitals, VITALS)
 
     def test_note_message_only_touches_the_hud(self):
         """回复文本只进左栏的调试 HUD。
@@ -210,18 +228,104 @@ class TestNoSecondStateSource(SplitWindowTestCase):
         self.window.set_vai({**VAI, "state": STATE_SAD})
         self.assertEqual(self.face._state, STATE_NORMAL)
 
+    def test_vitals_do_not_change_the_face(self):
+        """心率 / 呼吸**不许**驱动表情 —— 它是右栏的另一行数字，不是状态源。"""
+        self.window.set_state(STATE_TIRED)
+        before_state = self.face._state
+        before_index = self.face._index
+
+        self.window.set_vitals(VITALS)
+        self.window.set_vitals({**VITALS, "hr": 180, "rr": 40.0})
+        self.window.set_vitals({**VITALS, "hr": None, "rr": None})
+
+        self.assertEqual(self.face._state, before_state)
+        self.assertEqual(self.face._index, before_index)
+
+    def test_vitals_with_a_stray_state_field_still_do_not_change_the_face(self):
+        """就算体征报文里混进了 ``state``，左栏也不许跟着变。"""
+        self.window.set_state(STATE_NORMAL)
+        self.window.set_vitals({**VITALS, "state": STATE_SAD})
+        self.assertEqual(self.face._state, STATE_NORMAL)
+
     def test_face_expression_set_is_unchanged(self):
         """表情仍然只由四态决定（api_doc §4.2 不许自造）。"""
         self.window.set_vai(VAI)
         self.assertEqual(len(expressions_for(self.face._state)), 4)
 
 
+class TestDistractedFace(SplitWindowTestCase):
+    """走神确认时左栏的小表情要变 —— 用户点名要求的唯一 vai→脸授权例外。
+
+    边界三条：只换表情组（用现成的「走神/无人」组，**不新增样式**）；
+    ``_state`` 仍是协议四态（人还在画面里，state=normal 是对的）；
+    疲惫/低落等状态机表情优先于走神叠加。
+    """
+
+    def test_distracted_swaps_to_wander_faces(self):
+        self.face._apply_state(STATE_NORMAL)
+        self.face.set_distracted(True)
+        self.assertEqual(self.face._state, STATE_NORMAL)      # 状态不破
+        self.assertEqual(self.face._faces(), expressions_for(STATE_ABSENT))
+
+    def test_distracted_clear_returns_to_state_faces(self):
+        self.face._apply_state(STATE_NORMAL)
+        self.face.set_distracted(True)
+        self.face.set_distracted(False)
+        self.assertEqual(self.face._faces(), expressions_for(STATE_NORMAL))
+
+    def test_tired_state_wins_over_distracted(self):
+        """疲惫时人可能同样低专注，但疲惫表情更贴近当下 —— 状态机优先。"""
+        self.face._apply_state(STATE_TIRED)
+        self.face.set_distracted(True)
+        self.assertEqual(self.face._faces(), expressions_for(STATE_TIRED))
+
+    def test_repeated_value_does_not_restart(self):
+        """心跳重发同一走神值不许让脸闪 —— 与 set_state 的去重同一条规矩。"""
+        self.face._apply_state(STATE_NORMAL)
+        self.face.set_distracted(True)
+        self.face._index = 2
+        self.face.set_distracted(True)
+        self.assertEqual(self.face._index, 2)
+
+
+class TestDistractedPill(SplitWindowTestCase):
+    """走神时右栏状态胶囊要有可见变化 —— 但 state 本身仍是协议四态。
+
+    人还坐在画面里，视觉状态机说 normal 是**对的**；「走神」是 B 端
+    VAI 层的确认（走神才提醒、确认才下发），叠加在胶囊的原因括号里。
+    """
+
+    def _pill_text(self):
+        rows = self.pane._block_rows(self.pane._text_point_size())
+        pills = [r["text"] for r in rows if r["kind"] == "pill"]
+        self.assertEqual(len(pills), 1)
+        return pills[0]
+
+    def test_pill_says_distracted_when_b_says_so(self):
+        self.window.set_state(STATE_NORMAL)
+        self.window.set_vai({**VAI, "distracted": True})
+        self.assertIn("走神中", self._pill_text())
+
+    def test_pill_unchanged_without_the_flag(self):
+        self.window.set_state(STATE_NORMAL)
+        self.window.set_vai(VAI)
+        self.assertNotIn("走神中", self._pill_text())
+
+    def test_pill_unchanged_when_state_is_not_normal(self):
+        """sad/tired 各有自己的话要说，不被走神覆盖 —— 走神叠加只服务 normal。"""
+        self.window.set_state(STATE_SAD)
+        self.window.set_vai({**VAI, "distracted": True})
+        self.assertNotIn("走神中", self._pill_text())
+        self.assertIn("情绪低落", self._pill_text())
+
+
+@unittest.skipUnless(has_real_fonts(), skip_reason())
 class TestFontWidthClamp(SplitWindowTestCase):
     """分栏之后左栏只剩半宽：字号必须同时受宽度约束。
 
     断言一律按**目的**（最宽的颜文字真的放得下）而不是某个魔数 ——
-    第一版实现用的是 ``width / 7.0`` 这个手调系数，实测偏大 50%，
-    测试要是也照抄那个系数就一起错了。
+    手调系数 ``width / 7.0`` 实测偏大 50%，测试照抄系数就会一起错。
+    依赖字体的真实度量，离屏平台（字体库为空）整类跳过。
     """
 
     def measured_width(self, point_size: int) -> int:
@@ -232,13 +336,7 @@ class TestFontWidthClamp(SplitWindowTestCase):
         return max(metrics.horizontalAdvance(face) for face in all_faces())
 
     def test_a_wide_window_is_still_sized_by_height(self):
-        """字号就是 ``min(按高度, 按宽度)`` —— 分栏只在"窄到会溢出"时才起作用。
-
-        注意不能写死"1080p 下等于 ``height*0.16``"：最宽的颜文字要多少像素
-        是**本机字体**的属性（实测开发机的 Microsoft YaHei UI 约 11px/磅，
-        而离屏平台的回退字体约 16.6px/磅 —— 那个字体下 1920px 根本放不下
-        172 磅）。所以这里按规则本身分两支断言，两支各自钉住一个目的。
-        """
+        """字号就是 ``min(按高度, 按宽度)`` —— 分栏只在"窄到会溢出"时才起作用。"""
         width, height = 1920, 1080
         self.face.resize(width, height)
         size = self.face._font_point_size()
@@ -275,8 +373,8 @@ class TestFontWidthClamp(SplitWindowTestCase):
         self.assertLessEqual(self.measured_width(size), 719)
 
     def test_the_floor_still_wins_in_an_absurdly_narrow_pane(self):
-        """窗口被压到极窄时字号不许变成 0（会画不出来），也不许小于 24pt ——
-        适老化要求字大，宁可溢出也不能小到看不清。"""
+        """窗口被压到极窄时字号不许小于 24pt —— 适老化要求字大，
+        宁可溢出也不能小到看不清。"""
         self.face.resize(60, 600)
         self.assertGreaterEqual(self.face._font_point_size(), 24)
 
@@ -326,7 +424,28 @@ class TestCameraPaneRendering(unittest.TestCase):
                       "valid_seconds": "很久", "note": 123})
         pane.set_vai("这不是 dict")
         pane.set_state(None)
+        pane.set_vitals({"hr": "很快", "rr": None, "note": 123})
+        pane.set_vitals("这也不是 dict")
         self.assertFalse(pane.snapshot(600, 400).isNull())
+
+    def test_paints_all_three_vitals_situations(self):
+        """体征的三种显示情形都要画得出来：没收到 / 收到但没检出 / 有值。
+
+        后两种在界面上必须**不一样**（「未提供」vs「未检出」vs「72 bpm」），
+        这里至少先钉住：三种情况下渲染都不崩、尺寸都对。
+        """
+        situations = (
+            ("never-received", None),
+            ("received-but-none", {**VITALS, "hr": None, "rr": None}),
+            ("has-values", VITALS),
+        )
+        for name, payload in situations:
+            with self.subTest(situation=name):
+                pane = CameraPane(_family)
+                self.addCleanup(pane.close)
+                pane.set_vitals(payload)
+                pixmap = pane.snapshot(600, 400)
+                self.assertFalse(pixmap.isNull())
 
     def test_link_labels_cover_the_stream_channel(self):
         """``stream`` 必须在标签表里，否则标题栏/HUD 会打出英文原名。"""

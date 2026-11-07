@@ -39,9 +39,10 @@
 线程铁律（与 ``ui/window.py`` 的 ``StateBridge`` 同一条）
 --------------------------------------------------------------------------
 本类的方法**只允许在 GUI 线程里被调用**。socket 线程来的数据一律先经
-``StateBridge`` 的 ``vaiArrived`` / ``stateReasonChanged`` / ``linkChanged``
-信号排队回 GUI 线程，或经 ``FrameSlot`` 这一道单槽，再由本类在 GUI 线程里
-取走。绝不能在 socket 线程里直接调 ``set_vai()`` 或 ``pull_frame()``。
+``StateBridge`` 的 ``vaiArrived`` / ``vitalsArrived`` / ``stateReasonChanged`` /
+``linkChanged`` 信号排队回 GUI 线程，或经 ``FrameSlot`` 这一道单槽，
+再由本类在 GUI 线程里取走。绝不能在 socket 线程里直接调 ``set_vai()``
+或 ``pull_frame()``。
 """
 
 from __future__ import annotations
@@ -49,11 +50,15 @@ from __future__ import annotations
 import logging
 from typing import Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import QRectF, Qt, QTimer
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPixmap
+from PyQt5.QtCore import QPointF, QRectF, Qt, QTimer
+from PyQt5.QtGui import (
+    QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath,
+    QPen, QPixmap,
+)
 from PyQt5.QtWidgets import QWidget
 
 from c_core import display_text as text_lib
+from c_core import theme
 from c_core.expressions import DEFAULT_STATE
 from c_core.mjpeg_client import DEFAULT_CAMERA_FPS, FrameSlot, clamp_fps
 
@@ -71,13 +76,23 @@ TEXT_WIDTH_DIVISOR = 34.0
 MIN_TEXT_POINT = 12
 MAX_TEXT_POINT = 26
 
-#: 灰色（标题、通道状态、免责声明这类次要信息）
-GREY = QColor(140, 140, 140)
-DIM = QColor(100, 100, 100)
+# ---- 颜色（色值全部来自 c_core/theme.py —— 与左栏状态光同一套主题） ----
+GREY = QColor(*theme.hex_to_rgb(theme.TEXT_MUTED))
+DIM = QColor(*theme.hex_to_rgb(theme.TEXT_FAINT))
+BODY = QColor(*theme.hex_to_rgb(theme.TEXT_PRIMARY))
+SOFT = QColor(*theme.hex_to_rgb(theme.TEXT_SECONDARY))
+ACCENT_VAI = QColor(*theme.hex_to_rgb(theme.ACCENT_VAI))
+TRACK = QColor(*theme.hex_to_rgb(theme.TRACK))
+TRACK_BORDER = QColor(*theme.hex_to_rgb(theme.TRACK_BORDER))
+PANEL_BORDER = QColor(*theme.hex_to_rgb(theme.PANEL_BORDER))
+LIVE_OK = QColor(*theme.hex_to_rgb(theme.LIVE_OK))
+LIVE_BAD = QColor(*theme.hex_to_rgb(theme.LIVE_BAD))
+BG_TOP = QColor(*theme.hex_to_rgb(theme.BG_TOP))
 
 
-def _line_height(metrics: QFontMetrics) -> int:
-    return metrics.height()
+def _accent_qcolor(state: object) -> QColor:
+    """状态 → 主题色 QColor（胶囊、光晕等处共用，与左栏同源）。"""
+    return QColor(*theme.hex_to_rgb(theme.state_accent(state)))
 
 
 class CameraPane(QWidget):
@@ -101,6 +116,7 @@ class CameraPane(QWidget):
         self._stream_planned = stream_url is not None
 
         self._vai: Optional[dict] = None
+        self._vitals: Optional[dict] = None
         self._state = DEFAULT_STATE
         self._reason = ""
         self._links: Dict[str, bool] = {}
@@ -200,6 +216,18 @@ class CameraPane(QWidget):
         self._vai = message if isinstance(message, dict) else None
         self.update()
 
+    def set_vitals(self, message: Optional[dict]) -> None:
+        """收到 B 的体征展示报文（``{"type":"vitals", ...}``）。
+
+        与 ``set_vai`` 同一条红线：**不驱动表情** —— 报文不带 ``state``
+        字段，心率呼吸只是右栏的另一行数字。
+
+        ``None`` 是合法输入 —— 表示"从来没收到过"，界面显示「未提供」，
+        与"收到了但 hr/rr 都是 None"（A 明确说没检出）分开显示。
+        """
+        self._vitals = message if isinstance(message, dict) else None
+        self.update()
+
     def set_state(self, state: str, reason: str = "") -> None:
         """状态文字。**注意与左栏那张脸是两条独立的更新路径**：
         脸只听 ``stateChanged``，文字听 ``stateReasonChanged``（带原因）。
@@ -247,57 +275,308 @@ class CameraPane(QWidget):
             return None
         return bool(self._links.get("stream"))
 
-    def _build_text_block(self, painter: QPainter, point: int) -> List[Tuple[str, QFont, QColor]]:
-        """文本块的每一行（文字、字体、颜色）。排版与绘制共用这一份定义。"""
-        big = QFont(self._family)
-        big.setPointSize(point)
+    def _index_value(self) -> Optional[float]:
+        """``vai.index`` → 0–100 的 float；没有分数或值非法 → ``None``。
+
+        与 ``display_text.format_index`` 同一条兜底脾气：类型乱来的字段按
+        "没有分数"处理，绝不让 GUI 线程为脏数据抛异常。进度条的实心段
+        长度与数值行的颜色都由它驱动。
+        """
+        if not isinstance(self._vai, dict):
+            return None
+        try:
+            return max(0.0, min(100.0, float(self._vai.get("index"))))
+        except (TypeError, ValueError):
+            return None
+
+    def _fonts(self, point: int) -> Tuple[QFont, QFont, QFont]:
+        """右栏的三档字体：区块标签（小）/ 数值（主角，加粗大字）/ 细节（小）。
+
+        排版层级是这次美化最重要的改动：原来整块只有两档字号、全部挤在一起，
+        现在数值独占一档并加粗 —— 隔着两三米，第一眼看到的就是它。
+        """
+        label = QFont(self._family)
+        label.setPointSize(max(10, int(point * 0.55)))
+        number = QFont(self._family)
+        number.setPointSize(max(20, min(40, int(point * 1.55))))
+        number.setBold(True)
         small = QFont(self._family)
         small.setPointSize(max(MIN_TEXT_POINT - 2, int(point * 0.62)))
+        return label, number, small
 
-        lines: List[Tuple[str, QFont, QColor]] = []
-        for row in text_lib.format_vai_lines(self._vai):
-            # 第一行（含数值）用主字号，条与细节行小一号 —— 数值是主角
-            lines.append((row, big if not lines else small,
-                          QColor(255, 255, 255) if not lines else QColor(200, 200, 200)))
-        lines.append(("", small, GREY))     # 空行 = 段落间隔
-        lines.append((text_lib.format_state_line(self._state, self._reason),
-                      big, QColor(255, 255, 255)))
-        lines.append((text_lib.format_note(self._vai), small, GREY))
+    def _block_rows(self, point: int) -> List[dict]:
+        """文本块的每一行（种类、内容、字体、颜色、占高）。
+
+        测量与绘制共用这一份定义（原来叫 ``_build_text_block``）——
+        先量总高把画面框的空间让出来，再逐行画，两步永远说同一套话。
+
+        文字内容仍然**全部**来自 :mod:`c_core.display_text` 的纯函数，
+        这里只负责排版与上色；文案一个字都不写死在本文件。
+        """
+        label_f, number_f, small_f = self._fonts(point)
+        label_m = QFontMetrics(label_f)
+        number_m = QFontMetrics(number_f)
+        small_m = QFontMetrics(small_f)
+        value = self._index_value()
+        vai = self._vai if isinstance(self._vai, dict) else None
+
+        rows: List[dict] = []
+        # ① 区块标签：青绿短竖条 + 小字（给整块一个视觉锚点）
+        rows.append({"kind": "label", "text": text_lib.VAI_LABEL,
+                     "font": label_f, "color": GREY,
+                     "height": label_m.height() + 6})
+        # ② 数值（主角）：有分数 → 白色大字；没有 → 灰色破折号（**不是 0**）
+        rows.append({"kind": "number",
+                     "text": text_lib.format_index(vai.get("index") if vai else None),
+                     "font": number_f,
+                     "color": BODY if value is not None else GREY,
+                     "height": number_m.height() + 2})
+        # ③ 图形化进度条（取代 ■□ 字符条，见 _paint_bar）
+        bar_h = max(10, min(14, int(self.width() * 0.014)))
+        rows.append({"kind": "bar", "value": value, "height": bar_h + 10})
+        # ④ 细节行（状态 / 模态 / 已测时长；没分数时是"为什么没分数"）
+        rows.append({"kind": "text", "text": text_lib.format_vai_detail(self._vai),
+                     "font": small_f, "color": GREY, "height": small_m.height()})
+        # ⑤ 状态胶囊：底色与左栏氛围光是同一个状态主题色（c_core.theme）。
+        #    走神叠加：B 在 vai 报文里明确说走神、而视觉状态还是 normal 时，
+        #    在原因括号里补「走神中」，并把胶囊色调切到走神紫 —— 用户要的
+        #    就是这个可见变化：人还坐在画面里（所以 state 仍是 normal，
+        #    协议四态不动），但状态行要能看出"走神了"。
+        reason = self._reason
+        accent = _accent_qcolor(self._state)
+        if vai and vai.get("distracted") and self._state == "normal":
+            reason = ("走神中" if not reason else f"走神中，{reason}")
+            accent = _accent_qcolor("absent")
+        rows.append({"kind": "gap", "height": SECTION_GAP})
+        rows.append({"kind": "pill",
+                     "text": text_lib.format_state_line(self._state, reason),
+                     "font": small_f,
+                     "accent": accent,
+                     "height": small_m.height() + 12})
+        # ⑤' 心率 / 呼吸：与专注度同构的 label + 数值 + 细节三行，插在
+        #     状态胶囊下面。同样**不驱动表情**（vitals 报文不带 state 字段，
+        #     见 set_vitals）；hr/rr 都没有时数值是灰色破折号，**不是 0**。
+        vitals = self._vitals if isinstance(self._vitals, dict) else None
+        has_vitals = vitals is not None and (
+            vitals.get("hr") is not None or vitals.get("rr") is not None
+        )
+        rows.append({"kind": "gap", "height": SECTION_GAP})
+        rows.append({"kind": "label", "text": text_lib.VITALS_LABEL,
+                     "font": label_f, "color": GREY,
+                     "height": label_m.height() + 6})
+        rows.append({"kind": "number",
+                     "text": text_lib.format_vitals_values(self._vitals),
+                     "font": number_f,
+                     "color": BODY if has_vitals else GREY,
+                     "height": number_m.height() + 2})
+        rows.append({"kind": "text", "text": text_lib.format_vitals_detail(self._vitals),
+                     "font": small_f, "color": GREY, "height": small_m.height()})
+        # ⑥ 免责声明（一个字不许改写 —— 兜底值也来自 display_text）
+        rows.append({"kind": "gap", "height": SECTION_GAP})
+        rows.append({"kind": "text", "text": text_lib.format_note(self._vai),
+                     "font": small_f, "color": DIM, "height": small_m.height()})
+        # ⑦ 通道行：彩色圆点 + 文字
         if self._links:
-            lines.append((text_lib.format_link_block(self._links), small, DIM))
-        return lines
+            rows.append({"kind": "gap", "height": max(6, SECTION_GAP // 2)})
+            rows.append({"kind": "links", "font": small_f,
+                         "height": small_m.height()})
+        return rows
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
         painter.setRenderHint(QPainter.TextAntialiasing, True)
-        painter.fillRect(self.rect(), Qt.black)
+
+        # 背景：纯黑里加一层极轻的纵向渐变 —— 是"黑里的层次"，不是灰底。
+        # 顶部 #0a0a0c 与左栏的状态光晕同为低亮度，两栏摆在一起不突兀。
+        bg = QLinearGradient(0.0, 0.0, 0.0, float(self.height()))
+        bg.setColorAt(0.0, BG_TOP)
+        bg.setColorAt(1.0, QColor(0, 0, 0))
+        painter.fillRect(self.rect(), bg)
 
         point = self._text_point_size()
 
         # 1) 先量文本块要多高 —— 画面框拿剩下的空间，而不是写死比例。
         #    写死 55% 的话，字号一变（窗口小、或演示机 DPI 不同）就会重叠。
-        block = self._build_text_block(painter, point)
-        block_height = 0
-        for text, font, _color in block:
-            block_height += _line_height(QFontMetrics(font)) if text else SECTION_GAP
-
+        rows = self._block_rows(point)
+        block_height = sum(row["height"] for row in rows)
         block_top = max(self.height() // 2, self.height() - MARGIN - block_height)
+        available = self.height() - MARGIN - block_top
+
+        # 空间不足时的优雅降级，两级：
+        #   ① 压段间距与装饰 padding（_compact_rows）；
+        #   ② 仍不够 → 缩字号重排一次（行高随字号缩，条与间距是定值，
+        #      所以重排后再补一轮 ① 收余量）。内容行一个不丢 ——
+        #      挤可以，免责声明 / 通道状态不能被挤出屏幕。
+        overflow = block_height - available
+        if overflow > 0:
+            self._compact_rows(rows, overflow)
+            block_height = sum(row["height"] for row in rows)
+            if block_height > available:
+                scaled = max(MIN_TEXT_POINT, int(point * available / block_height))
+                if scaled < point:
+                    rows = self._block_rows(scaled)
+                    block_height = sum(row["height"] for row in rows)
+                    self._compact_rows(rows, max(0.0, block_height - available))
+                    block_height = sum(row["height"] for row in rows)
+            block_top = max(self.height() // 2, self.height() - MARGIN - block_height)
+
         body_width = max(1, self.width() - 2 * MARGIN)
 
         # 2) 画面：有帧就画帧，没有就画占位
         box = QRectF(MARGIN, MARGIN, body_width, max(0, block_top - MARGIN - SECTION_GAP))
         if self._pixmap is not None and box.height() >= 8:
-            self._paint_frame(painter, box)
+            self._paint_frame(painter, box, point)
         else:
             self._paint_placeholder(painter, box, point)
 
         # 3) 文本块
-        self._paint_lines(painter, block, MARGIN, block_top)
+        self._paint_rows(painter, rows, body_width, block_top)
 
         painter.end()
 
-    def _paint_frame(self, painter: QPainter, box: QRectF) -> None:
+    @staticmethod
+    def _compact_rows(rows: List[dict], overflow: float) -> None:
+        """空间不足时按"先装饰后内容"的顺序压缩行高（就地修改 rows）。
+
+        压缩顺序：段间距（每段保底 2px）→ 标签 / 胶囊 / 进度条 / 数值行的
+        装饰性 padding（各让 8px）。数值、细节、免责声明、通道这些**内容
+        行的字体与文字一律不动** —— 挤可以，丢不行。``rows`` 同时供测量
+        与绘制使用，就地改完两边自动一致。
+        """
+        remaining = float(overflow)
+        for row in rows:
+            if remaining <= 0:
+                break
+            if row["kind"] == "gap" and row["height"] > 2:
+                cut = min(row["height"] - 2, remaining)
+                row["height"] -= cut
+                remaining -= cut
+        for row in rows:
+            if remaining <= 0:
+                break
+            if row["kind"] in ("label", "pill", "bar", "number"):
+                cut = min(8.0 if row["kind"] != "number" else 2.0, remaining)
+                row["height"] -= cut
+                remaining -= cut
+
+    def _paint_rows(self, painter: QPainter, rows: List[dict],
+                    body_width: int, top: int) -> None:
+        y = float(top)
+        for row in rows:
+            kind = row["kind"]
+            if kind == "gap":
+                y += row["height"]
+            elif kind == "label":
+                m = QFontMetrics(row["font"])
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(ACCENT_VAI)
+                painter.drawRoundedRect(QRectF(MARGIN, y + 1, 3, m.height() - 2),
+                                        1.5, 1.5)
+                painter.setFont(row["font"])
+                painter.setPen(row["color"])
+                painter.drawText(QRectF(MARGIN + 11, y, body_width - 11, m.height()),
+                                 int(Qt.AlignVCenter), row["text"])
+                y += row["height"]
+            elif kind in ("text", "number"):
+                m = QFontMetrics(row["font"])
+                painter.setFont(row["font"])
+                painter.setPen(row["color"])
+                painter.drawText(QRectF(MARGIN, y, body_width, m.height()),
+                                 int(Qt.AlignVCenter), row["text"])
+                y += row["height"]
+            elif kind == "bar":
+                self._paint_bar(painter, MARGIN, y + 5, body_width,
+                                row["height"] - 10, row["value"])
+                y += row["height"]
+            elif kind == "pill":
+                self._paint_pill(painter, y, row, body_width)
+                y += row["height"]
+            elif kind == "links":
+                self._paint_links(painter, y, row["font"])
+                y += row["height"]
+
+    def _paint_bar(self, painter: QPainter, x: float, y: float,
+                   width: float, height: float, value: Optional[float]) -> None:
+        """0–100 的图形化进度条。
+
+        取代 ``■□`` 字符条的两个理由：字符条的对齐与粗细取决于字体，
+        U+25A0 缺字形时会静默变豆腐块；圆角矩形 + 渐变在任何平台画出来
+        都一模一样，也更适合投影仪。
+
+        ``value is None``（没有分数）时**整条轨道全空** —— 空条加破折号，
+        和"低分"在视觉上不会混。这条语义与 ``display_text.format_index_bar``
+        一致；``value == 0`` 同样不画实心段（0 分就是空条，不是一个圆头）。
+        """
+        if width <= 0 or height <= 0:
+            return
+        radius = height / 2.0
+        painter.setPen(QPen(TRACK_BORDER, 1.0))
+        painter.setBrush(TRACK)
+        painter.drawRoundedRect(QRectF(x, y, width, height), radius, radius)
+        if value is None or value <= 0:
+            return
+        filled = max(height, width * (value / 100.0))   # 至少留一个圆头
+        fill = QRectF(x, y, min(filled, width), height)
+        grad = QLinearGradient(fill.topLeft(), fill.topRight())
+        grad.setColorAt(0.0, ACCENT_VAI)
+        grad.setColorAt(1.0, LIVE_OK)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(grad)
+        painter.drawRoundedRect(fill, radius, radius)
+
+    def _paint_pill(self, painter: QPainter, y: float, row: dict,
+                    body_width: int) -> None:
+        """状态胶囊：状态主题色的圆角底 + 白字。
+
+        底色与左栏那张脸背后的氛围光是**同一个颜色**（都来自
+        ``c_core.theme.STATE_ACCENTS``）—— 老人扫一眼右栏这个色块，
+        就知道左栏的表情为什么变了。两栏由同一条状态驱动，颜色也必须同源。
+        """
+        font = row["font"]
+        accent: QColor = row["accent"]
+        m = QFontMetrics(font)
+        h = float(row["height"])
+        w = min(float(body_width), m.horizontalAdvance(row["text"]) + 24.0)
+        radius = h / 2.0
+        bg = QColor(accent)
+        bg.setAlphaF(0.16)
+        border = QColor(accent)
+        border.setAlphaF(0.55)
+        painter.setPen(QPen(border, 1.0))
+        painter.setBrush(bg)
+        painter.drawRoundedRect(QRectF(MARGIN, y, w, h), radius, radius)
+        painter.setFont(font)
+        painter.setPen(BODY)
+        painter.drawText(QRectF(MARGIN + 12, y, w - 24, h),
+                         int(Qt.AlignVCenter), row["text"])
+
+    def _paint_links(self, painter: QPainter, y: float, font: QFont) -> None:
+        """通道行：彩色圆点 + 文字（文字仍来自 ``display_text.format_link_line``）。
+
+        圆点用颜色编码健康度 —— 绿 = 通，红 = 断。原来纯靠「通/断」两个字，
+        投影仪上一旦糊了就什么信息都没有；颜色加文字是冗余编码，丢一路
+        还剩一路。顺序沿用 ``format_link_block`` 的固定排序，不让它跳位置。
+        """
+        m = QFontMetrics(font)
+        painter.setFont(font)
+        order = ("chat", "status", "stream")
+        sources = ([s for s in order if s in self._links]
+                   + sorted(s for s in self._links if s not in order))
+        x = float(MARGIN)
+        cy = y + m.height() / 2.0
+        for source in sources:
+            connected = bool(self._links[source])
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(LIVE_OK if connected else LIVE_BAD)
+            painter.drawEllipse(QRectF(x, cy - 3.0, 6.0, 6.0))
+            x += 12.0
+            text = text_lib.format_link_line(source, connected)
+            painter.setPen(DIM)
+            painter.drawText(QPointF(x, y + m.ascent()), text)
+            x += m.horizontalAdvance(text) + 18.0
+
+    def _paint_frame(self, painter: QPainter, box: QRectF, point: int) -> None:
         """把最新一帧按比例铺进框里，居中留黑边（letterbox）。
 
         **不拉伸填满**：A 的叠加层已经把两行识别结果烧进了画面（见
@@ -306,16 +585,53 @@ class CameraPane(QWidget):
 
         缩放用 ``SmoothPixmapTransform``：颜文字那边不怕糊，这里怕 ——
         画面缩小后脸上会出现锯齿，隔着投影仪看像是识别错了。
+
+        美化升级：圆角裁切 + 一圈极轻的白色描边，让框在黑底上"存在"
+        但不抢画面的戏；右上角另有一枚「实时画面」徽标（见下）。
         """
         pixmap = self._pixmap
         if pixmap is None or pixmap.isNull():
             return
         if box.width() <= 0 or box.height() <= 0:
             return
+        radius = min(14.0, box.width() / 6.0, box.height() / 6.0)
+        path = QPainterPath()
+        path.addRoundedRect(box, radius, radius)
         painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.save()
+        painter.setClipPath(path)
         painter.drawPixmap(self._fit_rect(box, pixmap), pixmap, QRectF(pixmap.rect()))
-        painter.setPen(DIM)
-        painter.drawRect(box)
+        painter.restore()
+        painter.setBrush(Qt.NoBrush)
+        painter.setPen(QPen(QColor(255, 255, 255, 26), 1.0))
+        painter.drawRoundedRect(box, radius, radius)
+        self._paint_live_badge(painter, box, point)
+
+    def _paint_live_badge(self, painter: QPainter, box: QRectF, point: int) -> None:
+        """画面框右上角的「实时画面」徽标（半透明黑底 + 绿点）。
+
+        放**右上**而不是左上：A 烧进画面的 ASCII 叠加层就在左上角，
+        徽标叠上去会把这块东西里唯一"必须能读"的部分盖掉。
+        框太小时整枚省略 —— 装饰不能挤占内容。"""
+        if box.width() < 160 or box.height() < 60:
+            return
+        font = QFont(self._family)
+        font.setPointSize(max(9, int(point * 0.45)))
+        m = QFontMetrics(font)
+        text = text_lib.STREAM_LIVE_BADGE
+        h = m.height() + 8.0
+        w = m.horizontalAdvance(text) + 30.0
+        left = box.right() - 10.0 - w
+        top = box.top() + 10.0
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 150))
+        painter.drawRoundedRect(QRectF(left, top, w, h), h / 2.0, h / 2.0)
+        painter.setBrush(LIVE_OK)
+        painter.drawEllipse(QRectF(left + 12.0, top + h / 2.0 - 3.0, 6.0, 6.0))
+        painter.setFont(font)
+        painter.setPen(SOFT)
+        painter.drawText(QRectF(left + 24.0, top, w - 28.0, h),
+                         int(Qt.AlignVCenter), text)
 
     @staticmethod
     def _fit_rect(box: QRectF, pixmap: QPixmap) -> QRectF:
@@ -330,44 +646,66 @@ class CameraPane(QWidget):
                        width, height)
 
     def _paint_placeholder(self, painter: QPainter, box: QRectF, point: int) -> None:
-        """带边框的空框 + 居中说明。没有画面时**必须**看得出是"没接入"，
-        而不是"接到了但画面全黑"（后者会让人去查摄像头，其实是没起流）。"""
+        """虚线圆角框 + 简笔画摄像机 + 居中说明。
+
+        没有画面时**必须**看得出是"没接入"，而不是"接到了但画面全黑"
+        （后者会让人去查摄像头，其实是没起流）。"""
         if box.height() < 8:
             return
-        painter.setPen(DIM)
-        painter.drawRect(box)
+        painter.setPen(QPen(PANEL_BORDER, 1.5, Qt.DashLine))
+        painter.setBrush(Qt.NoBrush)
+        radius = min(14.0, box.width() / 6.0, box.height() / 6.0)
+        painter.drawRoundedRect(box, radius, radius)
 
         hint_font = QFont(self._family)
         hint_font.setPointSize(max(MIN_TEXT_POINT, int(point * 0.7)))
         painter.setFont(hint_font)
         painter.setPen(GREY)
-
-        lines = text_lib.format_stream_text(self._stream_connected(), self._stream_url).split("\n")
         metrics = QFontMetrics(hint_font)
-        total = len(lines) * metrics.height()
-        y = box.center().y() - total / 2 + metrics.ascent()
+        lines = text_lib.format_stream_text(self._stream_connected(), self._stream_url).split("\n")
+        text_h = len(lines) * metrics.height()
+
+        # 简笔画图标：框太小就整个省略，说明文字永远要保住
+        icon = int(min(64.0, box.width() * 0.16, box.height() * 0.22))
+        if box.height() < 90:
+            icon = 0
+        gap = 12.0 if icon else 0.0
+        total = icon + gap + text_h
+        y = box.center().y() - total / 2.0 + metrics.ascent()
+        if icon:
+            self._paint_camera_icon(painter, box.center().x(), y - metrics.ascent() + icon / 2.0, icon)
+            y += icon + gap
         for line in lines:
             painter.drawText(QRectF(box.left(), y - metrics.ascent(), box.width(), metrics.height()),
                              int(Qt.AlignHCenter | Qt.AlignVCenter), line)
             y += metrics.height()
 
-    def _paint_lines(self, painter: QPainter, block, left: int, top: int) -> None:
-        y = top
-        for text, font, color in block:
-            if not text:
-                y += SECTION_GAP
-                continue
-            metrics = QFontMetrics(font)
-            painter.setFont(font)
-            painter.setPen(color)
-            painter.drawText(left, y + metrics.ascent(), text)
-            y += metrics.height()
+    def _paint_camera_icon(self, painter: QPainter, cx: float, cy: float,
+                           size: int) -> None:
+        """简笔画摄像机：机身圆角矩形 + 镜头圆 + 顶部取景凸起。
+
+        纯形状、**零字形** —— 占位图标恰恰是字体缺失时最先露馅的地方，
+        所以它一个字符都不用，任何平台画出来都一样。"""
+        body_w = float(size)
+        body_h = size * 0.68
+        body = QRectF(cx - body_w / 2.0, cy - body_h / 2.0, body_w, body_h)
+        painter.setPen(QPen(GREY, 2.0))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(body, size * 0.14, size * 0.14)
+        r = size * 0.16
+        painter.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+        notch_w = size * 0.34
+        notch_h = size * 0.10
+        painter.drawRoundedRect(
+            QRectF(cx - notch_w / 2.0, body.top() - notch_h - 2.0, notch_w, notch_h + 4.0),
+            2.0, 2.0)
 
     # ------------------------------------------------------------------
 
     def snapshot(self, width: int = 900, height: int = 600,
                  vai: Optional[dict] = None, state: Optional[str] = None,
-                 jpeg: Optional[bytes] = None) -> QPixmap:
+                 jpeg: Optional[bytes] = None,
+                 vitals: Optional[dict] = None) -> QPixmap:
         """渲染成一帧位图（``--screenshot`` 与单元测试用）。
 
         与 ``FaceWindow.snapshot`` 同样的理由：截图时**直接赋值**，
@@ -378,6 +716,8 @@ class CameraPane(QWidget):
         """
         if vai is not None:
             self._vai = vai
+        if vitals is not None:
+            self._vitals = vitals
         if state is not None:
             self._state = state
         if jpeg is not None:

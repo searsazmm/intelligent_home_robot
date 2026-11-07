@@ -82,6 +82,25 @@ class TestIndexIsNotZero(unittest.TestCase):
         self.assertIn("原因未知", detail)
 
 
+class TestDistractedBadge(unittest.TestCase):
+    """走神提示：B 明确说走神才显示，且放在细节行**最前**。"""
+
+    def test_badge_shown_when_b_says_distracted(self):
+        detail = dt.format_vai_detail({**VAI_OK, "distracted": True})
+        self.assertIn(dt.DISTRACTED_BADGE, detail)
+        # 最前：走神是这一行里唯一需要老人立刻注意到的事
+        self.assertTrue(detail.startswith(dt.DISTRACTED_BADGE))
+
+    def test_no_badge_without_the_flag(self):
+        """缺字段（旧版 B / 未开主动关怀）与显式 False 都**不**显示。"""
+        self.assertNotIn(dt.DISTRACTED_BADGE, dt.format_vai_detail(VAI_OK))
+        self.assertNotIn(dt.DISTRACTED_BADGE,
+                         dt.format_vai_detail({**VAI_OK, "distracted": False}))
+
+    def test_no_badge_when_not_a_dict(self):
+        self.assertEqual(dt.format_vai_detail(None), dt.VAI_NOT_DELIVERED)
+
+
 class TestIndexBar(unittest.TestCase):
 
     def test_none_is_an_empty_bar_not_a_full_one(self):
@@ -155,6 +174,70 @@ class TestNoteIsNeverReworded(unittest.TestCase):
         expected = f'VAI_NOTE = "{dt.FALLBACK_NOTE}"'
         self.assertIn(expected, source,
                       "C 的兜底免责声明与 B 的 VAI_NOTE 不一致 —— 两边必须逐字相同")
+
+
+VITALS_OK = {
+    "type": "vitals",
+    "hr": 72,
+    "rr": 16.0,
+    "ibi_ms": [833, 841, 828],
+    "note": "视觉测量，仅供参考，非医疗结论",
+}
+
+
+class TestVitalsText(unittest.TestCase):
+    """心率 / 呼吸文案：``hr/rr`` 是 ``None`` 不等于 0 —— 同 VAI 那条约定。
+
+    "未检出"写成"心率 0"的话，老人看到的是系统在报一个危险的心跳数。
+    """
+
+    def test_values_line(self):
+        self.assertEqual(dt.format_vitals_values(VITALS_OK), "72 bpm · 16 次/分")
+
+    def test_missing_values_are_dashes_not_zero(self):
+        self.assertEqual(dt.format_vitals_values(None), f"{dt.NO_INDEX} · {dt.NO_INDEX}")
+        self.assertEqual(
+            dt.format_vitals_values({**VITALS_OK, "hr": None, "rr": None}),
+            f"{dt.NO_INDEX} · {dt.NO_INDEX}",
+        )
+        # 只缺一个：缺的那个补破折号，另一个照常显示
+        self.assertEqual(
+            dt.format_vitals_values({**VITALS_OK, "hr": None}),
+            f"{dt.NO_INDEX} · 16 次/分",
+        )
+
+    def test_garbage_values_do_not_crash(self):
+        self.assertEqual(
+            dt.format_vitals_values({"hr": "很快", "rr": [1, 2]}),
+            f"{dt.NO_INDEX} · {dt.NO_INDEX}",
+        )
+
+    def test_detail_distinguishes_not_delivered_from_not_detected(self):
+        """三种情形要说得不一样：没收到 / 收到但没检出 / 有值。"""
+        self.assertEqual(dt.format_vitals_detail(None), dt.VITALS_NOT_DELIVERED)
+        self.assertEqual(
+            dt.format_vitals_detail({**VITALS_OK, "hr": None, "rr": None}),
+            dt.VITALS_NOT_DETECTED,
+        )
+        self.assertEqual(dt.format_vitals_detail(VITALS_OK), VITALS_OK["note"])
+
+    def test_detail_falls_back_to_the_verbatim_disclaimer(self):
+        self.assertEqual(
+            dt.format_vitals_detail({**VITALS_OK, "note": ""}),
+            dt.VITALS_FALLBACK_NOTE,
+        )
+
+    def test_fallback_note_matches_b_source_verbatim(self):
+        """**跨模块断言**：C 的体征兜底免责声明必须与
+        ``backend_B/core/vitals.py`` 的 ``VITALS_NOTE`` 逐字相同（理由同 vai）。"""
+        path = REPO_ROOT / "backend_B" / "core" / "vitals.py"
+        if not path.exists():
+            self.skipTest(f"找不到 B 侧源文件：{path}")
+
+        source = path.read_text(encoding="utf-8")
+        expected = f'VITALS_NOTE = "{dt.VITALS_FALLBACK_NOTE}"'
+        self.assertIn(expected, source,
+                      "C 的体征兜底免责声明与 B 的 VITALS_NOTE 不一致 —— 两边必须逐字相同")
 
     def test_fallback_used_when_note_missing(self):
         """旧版 B / 手写报文没有 note 字段时用兜底，而不是留空。"""
