@@ -58,9 +58,11 @@ from core import proactive as proactive_lib
 from core.dialogue import DialogueEngine, DialogueReply, static_replies
 from core.history_store import CsvHistoryStore, TurnRecord
 from core.llm import build_chatter
+from core.typed_messages import MSG_RPPG
 from core.ui_channel import ChatServer, StatusBroadcaster
 from core.vision_client import OfflineVisionFeeder, VisionClient
 from core.vision_state import VisionState, VisionStateEvaluator
+from core.vitals import VitalsStore
 from core.voice import audio as audio_lib
 from core.voice.loop import LoopConfig, Speaker, VoiceLoop
 from core.voice.speech_cache import SpeechCache
@@ -115,6 +117,12 @@ class BackendB:
             care_interval=self._care_interval(),
         )
 
+
+        # ---- 心率 / 呼吸（rppg）----
+        # 接住 A 每秒一条的 rppg 报文（此前收下计数后**丢弃**，没有消费者）。
+        # 建在 chat_server 之前：下面的 vitals_provider 要惰性取它。
+        self.vitals_store = VitalsStore()
+
         self.status_server = StatusBroadcaster(
             host=args.status_host, port=args.status_port
         )
@@ -132,6 +140,8 @@ class BackendB:
                 getattr(self, "focus_tracker", None).snapshot()
                 if getattr(self, "focus_tracker", None) is not None else None
             ),
+            # 体征展示报文（B→C，只读旁路）。同样惰性取，理由同上。
+            vitals_provider=lambda: self.vitals_store.snapshot(),
             host=args.chat_host, port=args.chat_port,
         )
 
@@ -151,6 +161,7 @@ class BackendB:
                 speed=args.speed,
                 loop=args.loop,
                 focus=self.focus_tracker,
+                on_typed=self._on_typed_reading,
             )
             logger.info("离线模式：回放 %s（%.1fx 倍速，loop=%s）",
                         args.offline, args.speed, args.loop)
@@ -159,6 +170,7 @@ class BackendB:
                 evaluator=self.evaluator,
                 host=args.vision_host, port=args.vision_port,
                 focus=self.focus_tracker,
+                on_typed=self._on_typed_reading,
             )
 
         # ---- 状态覆盖 ----
@@ -624,6 +636,16 @@ class BackendB:
             return
         self.chat_server.broadcast_state(state, reason)
 
+    def _on_typed_reading(self, kind: str, reading: object) -> None:
+        """类型化报文的旁路订阅（视觉读取线程里被调，只做一次字典写入）。
+
+        focus 报文已由 ``VisionClient`` 内部喂给 focus_tracker（它要同时看
+        帧报文与 focus 报文两条流，接线在类内部），这里只补上此前**没有
+        消费者**的那条：rppg 进 :class:`VitalsStore`，供 0.2 秒节拍取用。
+        """
+        if kind == MSG_RPPG:
+            self.vitals_store.update(reading)
+
     def _publish_vai(self) -> None:
         """把专注度快照推给 C（**只供界面显示**）。不发就返回。
 
@@ -646,6 +668,18 @@ class BackendB:
             return
         self.chat_server.publish_vai(self.focus_tracker.snapshot())
 
+    def _publish_vitals(self) -> None:
+        """把最新体征读数推给 C（**只供界面显示**）。一条都没收到过就不发。
+
+        ⚠️ 与 :meth:`_publish_vai` 同一套只读旁路约束：只读
+        ``VitalsStore.snapshot()``（不可变读数），不进 ``evaluator``、
+        不调 ``_publish_state`` —— 心率呼吸不参与任何判定，
+        它只是右栏的另一行数字。报文里也不带 ``state`` 字段。
+
+        去重（变化 + 心跳）在 ``ChatServer.publish_vitals`` 里。
+        """
+        self.chat_server.publish_vitals(self.vitals_store.snapshot())
+
     def _state_publish_loop(self) -> None:
         """定期取当前状态并推给 C。变化时推，没变化时靠心跳推。
 
@@ -653,14 +687,17 @@ class BackendB:
         时刻、是否正在播报）在这个节拍上本来就齐了，单开一个轮询线程
         只会多一处要同步的状态，不会更快。
 
-        专注度展示同理挂在同一节拍上（:meth:`_publish_vai`），**不新开线程**：
-        "变了才发、没变 5 秒心跳"的去重逻辑在 ``ChatServer.publish_vai`` 里。
+        专注度展示与体征展示同理挂在同一节拍上（:meth:`_publish_vai` /
+        :meth:`_publish_vitals`），**不新开线程**：
+        "变了才发、没变 5 秒心跳"的去重逻辑在 ``ChatServer.publish_vai`` /
+        ``publish_vitals`` 里。
         """
         while not self._stop.is_set():
             try:
                 state, reason = self._effective_state()
                 self._publish_state(state, reason)
                 self._publish_vai()
+                self._publish_vitals()
                 self._tick_proactive(state)
             except Exception:
                 logger.exception("状态发布出错")

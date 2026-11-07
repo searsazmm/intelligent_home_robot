@@ -23,6 +23,9 @@
              ↑ 专注度（VAI）**展示**报文。**只供界面显示**，不带 state 字段、
                不驱动表情、不参与任何判决 —— 它是一条**只读旁路**。
                判决（静默模式）仍然只在 B 内部，见 core/focus.py。
+        B→C  {"type":"vitals","hr":72,"rr":16.0,"ibi_ms":[...],...}
+             ↑ 心率 / 呼吸（rppg）**展示**报文。与 vai 同一条红线：不带 state、
+               只供界面显示（core/vitals.py 的 build_vitals_message 投影）。
 
 两个服务都是"多客户端"的：C 端可能反复重启，所以每个连接单开一个线程处理，
 写失败就把该连接剔除，绝不因为一个客户端掉线影响其它客户端。
@@ -41,6 +44,7 @@ from typing import Callable, List, Optional
 
 import config
 from core.protocol import LineBuffer, ProtocolError, decode_json_line, encode_line, encode_text_line
+from core.vitals import build_vitals_message
 
 logger = logging.getLogger(__name__)
 
@@ -355,6 +359,7 @@ class ChatServer(_BaseTcpServer):
         on_chat: Callable[[str], object],
         state_provider: Optional[Callable[[], tuple]] = None,
         vai_provider: Optional[Callable[[], object]] = None,
+        vitals_provider: Optional[Callable[[], object]] = None,
         host: str = config.CHAT_HOST,
         port: int = config.CHAT_PORT,
     ) -> None:
@@ -367,6 +372,9 @@ class ChatServer(_BaseTcpServer):
         #: 同样是回调，理由同上；未开专注静默时注入 None，于是整条展示
         #: 通道不存在 —— 与 focus 报文"照收照计数、只是没人消费"的处境一致。
         self._vai_provider = vai_provider
+        #: 返回一条「长得像 RppgReading」的读数（或 None）的可调用体。
+        #: 没有消费者时注入 None，vitals 展示通道整个不存在 —— 与 vai 同构。
+        self._vitals_provider = vitals_provider
         #: 上一次发出去的展示报文签名 ``(status, index, index_status, 模态)``。
         #: 只有签名变化或心跳到期才真发 —— 0.2 秒一拍、每拍都发的话，
         #: C 端一秒钟要处理五条一模一样的专注度。
@@ -375,6 +383,11 @@ class ChatServer(_BaseTcpServer):
         #: 保护上面两个字段的读-改-写。展示节拍只有一条线程在推，
         #: 但「新客户端连上补发」发生在**客户端线程**里，两者会并发。
         self._vai_lock = threading.Lock()
+        #: vitals 的签名只比 ``(hr, rr)``：ibi 数组每一跳都在变，比它等于
+        #: 每条都发，去重就失效了。hr/rr 都没变就是"没变"。
+        self._last_vitals_sig: Optional[tuple] = None
+        self._last_vitals_at: float = 0.0
+        self._vitals_lock = threading.Lock()
 
     # ------------------------------------------------------------------
 
@@ -434,12 +447,35 @@ class ChatServer(_BaseTcpServer):
         if self._send(client, build_vai_message(snapshot)):
             logger.info("已向新客户端 %s:%d 补发专注度展示报文", addr[0], addr[1])
 
+    def _send_initial_vitals(self, client: socket.socket, addr) -> None:
+        """新客户端连上时补一条体征展示报文（理由与 :meth:`_send_initial_vai` 相同）。
+
+        变化才发，而 rppg 是约 1Hz 的慢量 —— 不补发的话，新连上的 C 右栏
+        要盯着「心率 / 呼吸：未提供」一直等到下一次数值变化或心跳。
+        失败同样**不**掐连接：体征只是一栏展示。
+        """
+        if self._vitals_provider is None:
+            return
+        try:
+            reading = self._vitals_provider()
+        except Exception:
+            logger.exception("取体征快照失败，跳过补发（连接保留）")
+            return
+        if reading is None:
+            return
+        message = build_vitals_message(reading)
+        if message is None:
+            return
+        if self._send(client, message):
+            logger.info("已向新客户端 %s:%d 补发体征展示报文", addr[0], addr[1])
+
     def _client_loop(self, client: socket.socket, addr) -> None:
         """覆写：连上先补发当前状态，再进入正常的读循环。"""
         if not self._send_initial_state(client, addr):
             self._remove_client(client)
             return
         self._send_initial_vai(client, addr)
+        self._send_initial_vitals(client, addr)
         super()._client_loop(client, addr)
 
     def _on_line(self, client: socket.socket, line: str) -> None:
@@ -549,6 +585,38 @@ class ChatServer(_BaseTcpServer):
                 return False
             self._last_vai_sig = signature
             self._last_vai_at = now
+
+        self._broadcast(encode_line(message))
+        return True
+
+    def publish_vitals(self, reading: object, force: bool = False) -> bool:
+        """推一条体征展示报文。签名没变且没到心跳时间就不发。返回是否真发了。
+
+        语义与 :meth:`publish_vai` 对齐（变化 + 心跳）：C 端要能分辨
+        「数值没变」与「B 挂了」。
+
+        ⚠️ 与 ``publish_vai`` 同一条红线：本方法以及它的调用者都**只读**
+        ``VitalsStore.snapshot()`` 这一个只读快照，不进 evaluator、不调
+        ``_publish_state`` —— 心率呼吸不参与任何判定（见 main.BackendB._publish_vitals）。
+        """
+        if reading is None:
+            return False
+
+        message = build_vitals_message(reading)
+        if message is None:
+            return False
+        signature = (message["hr"], message["rr"])
+        now = time.monotonic()
+
+        # 判定与记账在锁内、发送在锁外 —— 与 publish_vai 同一条理由：
+        # sendall 可能阻塞到 socket 超时，持锁发送会把 0.2 秒的节拍拖垮。
+        with self._vitals_lock:
+            changed = signature != self._last_vitals_sig
+            heartbeat_due = (now - self._last_vitals_at) >= config.VAI_HEARTBEAT_SECONDS
+            if not force and not changed and not heartbeat_due:
+                return False
+            self._last_vitals_sig = signature
+            self._last_vitals_at = now
 
         self._broadcast(encode_line(message))
         return True
