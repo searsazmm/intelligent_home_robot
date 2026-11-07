@@ -76,7 +76,23 @@ FileNotFoundError: The path does not exist: ...\mediapipe\modules\face_landmark\
 > FaceMesh 立刻能实例化。**用目录 junction 骗不过去** —— venv 里
 > `mediapipe.__file__` 会解析回中文原路径。
 
-A-包不受影响：它用 **Tasks** API，模型字节在 Python 侧读出来再交给 C++，不传路径。
+> ⚠️ **2026-10-05 更正：下面这句最早写的「A-包不受影响」是错的。**
+>
+> 原文是「A-包不受影响：它用 **Tasks** API，模型字节在 Python 侧读出来再交给
+> C++，不传路径」。**Tasks API 照样传路径** ——
+> `FaceLandmarker.create_from_options(...)` 收的是 `model_asset_path`，
+> C++ 层按同一个 ANSI 代码页去开它。于是同一个问题原样复现，而且报错**更
+> 误导人**：文件明明在、`Path.exists()` 也返回 True，却报
+>
+> ```
+> FileNotFoundError: Unable to open file at D:\...\成都东软学院下期\...\models\face_landmarker.task
+> ```
+>
+> 之所以一直没人发现，是因为**真摄像头这条路此前从没跑过**（见 §7 的验证
+> 状态）—— 合成源与 CSV 回放都不需要模型文件。
+>
+> 解法与 A-单文件相同：**把模型放到纯 ASCII 路径**，用
+> `FACE_LANDMARKER_MODEL` 指过去（见 §1 「真摄像头」）。
 
 ### 可用组合（2026-09-29 实测）
 
@@ -148,6 +164,30 @@ python main.py --list-scenarios
 python main.py --source synthetic-pixels --scenario drowsy --stream
 # 没摄像头时用 synthetic-pixels 验收画面：像素与特征同一次剧本推进
 ```
+
+**真摄像头**（`--source camera`）比上面多两道手续，缺一不可：
+
+```bash
+# ① 一次性下载人脸模型（约 3.6 MB）。仓库**不随附**：体积与授权原因。
+curl -L -o backend_A/models/face_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+
+# ② 把模型放到**纯 ASCII 路径**，再用环境变量指过去，然后才起服务。
+#    ⚠️ 这一步不是可选的：留在 backend_A/models/ 下**必然**失败，
+#    报 "Unable to open file at ..."，而那个文件明明就在那儿（原因见上面「二、路径」）。
+mkdir -p "$LOCALAPPDATA/mediapipe"
+cp backend_A/models/face_landmarker.task "$LOCALAPPDATA/mediapipe/face_landmarker.task"
+
+FACE_LANDMARKER_MODEL="$LOCALAPPDATA/mediapipe/face_landmarker.task" \
+  python main.py --source camera --fps 15 --stream
+```
+
+> `$LOCALAPPDATA` 在 Git Bash 与 PowerShell 里都有；换成绝对路径
+> （`C:\Users\<你>\AppData\Local\mediapipe\face_landmarker.task`）也一样。
+> 模型只有**这一个**入口需要 ASCII 路径 —— 仓库本身留在中文路径下没问题。
+>
+> 真摄像头下专注度（VAI）有一个**已知门槛**（被动校准要求头姿基本不动），
+> 详见 §8。第一次跑之前先读那一段，否则会误以为 VAI 坏了。
 
 跑测试（136 个用例，标准库 unittest，**不需要装任何东西**）：
 
@@ -404,7 +444,11 @@ python main.py [选项]
   --scenario NAME        合成剧本名（--source synthetic / synthetic-pixels）
   --video PATH           视频文件（--source video）
   --csv PATH             CSV 文件（--source csv）
-  --camera-index N       摄像头序号
+  --camera-index N       摄像头序号（--source camera）
+                         ⚠️ 真摄像头还额外需要环境变量 FACE_LANDMARKER_MODEL
+                            指向纯 ASCII 路径下的模型文件（见 §1「真摄像头」）。
+                            它**不是**命令行参数 —— 模型路径与端口不同，
+                            这里没有对应的 --model 选项
 
   --stream               起展示流（给前端右栏拉画面；默认关，见 §11）
   --stream-port N        展示流端口（默认 8010）
@@ -444,9 +488,14 @@ cd backend_B && python main.py --log-level DEBUG
 要连前端一起看（右栏画面），加 `--stream` 与一个**有像素**的源：
 
 ```bash
-# 终端1：换成带展示流的 A（真摄像头，或没摄像头时用玩具像素）
+# 终端1：换成带展示流的 A（没摄像头时用玩具像素）
 cd backend_A && python main.py --scenario drowsy --source synthetic-pixels --stream
-# 终端3：前端 C 拉那条流
+
+# 终端1（真摄像头版）：多一个环境变量，见 §1「真摄像头」
+cd backend_A && FACE_LANDMARKER_MODEL="$LOCALAPPDATA/mediapipe/face_landmarker.task" \
+  python main.py --source camera --fps 15 --stream
+
+# 终端3：前端 C 拉那条流（两种 A 都是同一个地址）
 cd frontend_C && python main.py --stream-url http://127.0.0.1:8010/stream.mjpeg
 ```
 
@@ -495,9 +544,13 @@ curl -s http://127.0.0.1:8010/stream.mjpeg | head -c 200   # 分区头，人眼�
 | **`scrub_frame` 真的在跑** | 单元测试计数：编码后被调用、只读缓冲区跳过并计数（不让它打崩主循环）、没起流时是空操作 |
 | **像素不驻留** | 单元测试：`vars(server)` 里没有任何 `pixel`/`frame_` 开头的名字 |
 | **无订阅者时不做编码** | 单元测试：`FrameHub` 没有订阅者时 `offer()` 不调用 `imencode` |
-| **真跑起来能收到帧** | 真机 `curl` 取到含 `--frame` + `Content-Type: image/jpeg` 的分区、`/healthz` 返 200、未知路径返 **404 响应**（不是断连）；解出来的图里有烧进画面的绿框与两行 ASCII |
+| **真跑起来能收到帧**（玩具像素那趟） | 真机 `curl` 取到含 `--frame` + `Content-Type: image/jpeg` 的分区、`/healthz` 返 200、未知路径返 **404 响应**（不是断连）；解出来的图里有烧进画面的绿框与两行 ASCII。真摄像头那趟另见下面几行 |
 | **不落盘** | 真机跑 60s 后 `git status --porcelain` 无新增文件；`stream.py` 里没有 `imwrite` / `open(...,'wb')` |
 | **客户端"连上就断"不打 traceback** | 单元测试：用 `SO_LINGER=(1,0)` 主动发 RST，断言 stderr 里**没有** Traceback 且计数进了 `client_resets`。回归用例 —— 这条曾经真的坏过：C 每次 `stop()` 都会在 A 的终端上打一段看着像崩溃的栈 |
+| **真摄像头能起来**（**2026-10-05 首次实测**） | 真机 `--source camera --fps 15 --stream`：日志里出现 `Created TensorFlow Lite XNNPACK delegate for CPU.`（说明 `FaceLandmarker` 真的建起来了，不是"服务起了但后端是空的"）；8000 与 8010 同时在听；`/healthz` 返 `clients=1/4 … encode_failed=0` |
+| **真摄像头的帧率与时间戳** | 同一次运行在 8000 上数 15 秒：**帧报文 14.8 条/s、§3.5 视线报文 14.7 条/s**，时间戳中位间隔 0.064s、**零次回退、零次超过 1 秒的空档**（这正是 B 侧会话重置的两个触发条件，都不成立） |
+| **真摄像头的画面进得了右栏** | 同一次运行抓的窗口图：**真人画面 + 绿框贴合脸部**（框来自 MediaPipe 的 `face_bbox`，不是画的）+ A 烧的 ASCII 叠加；C 右栏显示「状态 状态正常（人脸在位且各项特征正常）」—— 这句话本身证明 B 收到了真摄像头的帧并判对了 |
+| **模型缺失 / 中文路径的报错是可诊断的** | 两种失败各复现一次：模型不在 → `人脸模型文件不存在` + 下载地址 + `FACE_LANDMARKER_MODEL` 提示；模型在但路径含中文 → `Unable to open file at <中文路径>`（后者**报错信息本身会骗人**，见上面「二、路径」的更正） |
 
 真时钟实跑记录（A 与 B 同时起，B 连上后观察 45 秒，`--log-level DEBUG`）：
 
@@ -514,10 +567,8 @@ curl -s http://127.0.0.1:8010/stream.mjpeg | head -c 200   # 分区头，人眼�
 
 | 内容 | 为什么没验证 | 怎么补 |
 | --- | --- | --- |
-| **「像素 → 人脸关键点」这一步** | 开发机**没有摄像头**。合成源与 CSV 回放直接产出特征，**跳过了像素** | 接真实摄像头或真人视频：`python main.py --source camera` |
-| MediaPipe 后端在真实画面上的表现 | 同上 | 同上 |
-| **带真像素的展示流（`--source camera --stream`）** | 展示流的验收全程用 `--source synthetic-pixels` 的**玩具像素**（那张图不是人脸，叠加层的框也是画上去的）。像素→JPEG→HTTP→C 解码上屏这条链子**已验证**，但**真实人脸画面的观感没看过** | 在演示机上：`A --source camera --stream` + `C --stream-url …`，确认人脸占比、绿框贴合、叠加层字号可读 |
-| **真实场景下的判定准确率** | 同上。验的是**判定逻辑**，不是**视觉精度** | 需要真人数据，并做误报/漏报统计 |
+| **真摄像头下的 VAI 能不能真的出值** | 2026-10-05 首次实测：**一次都没出过**，全程停在 `status=校准预热中 / 正在建立稳定的头姿基线`。被动校准要求被观察者头姿基本不动（P10–P90 跨度 yaw ≤8° 且 pitch ≤8°），而实测真人 22 秒内 yaw 摆动 35°、pitch 摆动 18°（数值平滑漂移，是**真人在动**，不是估计器噪声）→ 基线一直建不起来。合成源的姿势完美静止，所以这条路从没暴露过它 | 让会话重开一轮（重启 B / 用手挡摄像头约 3 秒 / 重启 A），然后**面朝摄像头坐正约 10 秒**。机制与判据见 §8 |
+| **真实场景下的判定准确率** | 验的始终是**判定逻辑**，不是**视觉精度**。2026-10-05 真人首次入镜：人脸检出了、绿框贴合、B 判 `normal` 且 `reason` 说得通 —— 但这是一次**冒烟**，不是统计。误报/漏报率、戴眼镜、逆光、侧脸、多人同框**一概没测** | 需要多位真人、多种光照与姿态，按帧统计混淆矩阵 |
 | **表情识别的精度** | 是 52 个 ARKit blendshape 的**规则启发式基线**，不是训练模型 | 采集真实老人表情数据后接 ONNX 模型，`ExpressionClassifier` 接口已留好 |
 | 长时间运行稳定性 | 没有跑过数天量级的浸泡测试 | — |
 | `--source video` | 没有可用的测试视频 | 自备一段 |
@@ -547,6 +598,45 @@ curl -s http://127.0.0.1:8010/stream.mjpeg | head -c 200   # 分区头，人眼�
 ```bash
 pip install --force-reinstall --no-deps opencv-contrib-python==4.13.0.92
 ```
+
+#### ⚠️ 真摄像头下 VAI 出不来值 —— 不是 A 的问题，是 B 的被动校准门槛（2026-10-05）
+
+**症状**：`--source camera` 跑起来一切正常（人脸检出、绿框贴着、`tired`/`normal`
+判得都对、C 右栏画面流畅），**唯独专注度那一行一直停在**
+`校准预热中 / 正在建立稳定的头姿基线`，等多久都不出数。
+
+**为什么**：VAI 不在 A 里算，是 B 的 `core/focus.py`。它的被动校准要求
+**被观察者的头姿基本不动**，判据是「头姿角度的 P10–P90 跨度 ≤ 8°」：
+
+| 量 | 门槛（B 的 `FocusConfig`） | 真人实测（22 秒） |
+| --- | --- | --- |
+| yaw 跨度（P10–P90） | ≤ `calibration_yaw_range_max = 8.0°` | **35°** |
+| pitch 跨度（P10–P90） | ≤ `calibration_pitch_range_max = 8.0°` | **18°** |
+| 校准时长 / 最少样本 | 5.0s / 30 个 | 样本够，跨度不够 |
+| 质量下限 | `calibration_quality_min = 0.45` | 跨度不过 |
+
+看到 35° / 18° 这个量级，第一反应会怀疑「估计器在抖」。**不是** —— 把 yaw/pitch
+逐帧打出来看，是**平滑漂移**（人转头、低头看屏幕、呼吸带动的微动），
+是真人真的在动，不是噪声。合成源（`--scenario drowsy` 之类）的姿势是**完美静止**的，
+所以这条路从 ③b 落地到今天**从没暴露过**它。
+
+**怎么绕**：校准是**按会话**做的，会话一重开就重来。所以顺序是
+① 让会话重开一轮 → ② 立刻坐正面朝摄像头别动约 10 秒。
+
+```bash
+# 重开会话的三种等价做法，任选一种：
+#   a) 重启 B
+#   b) 用手把摄像头挡严实约 3 秒（B 会因 face 丢失判定会话中断）
+#   c) 重启 A
+```
+
+重开之后**别急着动** —— 那 5 秒校准窗（≥30 个样本）里你要是不动，
+`yaw/pitch` 跨度自然落在 8° 以内，基线立刻建起来，
+右栏就开始出 `专注度 VAI xx.x · 有效`。
+
+**要不要改代码**：本轮**不改**。这个门槛是 B 侧有意的设计（姿势不乱动才谈得上
+"稳定基线"），放宽它属于改判定语义，得单独讨论；而且**这不是回归**
+—— 是首次跑真摄像头才第一次踩到。这里只如实记录现象、判据与绕过办法。
 
 #### A 在团队仓库与 xiangmu1 会各自演进（分叉）
 

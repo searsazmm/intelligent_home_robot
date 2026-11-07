@@ -84,10 +84,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--source",
-        default="synthetic",
-        choices=("synthetic", "synthetic-pixels", "camera", "video", "csv"),
+        default="camera",
+        choices=("camera", "synthetic", "synthetic-pixels", "video", "csv"),
         help=(
-            "采集源种类（默认合成源，本机无摄像头时的主路径）。"
+            "采集源种类（默认真实摄像头；设备不可用时自动回退合成源并提示）。"
+            "synthetic 是无摄像头机器的确定性主路径（不过像素、不加载模型）；"
             "synthetic-pixels 与 synthetic 同剧本，额外给一路玩具像素，"
             "给 --stream 的展示流用"
         ),
@@ -150,8 +151,10 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "是否发 api_doc §3.5 的体征报文（rppg）。只有合成源挂得上。"
-            "关掉可以得到一条只含帧报文的干净流，排查协议问题时用"
+            "是否发 api_doc §3.5 的体征报文（rppg）。合成源直出 RGB；"
+            "camera/video 从人脸框上 1/3 取色（真人测量，hr 窗口 8s、"
+            "rr 窗口 20s，窗口满前置灰）；CSV 不发。关掉可以得到一条"
+            "只含帧报文的干净流，排查协议问题时用"
         ),
     )
     p.add_argument(
@@ -195,12 +198,50 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _camera_available(index: int) -> bool:
+    """粗探测摄像头能否打开（探测一次就释放）。
+
+    采集是**惰性打开**的（见 :class:`~module_a_vision.capture.camera.CameraSource`）：
+    装配时不碰硬件，第一次读才碰。这里在装配**之前**先试一次，为的是
+    "默认摄像头"这条路径在没接摄像头的机器上能自动落回合成源，
+    而不是让 `python main.py` 直接报错退出。
+
+    只做粗探测：能 ``isOpened()`` 就算通过。真正的读取质量（出帧、分辨率）
+    仍由 :meth:`CameraSource.open` 里的 probe 负责 —— 两层探测关注的问题不同。
+    """
+    try:
+        import cv2
+    except ImportError:
+        return False
+    from .capture.camera import _BACKENDS
+
+    for code, _name in _BACKENDS:
+        cap = cv2.VideoCapture(index, code)
+        opened = bool(cap.isOpened())
+        cap.release()
+        if opened:
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     _prepare_console()
     args = build_parser().parse_args(argv)
 
     if args.list_scenarios:
         return _list_scenarios()
+
+    # 默认源是真实摄像头，但没接设备（或没装 opencv）的机器上要**自动回退**
+    # 合成源，而不是崩溃 —— 合成源本来就是无摄像头场景的主路径（模块文档）。
+    # 回退选 synthetic-pixels：它还多给一路玩具像素，--stream 的展示流照常能看。
+    if args.source == "camera" and not _camera_available(args.camera_index):
+        print(
+            f"[A] 未检测到可用摄像头（设备 {args.camera_index}），"
+            "自动回退到合成源（synthetic-pixels）。"
+            "要显式用摄像头请检查设备后加 --source camera。",
+            file=sys.stderr,
+        )
+        args.source = "synthetic-pixels"
 
     # 展示流的帧缓存。**--dry-run 时根本不需要**（不起服务、也没有像素
     # 经手），所以这里就不建。给了 --stream 也不代表它会起来 —— 源若没有

@@ -36,8 +36,10 @@ if _HERE not in sys.path:
 
 import _console  # noqa: E402,F401  （导入即生效：让中文输出不乱码）
 
+from rppg import Rppg  # noqa: E402
 from module_a_vision.vitals import (  # noqa: E402
     DEFAULT_VITALS,
+    FaceRoiVitalsSource,
     RppgMonitor,
     SyntheticVitalsSource,
     VitalsSpec,
@@ -261,6 +263,163 @@ class TestRppgMonitor(unittest.TestCase):
         """
         text = RppgMonitor(SyntheticVitalsSource()).describe()
         self.assertIn("非生理测量", text)
+
+
+class TestFaceRoiVitalsSource(unittest.TestCase):
+    """真人取色源：bbox 上 1/3 均值、空缺不补 0、坏了不炸主循环。
+
+    camera/video 路径接上之后，这一层就是"像素 → 3 个标量"的唯一关口。
+    它最不能犯的错是**把没测到当成 0 填进波形**（那会往 FFT 里灌一段
+    人造方波），以及**在取色失败时把采集主循环带走**。
+    """
+
+    BBOX = (100, 80, 220, 200)   # 原图分辨率下的一个 120×120 框
+
+    @staticmethod
+    def _make_pixels(bgr=(10, 20, 30)):
+        """一块 240×320 的纯色 BGR 图。cv2 不可用时跳过相关用例。"""
+        cxx = None
+        try:
+            from module_a_vision.stream import _require_cv2
+            cxx = _require_cv2()
+        except Exception:
+            return None
+        import numpy
+
+        img = numpy.zeros((240, 320, 3), dtype=numpy.uint8)
+        img[:] = bgr
+        return img
+
+    def test_mean_of_the_top_third(self) -> None:
+        """上三分之一区域的 BGR 均值，且**通道顺序转成 (R, G, B)**。"""
+        pixels = self._make_pixels((10, 20, 30))   # B=10, G=20, R=30
+        if pixels is None:
+            self.skipTest("cv2 不可用")
+        src = FaceRoiVitalsSource()
+        src.observe_frame(pixels, self.BBOX)
+        self.assertEqual(src.read_rgb(0.0), (30.0, 20.0, 10.0))
+
+    def test_uses_only_the_top_third(self) -> None:
+        """下半部分的颜色**不该**被算进去 —— 取色位置就是额头那条。"""
+        pixels = self._make_pixels((10, 20, 30))
+        if pixels is None:
+            self.skipTest("cv2 不可用")
+        import numpy
+
+        x1, y1, x2, y2 = self.BBOX
+        y_mid = y1 + int((y2 - y1) / 3.0)
+        pixels[y_mid:y2, x1:x2] = (250, 250, 250)   # 下 2/3 全白
+        src = FaceRoiVitalsSource()
+        src.observe_frame(pixels, self.BBOX)
+        self.assertEqual(src.read_rgb(0.0), (30.0, 20.0, 10.0))
+
+    def test_missing_face_is_a_gap_not_zero(self) -> None:
+        """没有 bbox → ``None``。监视器据此跳过这一帧，波形里不留空穴。"""
+        src = FaceRoiVitalsSource()
+        src.observe_frame(self._make_pixels(), None)
+        self.assertIsNone(src.read_rgb(0.0))
+
+        monitor = RppgMonitor(src)
+        typed = monitor.feed(0.0)
+        self.assertIsNone(typed)   # 没取到色：连报文都不该有
+
+    def test_clamps_out_of_range_bbox(self) -> None:
+        """越界的 bbox 钳到图像内 —— 摄像头分辨率一变这不是不可能。"""
+        pixels = self._make_pixels()
+        if pixels is None:
+            self.skipTest("cv2 不可用")
+        src = FaceRoiVitalsSource()
+        src.observe_frame(pixels, (-500, -500, 9999, 9999))
+        self.assertIsNotNone(src.read_rgb(0.0))
+
+    def test_bad_inputs_do_not_raise(self) -> None:
+        """形状不对的 bbox / 坏像素都按"这一帧没人脸"处理，绝不抛。"""
+        src = FaceRoiVitalsSource()
+        for pixels, bbox in ((None, self.BBOX), (object(), (1, 2)),
+                             ("坏像素", self.BBOX)):
+            with self.subTest(pixels=type(pixels).__name__, bbox=bbox):
+                src.observe_frame(pixels, bbox)
+                self.assertIsNone(src.read_rgb(0.0))
+
+    def test_monitor_does_not_observe_a_synthetic_source(self) -> None:
+        """合成源没有 ``observe_frame`` —— 监视器必须安静地跳过。"""
+        monitor = RppgMonitor(SyntheticVitalsSource())
+        monitor.observe_frame(None, None)   # 不许抛
+        # 且合成源照常工作：第一条报文直接出（_last_emit 还是 None），
+        # 间隔不足 1s 的下一帧被吃掉，到点再出。
+        self.assertIsNotNone(monitor.feed(FPS))
+        self.assertIsNone(monitor.feed(FPS + 0.5))
+        self.assertIsNotNone(monitor.feed(2.0 * FPS))
+
+
+class _FakeGapSource:
+    """取色可随时置 None 的假源：模拟"人离开镜头再回来"。"""
+
+    def __init__(self) -> None:
+        self.rgb: tuple[float, float, float] | None = (150.0, 130.0, 120.0)
+
+    def read_rgb(self, ts: float):
+        return self.rgb
+
+    def describe(self) -> str:
+        return "假源（断流恢复测试用）"
+
+
+class TestFaceGapRecovery(unittest.TestCase):
+    """长时间无人脸后恢复：**不得把进程带走**（真机复现过的崩溃）。
+
+    场景（2026-10-06 真机）：人离开镜头 20~30 秒再回来，A 端整个进程
+    带着``"a cannot be empty"``退出 —— 缓冲里攒着离开前的旧波形，
+    回来后的第一帧把它卷进"最近 8 秒"窗口，``np.arange(t, t, ·)``
+    产出空数组，``np.convolve`` 抛异常。
+    """
+
+    FRAME_HZ = 15.0
+
+    def _feed_span(self, monitor: RppgMonitor, t0: float, t1: float) -> None:
+        """按 15fps 往监视器里喂 ``[t0, t1)`` 的帧。"""
+        n = int((t1 - t0) * self.FRAME_HZ)
+        for i in range(n):
+            monitor.feed(t0 + i / self.FRAME_HZ)
+
+    def test_long_gap_then_return_does_not_crash(self) -> None:
+        src = _FakeGapSource()
+        monitor = RppgMonitor(src)
+        self._feed_span(monitor, 0.0, 12.0)          # 坐着 12 秒
+        src.rgb = None
+        self._feed_span(monitor, 12.0, 36.0)          # 离开 24 秒
+        src.rgb = (150.0, 130.0, 120.0)
+        # 崩溃点在"回来"之后的头两秒 —— 一帧都不许抛
+        self._feed_span(monitor, 36.0, 38.0)
+        # 断流超过 GAP_RESET_SEC 必须清过一次缓冲
+        self.assertGreaterEqual(monitor.resets, 1)
+
+    def test_short_blink_gap_does_not_reset(self) -> None:
+        """眨眼级别的短暂丢帧（< 1 秒）**不该**清缓冲 —— 那是正常抖动。"""
+        src = _FakeGapSource()
+        monitor = RppgMonitor(src)
+        self._feed_span(monitor, 0.0, 4.0)
+        src.rgb = None
+        self._feed_span(monitor, 4.0, 4.6)            # 丢 0.6 秒
+        src.rgb = (150.0, 130.0, 120.0)
+        self._feed_span(monitor, 4.6, 6.0)
+        self.assertEqual(monitor.resets, 0)
+
+    def test_rppg_compute_with_stale_buffer_is_safe(self) -> None:
+        """算法层自保：绕过监视器直接构造"旧样本 + 1 个新样本"的缓冲。
+
+        这是最坏形态 —— 就算上游忘了清缓冲，``compute`` 也不许抛、
+        不许输出垃圾，只能置灰等窗口重新攒满。
+        """
+        r = Rppg()
+        t = 0.0
+        for _ in range(40):                            # 40 帧 @15fps ≈ 2.7 秒
+            r.update(t, 150.0, 130.0, 120.0)
+            t += 1.0 / self.FRAME_HZ
+        r.update(t + 24.0, 150.0, 130.0, 120.0)        # 离开 24 秒后回来第一帧
+        hr, rr, _ibi, _sqi = r.compute(t + 24.0)       # 原崩溃点 —— 不许抛
+        self.assertIsNone(hr)
+        self.assertIsNone(rr)
 
 
 if __name__ == "__main__":

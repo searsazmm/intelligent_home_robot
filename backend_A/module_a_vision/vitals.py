@@ -36,8 +36,8 @@ CSV 回放**不做** rPPG：``data/sample_vision.csv`` 里既没有 RGB 列也�
 像素，往里塞三列假数据会掩盖"这条路本来就走不通"。与
 ``capture/csv_replay.py`` 处理"没有视线列"的体例一致。
 
-真像素路径（camera / video）本步**未实现**。将来要做的话，取色位置用
-``frame.face_bbox`` 的上三分之一算 BGR 均值，**不要**复用
+真像素路径（camera / video）由 :class:`FaceRoiVitalsSource` 接上：取色
+位置用 ``frame.face_bbox`` 的**上三分之一**算 BGR 均值，**不要**复用
 ``vision_a.py`` 的地标 ROI —— 那一套的头姿是基线校正后的，语义与
 A-包不同，两套报文混进同一条流会让 B 侧的校准基线漂移。
 """
@@ -167,6 +167,84 @@ class VitalsSpec:
 DEFAULT_VITALS = VitalsSpec()
 
 
+class FaceRoiVitalsSource:
+    """从**最近一帧**的人脸 ROI 取色（camera / video 路径）。
+
+    它是 :class:`VitalsSource` 协议的真人实现，但多一步别的源没有的
+    :meth:`observe_frame` —— 像素在 A 模块里"用完即毁"（``server.py`` 的
+    ``_scrub`` 就地清零），所以取色必须发生在清零**之前**，由 server 逐帧
+    把 ``(像素, 人脸框)`` 递进来。这里只留 **3 个标量**（BGR 均值），
+    不保留任何像素引用 —— "像素不出模块 A"的红线不含"模块内短暂持有"，
+    但也绝不升级成长驻。
+
+    取色位置：``face_bbox``（原图分辨率， ``(x1, y1, x2, y2)``）的
+    **上三分之一**。额头区域头发/眼镜污染最小、颊部反光最少，与
+    ``vision_a.py`` 实测可用的 ROI 语义一致（见模块文档：不要复用它的
+    地标 ROI，但取额头这一条的结论是一样的）。
+
+    没有人脸框（``face_bbox is None``，对应"这一帧没检出脸"）时存
+    ``None``：:class:`RppgMonitor` 会把空缺跳过，**不会**拿 0 填进波形。
+    """
+
+    def __init__(self, roi_top_ratio: float = 1.0 / 3.0) -> None:
+        #: 取 ROI 的纵向比例（上三分之一）。
+        self.roi_top_ratio = float(roi_top_ratio)
+        self._latest: tuple[float, float, float] | None = None
+        self.frames_seen = 0
+        self.frames_with_face = 0
+
+    def observe_frame(self, pixels: Any, face_bbox: Any) -> None:
+        """在像素清零**前**取色（由 ``server._observe_vitals`` 逐帧调用）。
+
+        任何失败都按"这一帧没有 ROI"处理：存 ``None``，不抛 ——
+        取色炸了不能把采集主循环带走（与 ``server._scrub`` 同一条忍法）。
+        """
+        self._latest = None
+        self.frames_seen += 1
+        if pixels is None or face_bbox is None:
+            return
+        try:
+            if len(face_bbox) != 4:
+                return
+            x1, y1, x2, y2 = (int(v) for v in face_bbox)
+            if x2 <= x1 or y2 <= y1:
+                return
+            # 惰性导入 cv2：与 stream.py 同一条规矩（它是唯一能解码 BGR 的）。
+            # 这里只用 ``cv2.mean`` —— 不引入第二套图像处理。
+            from .stream import _require_cv2
+
+            cxx = _require_cv2()
+            height, width = pixels.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            if x2 <= x1 or y2 <= y1:
+                return
+            y_mid = y1 + int((y2 - y1) * self.roi_top_ratio)
+            if y_mid <= y1:
+                return
+            # round(…, 2)：均值是连续量，两位小数远超算法需要的精度，
+            # 顺手把 cv2.mean 的浮点累加尾差（30.000000000000004）掐掉。
+            b, g, r = (round(float(v), 2) for v in cxx.mean(pixels[y1:y_mid, x1:x2])[:3])
+            self._latest = (r, g, b)
+            self.frames_with_face += 1
+        except Exception as exc:   # noqa: BLE001 —— 理由见 docstring
+            self._latest = None
+            if self.frames_with_face == 0 and self.frames_seen == 1:
+                print(f"[A] ⚠ 体征取色不可用（按每帧无人脸处理）：{exc}")
+
+    def read_rgb(self, ts: float) -> tuple[float, float, float] | None:
+        """最近一帧的取色。``ts`` 不参与计算 —— 帧与取色同源，时序由
+        server 保证（先 ``observe_frame`` 再 ``feed(ts)``）。"""
+        return self._latest
+
+    def describe(self) -> str:
+        return (
+            "真人取色（CHROM）：face_bbox 上 "
+            f"{self.roi_top_ratio:.0%} 区域 BGR 均值，只留 3 个标量不存像素；"
+            "未检出人脸的帧按空缺跳过（不补 0）"
+        )
+
+
 class SyntheticVitalsSource:
     """确定性地产出 ``(R, G, B)`` 序列，供 :class:`RppgMonitor` 消费。
 
@@ -223,6 +301,10 @@ class RppgMonitor:
     #: 体征报文的发送间隔（秒，按**帧时间轴**计，不是墙钟）。
     EMIT_INTERVAL_SEC = 1.0
 
+    #: 取色断流多久后清缓冲（秒，按帧时间轴计）。眨眼/短暂遮挡只丢几帧，
+    #: 不清；超过 1 秒说明人已经离开镜头，清（理由见 :meth:`feed`）。
+    GAP_RESET_SEC = 1.0
+
     def __init__(
         self,
         source: VitalsSource,
@@ -237,6 +319,8 @@ class RppgMonitor:
         self._rppg = rppg_cls()
         self._last_emit: float | None = None
         self._last_ts: float | None = None
+        #: 取色断流的起点（帧时间轴）。``None`` = 当前没有断流。
+        self._gap_started: float | None = None
         #: 已产出的体征报文数、因时间轴回退而重建的次数（联调时看这两个数）。
         #: 正常演示里 ``resets`` 应当**一直是 0** —— 它不是"跑了几圈"的计数器，
         #: 它只在数据源的时间轴真的往回走时才加（见 :meth:`feed`）。
@@ -245,6 +329,17 @@ class RppgMonitor:
 
     def describe(self) -> str:
         return f"{self.source.describe()}，每 {self.emit_interval:g}s 一条体征报文"
+
+    def observe_frame(self, pixels: Any, face_bbox: Any) -> None:
+        """把这一帧交给**真人取色源**（``FaceRoiVitalsSource``）。
+
+        必须在像素清零**前**调（见 ``server._observe_vitals``）。合成源
+        没有这一步 —— 用 ``getattr`` 判而不是改它的类：合成源的特征与
+        像素无关，不该为一个它用不着的钩子背上 ``observe_frame``。
+        """
+        observer = getattr(self.source, "observe_frame", None)
+        if observer is not None:
+            observer(pixels, face_bbox)
 
     def feed(self, ts: float) -> dict[str, Any] | None:
         """喂一帧的取色结果。该发体征时报文就返回它，否则返回 ``None``。
@@ -291,7 +386,25 @@ class RppgMonitor:
             # 真人路径下这里对应"这一帧没有可用的人脸 ROI"。**不**把
             # 未取到色的帧当作 0 填进去：那会在缓冲里留下一段人造的
             # 波形，比留个空缺危险得多。
+            #
+            # 但**也不能无限期留着**。缓冲里那 22 秒旧波形会一直攒着，
+            # 直到人回到镜头前、:meth:`Rppg.update` 的滚动清理把它们
+            # 顶掉 —— 问题恰恰出在"顶掉"那一帧：离开 20~30 秒后回来，
+            # 缓冲 = 几十个离开前的旧样本 + 1 个新样本，``compute`` 的
+            # "最近 8 秒"掩码只圈到那 1 个新样本，``np.arange(x, x, ·)``
+            # 产出空数组，``np.convolve`` 直接把进程带走（真机复现：
+            # "Mean of empty slice" → "a cannot be empty"，运行中断）。
+            # 所以断流超过 :attr:`GAP_RESET_SEC` 就整个换新实例 ——
+            # 与时间轴回退同一套"换实例"的理由：人回来了就该从零攒窗口。
+            if self._gap_started is None:
+                self._gap_started = ts
+            elif ts - self._gap_started > self.GAP_RESET_SEC:
+                self._rppg = self._rppg_cls()
+                self._last_emit = None
+                self._gap_started = None
+                self.resets += 1
             return None
+        self._gap_started = None
         self._rppg.update(ts, *rgb)
 
         if self._last_emit is not None and ts - self._last_emit < self.emit_interval:
@@ -305,6 +418,7 @@ class RppgMonitor:
 
 __all__ = [
     "DEFAULT_VITALS",
+    "FaceRoiVitalsSource",
     "RppgMonitor",
     "SyntheticVitalsSource",
     "VitalsSource",

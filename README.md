@@ -62,7 +62,7 @@ cd frontend_C && python main.py --stream-url http://127.0.0.1:8010/stream.mjpeg
 
 ```bash
 cd backend_A && python main.py --list-scenarios    # 看有哪些合成剧本
-cd backend_A && python main.py --source camera     # 用真实摄像头
+cd backend_A && python main.py --source camera     # 用真实摄像头（需先下模型，见「安装」）
 cd backend_A && python main.py --source camera --stream   # 真像素 + 展示流
 cd frontend_C && python main.py --fullscreen       # 全屏无边框（答辩用，ESC 退出）
 cd frontend_C && python main.py --no-camera        # 退回单脸窗口（不分栏）
@@ -116,6 +116,21 @@ pip install -r backend_B/requirements-voice.txt   # 可选：语音（不装也�
 
 - `opencv-contrib-python` + `mediapipe` —— 模块 A 用。两者版本已锁定，
   MediaPipe 与 OpenCV 的版本不匹配是「昨天还好好的」类故障的主要来源。
+- **人脸模型（只在用真摄像头时才需要）** —— 仓库**故意不装**这个 3.6 MB 的
+  `face_landmarker.task`（合成源与 CSV 回放都用不到它，不需要就别下）。
+  用真摄像头时先下载，并且**必须放在纯 ASCII 路径**下：
+  ```bash
+  mkdir -p "$LOCALAPPDATA/mediapipe"
+  curl -L -o "$LOCALAPPDATA/mediapipe/face_landmarker.task" \
+    https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+  # 启动时用环境变量指过去（没有对应的命令行参数）
+  cd backend_A && FACE_LANDMARKER_MODEL="$LOCALAPPDATA/mediapipe/face_landmarker.task" \
+      python main.py --source camera --stream
+  ```
+  ⚠️ **本仓库路径含中文，MediaPipe 打不开中文路径下的模型文件**，报错还很骗人
+  （`FileNotFoundError: Unable to open file at <中文路径>`，可文件明明在、
+  `Path.exists()` 也返 True）。这与「A-单文件」遇到的是**同一个**问题，
+  详见 [backend_A/README.md](backend_A/README.md) 开头的「二、路径」与 §1。
 - `PyQt5` —— 模块 C 用。装完请用下面这条**验证**（`import PyQt5` 在残缺安装时
   会假成功，不作数）：
   ```bash
@@ -224,7 +239,18 @@ QT_QPA_PLATFORM=windows python -m pytest        # 1010 passed, 0 skipped
   **重启 A** → 退避 3s→4s→6s→9s 后自己连回来，**不用重启 C**。
   默认关与只绑回环都用 `netstat` 核实过（不加 `--stream` 时 8010 查无监听；
   监听地址是 `127.0.0.1:8010` 而非 `0.0.0.0:8010`）。
-  ⚠️ 这一趟用的**不是真摄像头**，是玩具像素（见下面「没有验证」）。
+  ⚠️ 这一趟用的**不是真摄像头**，是玩具像素（真摄像头那趟见下一条）。
+- **摄像头 + MediaPipe 真实采集 —— 2026-10-05 首次冒烟通过**：真摄像头
+  （`A --source camera --fps 15 --stream`）实测能起、能检脸、能进右栏：
+  日志里出现 `Created TensorFlow Lite XNNPACK delegate for CPU.`、
+  14.8 帧/s、时间戳零回退零超时、C 右栏是**真人画面 + 贴合脸部的绿框**、
+  B 判 `状态正常`。**但这是一次冒烟，不是验收**：只跑过一台机器、一个人、
+  一种光照，误报/漏报率与戴眼镜/逆光/侧脸/多人同框**一概没测**。
+  真机上看一眼仍然值得：人脸占比、绿框贴合、叠加层字号可读。
+  ⚠️ 这条路**卡过一个门槛**：真人坐不住时，B 的被动校准（要求头姿
+  P10–P90 跨度 ≤8°）建不起基线，专注度会一直停在「校准预热中」；
+  这不是 bug，判据与绕过办法见
+  [backend_A/README.md §8](backend_A/README.md)。
 - **语音识别链路跑通（用合成语音）**：本机装了 vosk 0.3.45 +
   `vosk-model-small-cn-0.22`，喂进去的中文语音 → 16kHz PCM → vosk → 文本，
   三句话全部识别正确。
@@ -237,12 +263,6 @@ QT_QPA_PLATFORM=windows python -m pytest        # 1010 passed, 0 skipped
 
 **没有验证（需要你在真机上看一眼）：**
 
-- **摄像头 + MediaPipe 真实采集**：本机跑的是合成源与离线 CSV，
-  真实摄像头这条路没有验过。
-  **右栏画面也一样**：展示流的验收全程用的是 `--source synthetic-pixels`
-  的**玩具像素**（像素→JPEG→HTTP→C 解码上屏这条链子通了，但那张图不是人脸、
-  绿框也是画上去的）。真机上看一眼：`A --source camera --stream` +
-  `C --stream-url …`，确认人脸占比、绿框贴合、叠加层字号可读。
 - **真人对着麦克风说话**：语音识别只用 SAPI 合成的语音验证过，
   真人说话的口音、语速、环境噪声都还没试。想看这一条行不行：
   `cd backend_B && python main.py --voice`，对麦克风说一句，

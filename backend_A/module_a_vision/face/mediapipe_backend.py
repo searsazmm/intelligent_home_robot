@@ -69,6 +69,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import shutil
 import threading
 import time
 import warnings
@@ -110,6 +111,44 @@ MODEL_DOWNLOAD_HINT = (
     "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
     "face_landmarker/float16/1/face_landmarker.task"
 )
+
+#: 非 ASCII 模型路径的自动缓存目录。mediapipe 的 C++ 层（``BaseOptions.
+#: model_asset_path``）在 Windows 上打不开含中文等非 ASCII 字符的路径 ——
+#: 报 ``FileNotFoundError`` 但文件明明在（见 backend_A/README「已知问题」）。
+#: 本仓库恰好放在中文目录里，所以检测到这种路径就**自动复制一份到纯 ASCII
+#: 的缓存位置**再加载，让默认路径开箱即用、不再要求手动设环境变量。
+ASCII_MODEL_CACHE_DIR: Path = Path.home() / ".cache" / "ihr" / "models"
+
+
+def _ascii_safe_model_path(path: Path) -> Path:
+    """路径含非 ASCII 字符时，把模型复制到纯 ASCII 缓存并返回副本路径。
+
+    复制是**幂等**的：目标已存在且大小一致就复用，不重复拷贝十几 MB。
+    复制失败（磁盘满、权限等）时抛 :class:`FaceBackendError`，提示手动兜底 ——
+    静默吞掉的话，错误会在 mediapipe 内部以同样难懂的 ``FileNotFoundError``
+    复现，而不是一条能指导操作的说明。
+    """
+    try:
+        str(path).encode("ascii")
+    except UnicodeEncodeError:
+        pass
+    else:
+        return path  # 纯 ASCII 路径，mediapipe 能直接打开
+
+    target = ASCII_MODEL_CACHE_DIR / path.name
+    try:
+        if not (target.exists() and target.stat().st_size == path.stat().st_size):
+            ASCII_MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, target)
+        _log.info("模型路径含非 ASCII 字符，已使用 ASCII 缓存副本：%s", target)
+        return target
+    except OSError as exc:
+        raise FaceBackendError(
+            f"模型路径含非 ASCII 字符（mediapipe 无法直接打开），"
+            f"自动复制到 {ASCII_MODEL_CACHE_DIR} 失败：{exc}\n"
+            f"请手动把 {path} 复制到任意纯 ASCII 路径，"
+            f"再用环境变量 {MODEL_ENV_VAR} 指过去。"
+        ) from exc
 
 # ================================================================ 关键点编号
 
@@ -302,7 +341,7 @@ class MediaPipeFaceBackend(BaseFaceBackend):
                 f"  或用环境变量指定：{MODEL_ENV_VAR}=D:\\\\path\\\\to\\\\face_landmarker.task\n"
                 "无摄像头/离线开发场景不需要它——请改用 SyntheticFaceBackend。"
             )
-        return path
+        return _ascii_safe_model_path(path)
 
     def _create_landmarker(self, mp_python, vision, path: Path):
         """按 Tasks API 创建 landmarker。

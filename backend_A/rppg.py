@@ -121,6 +121,14 @@ class Rppg:
         # --- CHROM 脉搏波 + HR + SQI：最近 hr_window 秒 ---
         mask = t_all >= t_all[-1] - self.hr_window
         t_hr = t_all[mask]
+        if t_hr.size < 30:
+            # 最近 hr_window 秒里样本太少。典型场景：长时间无人脸后刚恢复，
+            # 缓冲里全是断流前的旧样本，"最近 8 秒"只圈到 1 个新样本 ——
+            # t_hr 只有 1 个元素时 np.arange(t_hr[0], t_hr[-1], ·) 产出
+            # 空数组，np.interp 跟着空，np.convolve 抛 "a cannot be empty"
+            # 把整个采集进程带走（真机复现，2026-10-06）。30 与上面
+            # len(t_all) >= 30 是同一道门槛（约 2 秒 @15fps）。
+            return self.hr, self.rr, self.ibi_ms, self.sqi
         grid = np.arange(t_hr[0], t_hr[-1], 1.0 / fs)
 
         def interp(ch):

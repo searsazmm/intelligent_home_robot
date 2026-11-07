@@ -164,6 +164,9 @@ class VisionServer:
             #: 已发出的体征报文数（§3.5）。**0 就说明体征通道是死的** ——
             #: 演示时它应该以 1Hz 稳定增长。
             "rppg_packets": 0,
+            #: 体征取色失败次数（真人路径）。**非零不致命**（按"这一帧
+            #: 没人脸"处理），但持续增长说明 ROI 坐标与像素对不上。
+            "vitals_observe_errors": 0,
             #: 已发出的视线报文数（§3.5）。它与帧**同频**，所以
             #: ``focus_packets`` 与 ``v1_frames`` 在 ``focus=True`` 时应当
             #: **完全相等**（两者都只在真发出去之后才自增）。对不上就是
@@ -271,6 +274,10 @@ class VisionServer:
             # 累计计数器是在 add_frame 里自增的。反过来会永远晚一帧。
             self.aggregator.add_frame(frame)
 
+            # 体征取色排在**清零之前** —— 这是像素活着的时候唯一能碰到
+            # 它的机会（见 _observe_vitals 与 _publish_frame 的时序说明）。
+            self._observe_vitals(frame, pixels)
+
             # 展示流排在**推理之后**：叠加要画 face_bbox，它来自 frame。
             # 反过来框会比画面晚一帧，头一转就看得出来。
             self._publish_frame(frame, pixels)
@@ -314,6 +321,28 @@ class VisionServer:
         )
 
     # ------------------------------------------------------------ 展示流
+
+    def _observe_vitals(self, frame: Any, pixels: Any) -> None:
+        """在像素清零**前**把取色交给体征源（真人路径用）。
+
+        **时序换不得。** ``_publish_frame`` 会当场把像素就地清零
+        （"用完即毁"），之后体征通道再想取色就拿到的全 0 —— 那不是
+        "测不出心率"，是往 FFT 里灌了一段人造方波。所以取色必须发生在
+        ``_publish_frame`` 之前。
+
+        合成源没有这一步也能工作（它的取色与像素无关），所以走
+        ``getattr`` 鸭子协议而不是改 ``RppgMonitor`` 的必选接口。
+        取色失败按"这一帧没人脸"处理，**绝不把采集主循环带走**
+        （与 ``_scrub`` 同一条忍法）。
+        """
+        if self.vitals is None or pixels is None:
+            return
+        try:
+            self.vitals.observe_frame(pixels, getattr(frame, "face_bbox", None))
+        except Exception as exc:   # noqa: BLE001 —— 理由见 docstring
+            self.stats["vitals_observe_errors"] += 1
+            if self.stats["vitals_observe_errors"] == 1:
+                print(f"[A] ⚠ 体征取色失败（按无人脸处理）：{exc}")
 
     def _publish_frame(self, frame: Any, pixels: Any) -> None:
         """把这一帧交给展示流，然后**当场把像素清零**。
@@ -382,10 +411,10 @@ class VisionServer:
 
         ⚠️ **这里的 ``self.vitals is None`` 只关掉自己。** 原先两条通道
         共用 :meth:`_emit_side_channels`、由 ``vitals is None`` 一并早退；
-        视线通道挂进来之后那个写法就成了一个静默陷阱：CSV 回放与 camera
-        源都没有体征（``build_server`` 只给合成源挂），于是**每帧都被那道
-        早退挡在视线通道之外**，表现是"VAI 一直不工作"，而"体征没开"
-        看起来完全正常。两条通道各自守各自的门，谁也不替谁决定。
+        视线通道挂进来之后那个写法就成了一个静默陷阱：CSV 回放没有体征
+        （没有 RGB 列也没有像素），于是**每帧都被那道早退挡在视线通道
+        之外**，表现是"VAI 一直不工作"，而"体征没开"看起来完全正常。
+        两条通道各自守各自的门，谁也不替谁决定。
         """
         if self.vitals is None:
             return
@@ -613,10 +642,12 @@ def build_server(
     时间戳在瞬间跳完的窗口，冷却与持续性判定全部失去意义。
     离线验证数据契约时设 ``False``。
     :param emit_mode: ``"v1"``（默认）或 ``"v2"``，见 :class:`VisionServer`。
-    :param vitals: 是否挂 §3.5 的体征通道。**只有合成源挂得上** ——
-        它是目前唯一能给出 RGB 的源（合成体征直出 ``(t, R, G, B)``）。
-        CSV 回放既没有 RGB 列也没有像素；camera / video 的真像素取色
-        本步尚未实现。传 ``False`` 可以要一条只发帧的干净流（排查用）。
+    :param vitals: 是否挂 §3.5 的体征通道。合成源直出 RGB
+        （:class:`~module_a_vision.vitals.SyntheticVitalsSource`，环路自检）；
+        camera / video 由 :class:`~module_a_vision.vitals.FaceRoiVitalsSource`
+        从 ``face_bbox`` 上三分之一取色（真人测量，8s 窗口满前 hr/rr 置灰）。
+        CSV 回放既没有 RGB 列也没有像素，**不挂**。传 ``False`` 可以要一条
+        只发帧的干净流（排查用）。
     :param focus: 是否发 §3.5 的视线报文。**所有源都发得起**（视线来自
         每一帧自己的 ``gaze_off_ratio``，不需要额外数据源），所以默认开，
         而且**与 ``vitals`` 无关** —— 想得到"只含帧报文"的干净流，
@@ -706,6 +737,8 @@ def build_server(
             "video / csv / camera"
         )
 
+    from .vitals import FaceRoiVitalsSource, RppgMonitor
+
     return VisionServer(
         source=source,
         backend=backend,
@@ -713,6 +746,9 @@ def build_server(
         host=host,
         port=port,
         emit_mode=emit_mode,
+        # 真人取色：face_bbox 上 1/3 均值 → CHROM。取色发生在像素清零
+        # **之前**（server._observe_vitals），窗口满前 hr/rr 置灰是正常态。
+        vitals=RppgMonitor(FaceRoiVitalsSource()) if vitals else None,
         focus=focus,
         stream=stream,
     )
