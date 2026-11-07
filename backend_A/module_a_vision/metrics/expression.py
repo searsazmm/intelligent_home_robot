@@ -35,6 +35,7 @@ ARKit 系数是相对"中性脸"定义的。而老人的面部松弛、眼睑下
 from __future__ import annotations
 
 import math
+from collections import Counter, deque
 from typing import Protocol
 
 from shared.enums import Emotion
@@ -333,3 +334,73 @@ def _uniform_normal() -> dict[str, float]:
         str(Emotion.SAD): 0.0,
         str(Emotion.UPSET): 0.0,
     }
+
+
+class ExpressionVoteFilter:
+    """表情输出的滑动窗口多数投票平滑器（纯标准库，零依赖）。
+
+    解决的问题
+    -----------
+    ``BlendshapeExpressionClassifier`` 是**逐帧**判定的。摄像头画面抖动、
+    老人头部微晃、一次眨眼或说话的口型，都足以让单帧标签在
+    normal/sad/tired 之间来回横跳——这些瞬时误判直接写进报文，就是
+    下游看到的"表情标签快速闪烁"。
+
+    本滤波器在分类器与对外输出之间加一道缓冲：
+
+    1. **滑动窗口**：缓存最近 ``window_size`` 帧（默认 7，取 5~8 的中值；
+       25 fps 下窗口跨度约 0.28 秒）的单帧标签；
+    2. **多数投票**：窗口内出现次数最多的类别即主导类；
+    3. **连续性闸门**：主导类与当前对外标签**不同**时，还必须满足
+       "窗口末尾连续 ``switch_consecutive`` 帧（默认 3）都是它"才真正
+       切换——单帧毛刺进得了窗口、过不了这道门。
+
+    延迟账（约束 4：实时性）
+    ------------------------
+    切换需要「窗口末尾连续 ``switch_consecutive`` 帧一致」与「窗口内
+    多数」**同时**成立。从稳态切入新表情的最坏情形是第
+    ``switch_consecutive + 1`` 帧（默认第 4 帧，25 fps 下约 **160 毫秒**）；
+    被滤掉的毛刺只损失那 1~2 帧（40~80 毫秒）的瞬时信息——拿一眨眼的
+    延迟换掉整条状态链路的闪烁，值得。
+
+    只滤标签、不碰分布
+    --------------------
+    滤波器只对外输出"平滑后的主标签"。置信度与四类分布仍由调用方
+    （窗口级投票）另行聚合——那里的投票窗口是 10 秒全窗，比这里更平滑，
+    语义也不同（一个管逐帧遥测，一个管窗口报文），互不掺和。
+    """
+
+    def __init__(self, window_size: int = 7, switch_consecutive: int = 3) -> None:
+        if window_size < 1:
+            raise ValueError(f"window_size 必须 ≥ 1，收到 {window_size}")
+        #: 连续性闸门不能超过窗口本身，否则永远切不过去。
+        self._window: deque[str] = deque(maxlen=window_size)
+        self._switch_need = min(max(switch_consecutive, 1), window_size)
+        self._out = str(Emotion.NORMAL)
+
+    @property
+    def output(self) -> Emotion:
+        """当前对外输出的表情标签。"""
+        return Emotion(self._out)
+
+    def feed(self, label: Emotion) -> Emotion:
+        """喂入一帧的单帧分类结果，返回平滑后的对外标签。
+
+        **每帧都要喂**（包括无脸帧——它们投"normal"票，人离开画面时
+        输出自然回落）；返回值即写进报文的 ``emo_feature``。
+        """
+        self._window.append(str(label))
+        counts = Counter(self._window)
+        winner = max(counts, key=lambda k: counts[k])
+        if winner != self._out and self._tail_streak(winner) >= self._switch_need:
+            self._out = winner
+        return Emotion(self._out)
+
+    def _tail_streak(self, label: str) -> int:
+        """窗口末尾连续多少帧都是 ``label``（毛刺检测的核心）。"""
+        streak = 0
+        for vote in reversed(self._window):
+            if vote != label:
+                break
+            streak += 1
+        return streak

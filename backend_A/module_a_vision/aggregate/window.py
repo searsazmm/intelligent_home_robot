@@ -55,7 +55,11 @@ from shared.schema import (
 )
 
 from ..metrics.attention import AttentionTracker
-from ..metrics.expression import BlendshapeExpressionClassifier, NeutralCalibrator
+from ..metrics.expression import (
+    BlendshapeExpressionClassifier,
+    ExpressionVoteFilter,
+    NeutralCalibrator,
+)
 from ..metrics.eye import PERCLOS_WINDOW_SEC, EyeTracker, fuse_or_raw
 from ..metrics.fatigue import assess as assess_fatigue
 from ..metrics.head_pose import HeadPoseEstimator
@@ -114,6 +118,11 @@ class AggregatorConfig:
     min_closed_sec: float = 5.0
     #: 帧有效率低于此值时整个窗口不可用。
     min_valid_ratio: float = 0.30
+    #: 表情输出平滑：滑动窗口帧数（需求口径 5~8 帧，取中值 7；
+    #: 25 fps 下窗口跨度约 0.28 秒，延迟可忽略）。
+    emo_smooth_window: int = 7
+    #: 表情输出平滑：与当前输出不同时，需窗口末尾连续这么多帧一致才切换。
+    emo_smooth_switch: int = 3
     #: 老花镜带来的置信度惩罚（设计方案 §4.9）。
     glasses_penalty: float = 0.15
     device_id: str = "cam-livingroom-01"
@@ -142,6 +151,13 @@ class WindowAggregator:
 
         self._calibrator = NeutralCalibrator()
         self._expression = BlendshapeExpressionClassifier(self._calibrator)
+        # 逐帧表情输出不走"裸分类"：滑动窗口多数投票把画面抖动、
+        # 头部微晃造成的单帧误判挡在报文之外（否则 8000 遥测里的
+        # emo_feature 会逐帧闪烁）。
+        self._emo_filter = ExpressionVoteFilter(
+            window_size=self.cfg.emo_smooth_window,
+            switch_consecutive=self.cfg.emo_smooth_switch,
+        )
         self._eyes = EyeTracker(perclos_window_sec=PERCLOS_WINDOW_SEC)
         self._attention = AttentionTracker()
         self._head_pose = HeadPoseEstimator()
@@ -205,9 +221,15 @@ class WindowAggregator:
 
         调用时机需在 :meth:`add_frame` 之后：本帧若恰好完成一次眨眼，
         :attr:`blink_total` 是在 ``add_frame`` 里自增的。
+
+        返回值**不是**裸分类结果，而是经 :class:`ExpressionVoteFilter`
+        平滑后的标签（滑动窗口多数投票 + 连续多帧才切换）：单帧毛刺
+        被挡在报文之外，真实的表情切换只延迟约 3 帧（25 fps 下
+        约 120 毫秒）。窗口级分类（``_aggregate_observations``）仍直接
+        用 ``self._expression``，不经滤波——两条路径语义不同，见滤波器文档。
         """
         emotion, _confidence, _dist = self._expression.classify(frame)
-        return emotion
+        return self._emo_filter.feed(emotion)
 
     # ------------------------------------------------------------ 关窗
 
