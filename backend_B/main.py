@@ -41,11 +41,12 @@ import argparse
 import logging
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from typing import Iterable, List, Optional, Tuple
 
 # 允许 `python backend_B/main.py` 与 `cd backend_B && python main.py` 两种方式都能跑：
 # 保证本目录在 sys.path 里，这样 `import config` / `from core import ...` 都能工作。
@@ -1099,6 +1100,38 @@ def fix_console_encoding() -> None:
             pass
 
 
+def find_live_listeners(
+    endpoints: Iterable[Tuple[str, int]],
+    timeout: float = 0.5,
+    _connect=None,
+) -> List[Tuple[str, int]]:
+    """探测 endpoints 里哪些 (host, port) **已经有服务在监听**。
+
+    背景（2026-10-09 现场）：``ui_channel`` 的服务端 socket 设了
+    ``SO_REUSEADDR``，在 Windows 上它的语义是"别的进程把同一个端口
+    再绑一遍也**不报错**"。于是"重启时旧进程没杀干净"不会在 bind
+    处炸出来，而是静默叠出第二个、第三个 B 端实例 —— 几个实例同时
+    听 8002、同时拾音、同时回答，用户问一句会有好几个声音一起应答；
+    实例之间又互不同步半双工静音，甲的播报会被乙当成用户说话，
+    连锁自激出"机器人自己说个不停"。
+
+    所以 bind 成功不再代表端口是自己的，必须在 bind **之前**主动连
+    一下：连得上就说明端口上已有活人在听。TIME_WAIT 的残留连接不
+    接受 connect，不会被误判；探测用的连接立刻关闭，对真正的 B 端
+    无副作用（它只是多了一个转瞬即逝的客户端）。
+    """
+    connect = _connect or socket.create_connection
+    busy: List[Tuple[str, int]] = []
+    for host, port in endpoints:
+        try:
+            sock = connect((host, port), timeout=timeout)
+        except OSError:
+            continue                       # 连不上 = 没有活的监听者
+        sock.close()
+        busy.append((host, port))
+    return busy
+
+
 def main(argv=None) -> int:
     fix_console_encoding()
 
@@ -1113,6 +1146,19 @@ def main(argv=None) -> int:
         print()
         print("用法：拿名字里的**一段**填给 --audio-in / --audio-out，不要用序号。")
         return 0
+
+    # ---- 多实例自检：必须在任何 bind 之前（见 find_live_listeners 的注释）----
+    busy = find_live_listeners(
+        ((args.status_host, args.status_port),
+         (args.chat_host, args.chat_port)))
+    if busy:
+        for host, port in busy:
+            logger.error(
+                "端口 %s:%d 已有服务在监听 —— 大概率是上一次启动的 B 端"
+                "没有关干净（Windows 的 SO_REUSEADDR 允许新旧实例静默共存，"
+                "表现为机器人用好几个声音一起回答）。"
+                "先关掉旧进程：netstat -ano | findstr :%d", host, port, port)
+        return 1
 
     app = BackendB(args)
     try:
