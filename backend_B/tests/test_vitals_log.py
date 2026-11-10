@@ -276,8 +276,10 @@ class TestConcurrentWriters(VitalsLogTestCase):
     def test_threads_serialize_into_queue(self):
         """四个线程同时写：串行落库、一条不丢、调用方零阻塞。
 
-        每条之间稍作间隔，让消费速度跟上生产 —— 溢出丢弃是**预期策略**
-        （专门用例已覆盖），这个用例验证的是"无溢出时一条不丢"。
+        每条 state 唯一（t{seed}-{i}）：write_state_event 的"仅切换写入"
+        去重会把相邻同状态吞掉 —— 那是 TestStateTransitions 专门测的
+        **设计语义**，不该混进这个用例。这里要验证的是并发串行化本身。
+
         队列容量调大到 256：「无溢出」这个前提必须由容量保证，不能
         指望时序 —— 全量回归时磁盘忙、commit 变慢，32 容量下会偶发
         丢弃几条（91/100），把断言变成对机器负载的赌注（flaky）。
@@ -288,11 +290,9 @@ class TestConcurrentWriters(VitalsLogTestCase):
         def hammer(seed: int) -> None:
             try:
                 for i in range(25):
-                    writer.write_state_event(f"t{seed}", "", ts=float(seed * 100 + i))
-                    # 0.02s：给"消费跟上灌入"留足余量 —— 0.005 在 coverage
-                    # 插桩/慢盘下会让 commit 掉队，偶发丢 1 条（99/100）。
-                    # 容量 256 已保证不溢出，这里再让节奏稳一点。
-                    time.sleep(0.02)
+                    writer.write_state_event(
+                        f"t{seed}-{i}", "", ts=float(seed * 100 + i))
+                    time.sleep(0.02)   # 给消费留余量，压低队列水位
             except Exception as exc:   # pragma: no cover
                 errors.append(exc)
 
@@ -302,7 +302,10 @@ class TestConcurrentWriters(VitalsLogTestCase):
         for t in threads:
             t.join()
         self.assertEqual(errors, [])
-        writer.close()
+        # close 的 join 上限放宽到 30s：coverage 插桩/磁盘忙时 100 条
+        # commit 可能超过默认 5s —— 那是**测试等待预算**问题，不是
+        # "一条不丢"语义问题（队列容量 256 保证无溢出）。
+        writer.close(timeout=30.0)
         self.assertEqual(len(rows(self.db_path, "state_events")), 100)
 
 
@@ -412,6 +415,90 @@ class TestWriterRetentionCleanup(VitalsLogTestCase):
         data = rows(self.db_path, "vitals_samples")
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0][2], 75)
+
+
+# ===========================================================================
+# 故障路径兜底：建库失败 / 清理失败 / 关库失败（覆盖率缺口里"制造故障
+# 才走到"的分支 —— 它们是 config §17 "落盘绝不拖垮主循环"的最后一道墙）
+# ===========================================================================
+
+class _ConnWithBrokenClose:
+    """close() 必抛的连接代理 —— sqlite3.Connection 的属性只读，
+    mock.patch 遮蔽不了内置 close，只能包一层。其余调用透传真连接。"""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def close(self) -> None:
+        raise sqlite3.OperationalError("unable to close: locked")
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestFailurePaths(VitalsLogTestCase):
+
+    def test_bootstrap_failure_degrades_to_disabled(self):
+        """建库失败：写线程退出、ready 置位、_conn 为 None，close 不炸。
+
+        现实触发：磁盘只读/满。用 mock 让 connect 直接抛 —— 真实文件系统
+        造"必然失败"在 Windows 上不可靠。
+        """
+        with mock.patch.object(vitals_log.sqlite3, "connect",
+                               side_effect=sqlite3.OperationalError("disk I/O error")):
+            writer = VitalsLogWriter(self.db_path)
+            self._writers.append(writer)
+            self.assertTrue(writer._ready.wait(timeout=5.0),
+                            "建库失败也必须置位 ready（调用方不能无限等）")
+            self.assertIsNone(writer._conn)
+            writer.close(timeout=2.0)   # 不抛即通过
+
+    def test_cleanup_failure_is_logged_and_writing_continues(self):
+        """清理语句抛异常：记日志、下个周期重试，之后的写入照常落库。"""
+        with mock.patch.object(vitals_log, "delete_expired_vitals",
+                               side_effect=RuntimeError("boom")) as deleter:
+            # retention/cleanup 都 >0：写线程空转 1s（CLEANUP_WAKE_SEC）后
+            # 会做首轮清理 —— 正好踩进异常分支
+            writer = self.make_writer(retention_days=7.0, cleanup_interval=3600.0)
+            time.sleep(1.3)
+            self.assertTrue(deleter.called, "首轮清理应已执行过")
+            # 清理炸了，写线程必须还活着、还能写
+            self.assertTrue(writer.write_state_event("normal", "", ts=time.time()))
+            time.sleep(0.3)
+            writer.close()
+            self.assertEqual(len(rows(self.db_path, "state_events")), 1)
+
+    def test_enqueue_after_close_is_silent_noop(self):
+        """close 之后再调用写入方法：静默跳过，绝不抛异常打扰 B 主循环。"""
+        writer = self.make_writer()
+        writer.close()
+        # 两类写入方法在 close 后都应是 no-op（覆盖率缺口 246：_closed 短路）
+        writer.maybe_write_vitals(make_reading(hr=80), now=time.time())
+        writer.write_state_event("normal", "", ts=time.time())
+        self.assertEqual(rows(self.db_path, "vitals_samples"), [])
+
+    def test_close_tolerates_conn_close_error(self):
+        """收尾关库失败（库被外部占用等）：吞掉，线程正常退出。"""
+        # 独立临时目录且容忍清理失败：这个用例故意让真连接逃过写线程的
+        # 正常关闭，Windows 上 WAL 文件句柄释放有延迟，TemporaryDirectory
+        # 硬删会撞 WinError 32 —— 交给系统 temp 回收，不为它写等待逻辑。
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        writer = VitalsLogWriter(os.path.join(tmp.name, "family_data.sqlite3"))
+        self._writers.append(writer)
+        self.assertTrue(writer._ready.wait(timeout=5.0))
+        real_conn = writer._conn
+        writer._conn = _ConnWithBrokenClose(real_conn)
+        # 线程此刻阻塞在 queue.get 上，换连接安全。真连接**不能**在主线程
+        # close（check_same_thread 拦截 —— 正是"连接独占在写线程"的纪律），
+        # 逃过正常关闭的它连同 WAL 句柄留给系统 temp 回收 —— 上面的
+        # ignore_cleanup_errors 就是为这一步准备的。
+        writer.close(timeout=2.0)       # 不抛即通过（305-306 的 except pass）
+
+    # close 时"哨兵塞入 Full → 挤出一条 → 再塞仍 Full"的双重兜底（235-236）
+    # 不写测试：真实触发需要多生产者与 close 的精确竞态，mock 队列又会
+    # 破坏消费循环本身 —— 纯防御分支，以代码评审把关，不为凑覆盖硬造。
+
 
 
 if __name__ == "__main__":

@@ -398,6 +398,202 @@ class TestWellnessIndices(TempDbMixin, TestCase):
         self.assertContains(resp, "精神压力指数")
 
 
+class TestStatusWords(unittest.TestCase):
+    """状态词表全覆盖 —— 每个词都对应一条**有依据**的规则分支。
+
+    页面上每一个状态词（偏快/过缓/有波动…）都是给家属看的判断，
+    词错一个就误导一次。此前只被 88/90 这种"偏高"路径偶然覆盖过，
+    这里把整张词表钉死。
+    """
+
+    def test_hr_word_table(self):
+        f = self._words()
+        # 词表函数返回 (word, level, tip) 三元组，断言取 [0]
+        self.assertEqual(f["_hr_word"](None)[0], "未检出")
+        self.assertEqual(f["_hr_word"](105)[0], "过速")   # > 100
+        self.assertEqual(f["_hr_word"](88)[0], "偏快")    # > 85
+        self.assertEqual(f["_hr_word"](72)[0], "平稳")    # 60~85
+        self.assertEqual(f["_hr_word"](58)[0], "偏缓")    # < 60
+        self.assertEqual(f["_hr_word"](50)[0], "过缓")    # < 55
+        # 边界值归属：恰在阈值上取宽的一侧（85/60 平稳、55 偏缓）
+        self.assertEqual(f["_hr_word"](85)[0], "平稳")
+        self.assertEqual(f["_hr_word"](60)[0], "平稳")
+        self.assertEqual(f["_hr_word"](55)[0], "偏缓")
+        # level 分级与词一致：过速/过缓是 bad，偏快/偏缓是 mid
+        self.assertEqual(f["_hr_word"](105)[1], "bad")
+        self.assertEqual(f["_hr_word"](88)[1], "mid")
+
+    def test_rr_word_table(self):
+        f = self._words()
+        self.assertEqual(f["_rr_word"](None)[0], "未检出")
+        self.assertEqual(f["_rr_word"](8)[0], "过缓")     # < 10
+        self.assertEqual(f["_rr_word"](11)[0], "偏缓")    # < 12
+        self.assertEqual(f["_rr_word"](16)[0], "平稳")    # 12~20
+        self.assertEqual(f["_rr_word"](22)[0], "偏快")    # > 20
+
+    def test_mood_and_energy_word_tables(self):
+        # None 由调用方兜底（summary 未生成时不进词表），词表只认 0~1 数值
+        f = self._words()
+        self.assertEqual(f["_mood_word"](0.1)[0], "良好")   # < 0.15
+        self.assertEqual(f["_mood_word"](0.2)[0], "平稳")   # < 0.30
+        self.assertEqual(f["_mood_word"](0.4)[0], "有波动")  # < 0.50
+        self.assertEqual(f["_mood_word"](0.6)[0], "偏低落")
+        self.assertEqual(f["_energy_word"](0.1)[0], "充沛")
+        self.assertEqual(f["_energy_word"](0.2)[0], "正常")
+        self.assertEqual(f["_energy_word"](0.4)[0], "易疲惫")
+        self.assertEqual(f["_energy_word"](0.6)[0], "疲乏")
+
+    @staticmethod
+    def _words() -> dict:
+        from family_portal import report as rep
+        return {"_hr_word": rep._hr_word, "_rr_word": rep._rr_word,
+                "_mood_word": rep._mood_word, "_energy_word": rep._energy_word}
+
+
+class TestDietAdviceBranches(TempDbMixin, TestCase):
+    """饮食建议规则的全分支：每条建议都必须有触发条件，且带依据。
+
+    此前只测过"心率偏高"一条路径，这里补齐低心率/情绪/气温分支 ——
+    这些规则是发给家属看的，漏一条 = 该提醒时没提醒。
+    """
+
+    @staticmethod
+    def _stats(hr=72.0, rr=16.0, tired=0.0, sad=0.0, negative=None) -> dict:
+        dist = []
+        if tired:
+            dist.append({"state": "tired", "ratio": tired, "seconds": 3600})
+        if sad:
+            dist.append({"state": "sad", "ratio": sad, "seconds": 3600})
+        return {"sample_count": 100, "hr_avg": hr, "rr_avg": rr,
+                "negative_ratio": negative, "state_distribution": dist}
+
+    def _texts(self, stats, weather=None) -> str:
+        from family_portal import report as rep
+        return " ".join(rep.diet_advice(stats, weather))
+
+    def test_low_hr_advise_iron(self):
+        self.assertIn("偏低", self._texts(self._stats(hr=50.0)))
+
+    def test_sad_ratio_advise_companionship(self):
+        self.assertIn("情绪低落", self._texts(self._stats(sad=0.4)))
+
+    def test_negative_without_single_state_advise_family_time(self):
+        """负面占比 >=50% 但疲惫/低落单项都不足 30%（混合型）也要接住。"""
+        text = self._texts(self._stats(tired=0.25, sad=0.2, negative=0.6))
+        self.assertIn("晒太阳", text)
+
+    def test_hot_weather_advise_hydration(self):
+        text = self._texts(self._stats(), weather={"temp": 32.0, "code": 0, "wind": 1.0})
+        self.assertIn("补水", text)
+
+    def test_cold_weather_advise_warm_food(self):
+        text = self._texts(self._stats(), weather={"temp": 2.0, "code": 0, "wind": 1.0})
+        self.assertIn("温热", text)
+
+
+class TestHealthScoreBranches(TempDbMixin, TestCase):
+    """健康综合评分的扣分分支：心缓/呼吸慢、'建议关注'档位。"""
+
+    def test_low_hr_and_slow_rr_deduct(self):
+        """hr=55、rr=10：两个'偏缓'方向同样扣分（此前只测过偏快方向）。"""
+        from family_portal import report as rep
+        s = rep.health_summary({"sample_count": 100, "hr_avg": 55.0,
+                                "rr_avg": 10.0, "negative_ratio": 0.0,
+                                "state_distribution": []})
+        # 100 - (60-55)/2 - (12-10) = 95.5 → round 银行家舍入 → 96
+        self.assertEqual(s["score"], 96)
+
+    def test_score_below_70_says_attention(self):
+        from family_portal import report as rep
+        dist = [{"state": "sad", "ratio": 1.0, "seconds": 3600}]
+        s = rep.health_summary({"sample_count": 100, "hr_avg": 90.0,
+                                "rr_avg": 16.0, "negative_ratio": 1.0,
+                                "state_distribution": dist})
+        # 100 - 2.5 - 30 = 67.5 → 68 → 最低档"建议关注"
+        self.assertEqual(s["score"], 68)
+        self.assertEqual(s["overall"], "建议关注")
+
+
+class TestStatsDateBranches(TempDbMixin, TestCase):
+    """stats 的日期参数分支：指定日期统计、未来事件截断。"""
+
+    def test_day_start_parses_date_string(self):
+        from family_portal import stats as st
+        ts = st._day_start("2026-11-01", 0)
+        self.assertEqual(ts, datetime(2026, 11, 1).timestamp())
+
+    def test_distribution_with_explicit_date_only_counts_that_day(self):
+        now = time.time()
+        self.insert_vitals(now, hr=72, rr=16.0)                      # 今天
+        # 3 天前：事件放在**当天零点后一分钟** —— 覆盖几乎全天；
+        # 若误按"7 天窗"统计，ratio 会被今天等其它天稀释
+        old_midnight = (datetime.now() - timedelta(days=3)
+                        ).replace(hour=0, minute=0, second=1, microsecond=0)
+        self.insert_vitals(old_midnight.timestamp(), hr=80, rr=16.0)
+        self.insert_state(old_midnight.timestamp(), "tired", "过去")
+        self.commit()
+        old_day = old_midnight.strftime("%Y-%m-%d")
+        dist = stats.state_distribution(self.conn, date_str=old_day)
+        # 返回 list（时长降序），span_covered 在末项、取值 0~1
+        self.assertTrue(dist, "指定日期应有分布数据")
+        self.assertTrue(all(d["ratio"] > 0.9 for d in dist[:-1]))  # tired 主导
+        self.assertGreater(dist[-1]["span_covered"], 0.95)  # 覆盖近全天，非 7 天窗
+
+    def test_future_state_events_are_excluded(self):
+        """未来时间戳的状态事件（时钟回拨残留等）不得计入今日时长。"""
+        now = time.time()
+        self.insert_state(now - 300, "normal", "五分钟前")
+        self.insert_state(now + 3600, "tired", "未来")   # seg_end=min(now,..) < start
+        self.commit()
+        dist = stats.state_distribution(self.conn)
+        states = {d["state"]: d["ratio"] for d in dist}
+        # 未来事件整段被丢弃；过去的事件保留（ratio 是"占当天已流逝时间"
+        # 的比例且保留 3 位小数，5 分钟的时段数值会被舍到 0.0，不比大小）
+        self.assertNotIn("tired", states)
+        self.assertIn("normal", states)
+
+
+class TestFailureFallbacks(TempDbMixin, TestCase):
+    """db/views 的故障兜底分支（覆盖率缺口：需要制造故障才走到）。"""
+
+    def test_db_path_default_when_setting_absent(self):
+        from family_portal import db
+        with override_settings(FAMILY_DB_PATH=None):
+            self.assertTrue(str(db.db_path()).replace("\\", "/")
+                            .endswith("backend_B/data/family_data.sqlite3"))
+
+    def test_connect_ro_returns_none_on_sqlite_error(self):
+        from family_portal import db
+        with mock.patch.object(db.sqlite3, "connect",
+                               side_effect=sqlite3.OperationalError("corrupt")):
+            self.assertIsNone(db.connect_ro(self.db_file))
+
+    def test_ensure_tables_with_none_conn(self):
+        from family_portal import db
+        self.assertFalse(db.ensure_tables_or_none(None))
+
+    def test_ensure_tables_with_broken_conn(self):
+        """坏连接（已关闭）上查表：吞 ProgrammingError 返回 False，
+        绝不让"库不可用"变成 500。"""
+        from family_portal import db
+        conn = sqlite3.connect(self.db_file)
+        conn.close()
+        self.assertFalse(db.ensure_tables_or_none(conn))
+
+    def test_report_page_on_shell_db_shows_empty_notice(self):
+        """空壳库（文件在、表不在）：报告页诚实提示而非 500。
+
+        TempDbMixin 的库自带表结构，这里另造一个真·空壳文件。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            shell = os.path.join(tmp, "shell.sqlite3")
+            conn = sqlite3.connect(shell)   # 建文件但不建表
+            conn.close()
+            with override_settings(FAMILY_DB_PATH=shell):
+                resp = self.client.get("/report/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "暂无任何数据")
+
+
 class TestPages(TestCase, TempDbMixin):
     """页面渲染：空库与有数据都不 500。"""
 
