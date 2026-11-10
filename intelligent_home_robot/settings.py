@@ -12,6 +12,8 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 
 from pathlib import Path
 
+import os
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -25,7 +27,9 @@ SECRET_KEY = 'django-insecure-g_d5@w!2@x2$m8g&wz@^3yx#hafb@4hhuo%fd4z%jy$^3vmet6
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+# ⚠️ 家属门户是演示版本，无鉴权（方案文档【范围与说明】）：仅限内网可信
+# 环境使用。部署到别的机器时用环境变量收窄：DJANGO_ALLOWED_HOSTS=192.168.1.10
+ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
 
 
 # Application definition
@@ -37,6 +41,8 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    # 家属远程 Web 门户（只读 backend_B 落盘的 family_data.sqlite3）
+    'family_portal.apps.FamilyPortalConfig',
 ]
 
 MIDDLEWARE = [
@@ -54,7 +60,8 @@ ROOT_URLCONF = 'intelligent_home_robot.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        # 家属门户的模板在项目根 templates/（family/base|home|stats|report.html）
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -115,6 +122,9 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
+
+# 家属门户的静态资源在项目根 static/family/（css/js/Chart.js vendor）
+STATICFILES_DIRS = [BASE_DIR / 'static']
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

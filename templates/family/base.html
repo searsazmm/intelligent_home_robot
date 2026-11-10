@@ -1,0 +1,44 @@
+{% load static %}<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}家人守护{% endblock %} · 家属门户</title>
+<link rel="stylesheet" href="{% static 'family/css/style.css' %}">
+{% block head %}{% endblock %}
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">
+      <!-- 心跳折线 Logo（内联 SVG，无需图片资源） -->
+      <svg viewBox="0 0 24 24" fill="none"><path d="M2 12h5l2-5 3 10 2.5-7 1.5 2H22" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    </span>
+    <span class="brand-text">家人守护 · 居家健康机器人
+      <small>AI 健康，让生活更安心</small>
+    </span>
+  </div>
+  <nav>
+    <span class="dot off" id="conn-dot" title="连接状态"></span>
+    <a href="{% url 'family_portal:home' %}">实时监测</a>
+    <a href="{% url 'family_portal:stats' %}">一周统计</a>
+    <a href="{% url 'family_portal:report' %}">健康报告</a>
+  </nav>
+</header>
+<main class="container">
+{% block content %}{% endblock %}
+</main>
+<footer class="footer">
+  体征数据来自家中机器人摄像头侧的非接触式监测，仅供生活方式参考，不构成医疗意见。
+</footer>
+<!-- 本地 vendor 优先（必须随仓库提交 —— 答辩离线环境的硬约束）；下面再回退 CDN -->
+<script src="{% static 'family/vendor/chart.umd.min.js' %}"></script>
+<script>
+/* Chart.js：本地 vendor 优先（答辩离线环境可用）；加载失败回退 CDN。 */
+if (!window.Chart) {
+  document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"><\/script>');
+}
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

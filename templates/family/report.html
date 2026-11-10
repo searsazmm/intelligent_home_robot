@@ -1,0 +1,112 @@
+{% extends "family/base.html" %}
+{% block title %}健康报告{% endblock %}
+{% block content %}
+{% if not report %}
+<div class="card"><h3 style="font-size:16px">暂无任何数据</h3>
+  <p class="sub">机器人还没有采集过数据，报告生成后这里会自动出现。</p></div>
+{% else %}
+<div class="card no-print" style="margin-bottom:16px; display:flex; justify-content:space-between">
+  <span class="print-tip">点击浏览器菜单 → 打印 → 另存为 PDF，即可导出/分享本报告。</span>
+</div>
+
+{% if report.summary %}
+<!-- 整体状态 hero 卡：评分圆环 + 状态词（参考体检报告模板） -->
+<div class="card hero-card section-gap" style="margin-bottom:18px">
+  <div class="score-ring tip" style="--score:{{ report.summary.score }}" data-tip="{{ report.summary.score_tip }}">
+    <div class="inner">
+      <div class="num">{{ report.summary.score }}</div>
+      <div class="cap">健康状态综合分</div>
+    </div>
+  </div>
+  <div style="flex:1; min-width:220px">
+    <h2 class="hero-title">整体状态{{ report.summary.overall }}</h2>
+    <p class="hero-sub">{{ report.summary.score_note }}</p>
+    <span class="score-pill">综合评分 {{ report.summary.score }} 分</span>
+  </div>
+</div>
+
+<!-- 四张状态词卡：心率/呼吸/情绪/活力 -->
+<h3 class="section-gap" style="display:flex; align-items:baseline">
+  基本指标
+  <span class="hint" style="margin-left:auto; font-size:12px; font-weight:500; color:var(--muted)">
+    客观测量 · 规则化呈现</span>
+</h3>
+<div class="status-tiles">
+  {% for t in report.summary.tiles %}
+  <div class="status-tile tip" data-tip="{{ t.tip }}">
+    <div class="name"><span class="pill-ico">{% if forloop.counter0 == 0 %}♥{% elif forloop.counter0 == 1 %}◍{% elif forloop.counter0 == 2 %}☺{% else %}⚡{% endif %}</span>{{ t.name }}</div>
+    <div class="word {{ t.level }}">{{ t.word }}</div>
+    <div class="desc">{{ t.desc }}</div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- 健康指数分析条 -->
+<h3 class="section-gap" style="display:flex; align-items:baseline">
+  健康指数分析
+  <span class="hint" style="margin-left:auto; font-size:12px; font-weight:500; color:var(--muted)">
+    由本周状态占比推算 · 仅作参考</span>
+</h3>
+<div class="card">
+  {% for g in report.summary.gauges %}
+  <div class="gauge">
+    <div class="gauge-head"><span>{{ g.name }}</span><b>{{ g.value }}分 <small style="color:var(--muted); font-weight:500">· {{ g.note }}</small></b></div>
+    <div class="track"><div class="fill-mask" style="width:{% widthratio g.value 1 100 %}%"></div></div>
+    <div class="labels"><span>低</span><span>高</span></div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card section-gap" style="margin-bottom:18px">
+  <h3 style="font-size:16px">本周无有效体征数据</h3>
+  <p class="sub">无法生成评分与状态卡 —— 机器人运行并采集到数据后，这里会自动出现。</p>
+</div>
+{% endif %}
+
+<div class="card section-gap">
+  <div class="report-head">
+    <h2 style="margin:0">家人健康周报</h2>
+    <span class="meta">生成于 {{ report.generated_at }}</span>
+  </div>
+
+  {% if report.has_data %}
+    <h3 class="section-gap" style="margin-top:22px">一、本周体征概况</h3>
+    <table>
+      <tr><th>指标</th><th>数值</th><th>说明</th></tr>
+      <tr><td>平均心率</td><td>{{ report.stats.hr_avg|default:"未检出" }} 次/分</td>
+          <td>区间 {{ report.stats.hr_min|default:"—" }} ~ {{ report.stats.hr_max|default:"—" }}</td></tr>
+      <tr><td>平均呼吸</td><td>{{ report.stats.rr_avg|default:"未检出" }} 次/分</td>
+          <td>成年人静息参考 12 ~ 20 次/分</td></tr>
+      <tr><td>有效样本</td><td>{{ report.stats.valid }} / {{ report.stats.sample_count }}</td>
+          <td>有效率 = 有测量值的样本占比</td></tr>
+      <tr><td>预警次数</td><td>{{ report.stats.alert_count }} 次</td>
+          <td>见"实时监测"页的预警列表</td></tr>
+    </table>
+
+    <h3 class="section-gap" style="margin-top:22px">二、状态时间分布</h3>
+    <table>
+      <tr><th>状态</th><th>占比</th><th>日均时长</th></tr>
+      {% for d in report.stats.state_distribution %}
+      <tr><td><span class="badge state-{{ d.state }}">{{ d.state }}</span></td>
+          <td>{{ d.pct }}%</td>
+          <td>日均约 {{ d.minutes|floatformat:0 }} 分钟</td></tr>
+      {% empty %}
+      <tr><td colspan="3" class="sub">本周没有状态记录</td></tr>
+      {% endfor %}
+    </table>
+    <p class="sub">状态时间覆盖 {{ report.stats.state_distribution.0.span_covered|floatformat:2 }}
+      （0~1）；覆盖不足 1 的部分为机器人未运行时段（含重启断档），不计入统计。</p>
+
+    <h3 class="section-gap" style="margin-top:22px">三、接下来一周的饮食建议</h3>
+    <ul class="advice">
+      {% for item in report.diet_advice %}<li>{{ item }}</li>{% endfor %}
+    </ul>
+    {% if report.weather %}
+    <p class="sub">参考天气：{{ report.weather.temp }}℃（风 {{ report.weather.wind }} m/s）—— 天气缓存 30 分钟，拉取失败时建议里不含天气项。</p>
+    {% endif %}
+  {% else %}
+    <p class="sub" style="margin-top:14px">本周无有效体征数据，无法生成统计与建议。</p>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}

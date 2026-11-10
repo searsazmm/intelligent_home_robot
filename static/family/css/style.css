@@ -1,0 +1,201 @@
+/* 家属门户样式 —— 居家健康机器人主题（清新绿健康风）：
+   奶白底 + 薄荷绿主色 + 大圆角卡片 + 柔和阴影，参考体检报告类 App 模板。
+   状态色语义与 frontend_C 的 c_core/theme.py 保持同一取向：
+   正常=绿、疲惫=橙、低落=蓝、离开=灰。面向家属，字号偏大、对比偏强。 */
+:root {
+  --bg: #f6f8f2;
+  --card: #ffffff;
+  --ink: #24352c;
+  --muted: #7d8a80;
+  --accent: #3a9d6e;
+  --accent-deep: #2e8a5f;
+  --accent-soft: #e7f3ec;
+  --accent-line: #cfe7da;
+  --grad: linear-gradient(135deg, #3a9d6e 0%, #6fbf98 100%);
+  --ok: #3a9d6e;
+  --warn: #dd9a3d;
+  --info: #5a8fd6;
+  --danger: #c65f54;
+  --grey: #9aa8a0;
+  --radius: 18px;
+  --shadow: 0 6px 24px rgba(46, 138, 95, 0.09);
+}
+* { box-sizing: border-box; }
+
+/* 背景：奶白渐变 + 两块柔和绿斑 + 淡淡的心电波形（居家健康主题装饰） */
+body {
+  margin: 0; color: var(--ink);
+  font: 16px/1.6 "Microsoft YaHei", "PingFang SC", sans-serif;
+  background:
+    radial-gradient(900px 480px at 88% -10%, rgba(111, 191, 152, .18), transparent 60%),
+    radial-gradient(760px 420px at -12% 30%, rgba(111, 191, 152, .14), transparent 60%),
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='420' height='120' viewBox='0 0 420 120'%3E%3Cpath d='M0 60h120l10-18 14 36 12-48 12 60 10-30h40l8-12 10 24 8-12h176' fill='none' stroke='%233a9d6e' stroke-opacity='.06' stroke-width='2'/%3E%3C/svg%3E") repeat,
+    var(--bg);
+  background-attachment: fixed;
+}
+
+/* ---- 顶栏 ---- */
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  background: rgba(255, 255, 255, .85); backdrop-filter: blur(10px);
+  padding: 12px 28px; box-shadow: 0 1px 12px rgba(46, 138, 95, .08);
+  position: sticky; top: 0; z-index: 10;
+}
+.topbar .brand { font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 12px; }
+/* 品牌 Logo：渐变绿圆片 + 心跳折线 */
+.topbar .logo {
+  width: 34px; height: 34px; border-radius: 12px; background: var(--grad);
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+}
+.topbar .logo svg { width: 20px; height: 20px; }
+.topbar .brand small { display: block; font-weight: 500; font-size: 11px; color: var(--muted); }
+.topbar .brand-text { line-height: 1.25; }
+.topbar nav a {
+  margin-left: 20px; color: var(--muted); text-decoration: none; font-size: 15px;
+  padding: 6px 14px; border-radius: 999px; transition: all .15s;
+}
+.topbar nav a:hover { color: var(--accent-deep); background: var(--accent-soft); }
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--grey); display: inline-block; }
+.dot.on { background: var(--ok); box-shadow: 0 0 0 4px rgba(58, 157, 110, .15); }
+.dot.off { background: var(--danger); box-shadow: 0 0 0 4px rgba(198, 95, 84, .15); }
+
+.container { max-width: 1080px; margin: 26px auto; padding: 0 20px; }
+.footer { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0 32px; }
+
+.grid { display: grid; gap: 18px; }
+.grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+.grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
+@media (max-width: 760px) { .grid.cols-3, .grid.cols-2 { grid-template-columns: 1fr; } }
+
+/* ---- 卡片 ---- */
+.card {
+  background: var(--card); border-radius: var(--radius); padding: 20px 24px;
+  box-shadow: var(--shadow); border: 1px solid rgba(46, 138, 95, .06);
+}
+.card h3 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600;
+           display: flex; align-items: center; gap: 8px; }
+.card h3 .hint { margin-left: auto; font-weight: 500; font-size: 12px; }
+
+/* ---- 实时指标卡（模板词卡风：图标圆片 + 大数字） ---- */
+.metric { font-size: 42px; font-weight: 700; line-height: 1.15; color: var(--accent-deep); }
+.metric .unit { font-size: 15px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+.metric.none { color: var(--grey); font-size: 22px; }
+.pill-ico {
+  width: 34px; height: 34px; border-radius: 11px; background: var(--accent-soft);
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  color: var(--accent-deep); font-size: 17px;
+}
+.metric-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.metric-head h3 { margin: 0; }
+
+.sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
+
+/* ---- 徽标 ---- */
+.badge { display: inline-block; padding: 3px 14px; border-radius: 999px;
+         font-size: 13px; font-weight: 600; color: #fff; }
+.state-normal { background: var(--ok); }
+.state-tired  { background: var(--warn); }
+.state-sad    { background: var(--info); }
+.state-absent { background: var(--grey); }
+.offline-badge { background: var(--danger); }
+.nodata-badge { background: var(--grey); }
+
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 9px 6px; border-bottom: 1px solid #eef3ee; }
+th { color: var(--muted); font-weight: 600; }
+td.kind { color: var(--danger); font-weight: 600; }
+
+.chart-box { position: relative; height: 300px; }
+.report-head { display: flex; justify-content: space-between; align-items: baseline; }
+.report-head .meta { color: var(--muted); font-size: 13px; }
+.advice li { margin-bottom: 10px; }
+.advice { padding-left: 20px; margin: 10px 0; }
+.disclaimer { color: var(--muted); font-size: 13px; }
+.print-tip { color: var(--muted); font-size: 13px; }
+
+/* ---- 报告页：整体状态 hero 卡（参考模板第三栏） ---- */
+.hero-card {
+  display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
+  background: linear-gradient(160deg, #ffffff 55%, #eaf6ef 100%);
+}
+.score-ring {
+  --score: 82;
+  width: 132px; height: 132px; border-radius: 50%; flex: none;
+  background: conic-gradient(var(--accent) calc(var(--score) * 1%), #e3efe7 0);
+  display: flex; align-items: center; justify-content: center;
+}
+.score-ring::before { content: ""; position: absolute; }
+.score-ring .inner {
+  width: 104px; height: 104px; border-radius: 50%; background: #fff;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+.score-ring .num { font-size: 40px; font-weight: 700; color: var(--accent-deep); line-height: 1; }
+.score-ring .cap { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.hero-title { font-size: 26px; font-weight: 700; margin: 0 0 6px; }
+.hero-sub { color: var(--muted); font-size: 14px; }
+.score-pill {
+  display: inline-block; margin-top: 10px; padding: 4px 16px; border-radius: 999px;
+  background: var(--accent-soft); color: var(--accent-deep);
+  font-size: 14px; font-weight: 600;
+}
+
+/* ---- 状态词卡（心血/呼吸/情绪/活力 四格） ---- */
+.status-tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+@media (max-width: 760px) { .status-tiles { grid-template-columns: repeat(2, 1fr); } }
+.status-tile { background: var(--card); border-radius: 16px; padding: 16px 18px;
+               box-shadow: var(--shadow); border: 1px solid rgba(46, 138, 95, .06); }
+.status-tile .name { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+.status-tile .word { font-size: 22px; font-weight: 700; margin-top: 8px; }
+.status-tile .desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.word.good { color: var(--ok); }
+.word.mid  { color: var(--warn); }
+.word.bad  { color: var(--danger); }
+.word.none { color: var(--grey); }
+
+/* ---- 健康指数分析条 ---- */
+.gauge { margin: 10px 0 16px; }
+.gauge .gauge-head { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
+.gauge .gauge-head b { color: var(--accent-deep); }
+.gauge .track { height: 10px; border-radius: 999px;
+                background: linear-gradient(90deg, #63c191, #f0c464, #e08a7a); position: relative; }
+.gauge .fill-mask { position: absolute; right: 0; top: 0; bottom: 0;
+                    background: #eef2ec; border-radius: 0 999px 999px 0; }
+.gauge .labels { display: flex; justify-content: space-between; font-size: 12px;
+                 color: var(--muted); margin-top: 4px; }
+
+.section-gap { margin-top: 20px; }
+
+/* ---- Hover 提示（纯 CSS，data-tip 属性驱动）----
+   用于评分环（解释评分逻辑）与状态词卡（解释状态含义）。
+   触屏/打印无 hover —— 提示只是增强，核心信息都在页面上。 */
+.tip { position: relative; cursor: help; }
+.tip::after {
+  content: attr(data-tip);
+  position: absolute; left: 50%; bottom: calc(100% + 10px);
+  transform: translateX(-50%) translateY(4px);
+  width: max-content; max-width: 260px; white-space: normal;
+  background: #2b3a33; color: #fff; font-size: 12.5px; font-weight: 400;
+  line-height: 1.55; padding: 8px 12px; border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .18);
+  opacity: 0; pointer-events: none; transition: opacity .15s, transform .15s;
+  z-index: 20;
+}
+.tip::before {
+  content: ""; position: absolute; left: 50%; bottom: calc(100% + 4px);
+  transform: translateX(-50%);
+  border: 6px solid transparent; border-top-color: #2b3a33;
+  opacity: 0; transition: opacity .15s; z-index: 21;
+}
+.tip:hover::after, .tip:hover::before { opacity: 1; transform: translateX(-50%) translateY(0); }
+/* 评分环这种大元素：提示浮层别顶出屏幕 */
+.score-ring.tip::after { left: 130%; bottom: 40%; transform: translateY(4px); }
+.score-ring.tip::before { left: calc(130% - 60px); bottom: auto; top: calc(40% - 6px); border-color: transparent; }
+.score-ring.tip:hover::after { transform: translateY(0); }
+
+@media print {
+  .topbar, .footer, .print-tip, .no-print { display: none; }
+  body { background: #fff; }
+  .card, .status-tile { box-shadow: none; border: 1px solid #ddd; }
+  .hero-card { background: #fff; }
+}

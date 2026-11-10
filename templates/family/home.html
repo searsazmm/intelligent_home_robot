@@ -1,0 +1,74 @@
+{% extends "family/base.html" %}
+{% load static %}
+{% block title %}实时监测{% endblock %}
+{% block content %}
+<div id="nodata-banner" class="card" style="display:none">
+  <h3>暂无任何数据</h3>
+  <p class="sub">家中的机器人还没有采集过数据 —— 设备运行起来之后，这个页面会自动出现。</p>
+</div>
+
+<div id="live-area" style="display:none">
+  <div class="card" style="margin-bottom:18px; display:flex; justify-content:space-between; align-items:center">
+    <div>
+      <span id="state-badge" class="badge state-normal">—</span>
+      <span id="state-reason" class="sub" style="margin-left:10px"></span>
+    </div>
+    <div>
+      <span id="online-badge" class="badge offline-badge" style="display:none">离线（可查看历史数据）</span>
+      <span id="last-update" class="sub"></span>
+    </div>
+  </div>
+
+  <div class="grid cols-3" style="margin-bottom:18px">
+    <div class="card">
+      <div class="metric-head">
+        <span class="pill-ico">♥</span><h3>心率状态</h3>
+        <span class="hint">静息时测量 · 每秒更新</span>
+      </div>
+      <div id="hr" class="metric none">未检出</div>
+      <div class="sub" id="hr-sub">成年人静息参考 60 ~ 100 次/分</div>
+    </div>
+    <div class="card">
+      <div class="metric-head">
+        <span class="pill-ico">◍</span><h3>呼吸状态</h3>
+        <span class="hint">每分钟次数</span>
+      </div>
+      <div id="rr" class="metric none">未检出</div>
+      <div class="sub" id="rr-sub">成年人静息参考 12 ~ 20 次/分</div>
+    </div>
+    <div class="card">
+      <div class="metric-head">
+        <span class="pill-ico">✚</span><h3>信号质量</h3>
+        <span class="hint">非接触式光学测量</span>
+      </div>
+      <div id="sqi" class="metric none">—</div>
+      <div class="sub">数值越接近 1 越可信，未检出属正常波动</div>
+    </div>
+  </div>
+
+  <div class="grid cols-2">
+    <div class="card">
+      <h3>今日概览</h3>
+      <div id="today-body" class="sub">加载中…</div>
+    </div>
+    <div class="card">
+      <h3>最近预警</h3>
+      <table>
+        <thead><tr><th>时间</th><th>类型</th><th>内容</th></tr></thead>
+        <tbody id="alert-rows"><tr><td colspan="3" class="sub">加载中…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* API 地址注入：静态 JS 不经过 Django 模板引擎，地址在这里给 */
+window.FAMILY_URLS = {
+  live: "{% url 'family_portal:api_live' %}",
+  alerts: "{% url 'family_portal:api_alerts' %}"
+};
+</script>
+<script src="{% static 'family/js/live.js' %}"></script>
+{% endblock %}

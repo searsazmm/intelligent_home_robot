@@ -32,6 +32,13 @@ backend_B/data/history.csv
 # 由语音引擎按本机音色自动生成、换配置自动失效，机器之间不可复用
 backend_B/data/tts_cache/
 
+# 家属门户的落盘数据库（B 运行时持续写入，WAL/-shm/-wal 同源生成；
+# 演示版无自动清理，只适合短期保留约 7 天数据 —— 方案文档【范围与说明】）
+backend_B/data/family_data.sqlite3*
+
+# Trae 本地文档（实现方案、会话产物），不属于代码交付物
+.trae/
+
 # IDE
 .idea/
 .vscode/

@@ -1,0 +1,26 @@
+{% extends "family/base.html" %}
+{% load static %}
+{% block title %}一周统计{% endblock %}
+{% block content %}
+<div class="card" style="margin-bottom:18px">
+  <h3>近 7 天心率 / 呼吸（日均值）</h3>
+  <div class="chart-box"><canvas id="chart-vitals"></canvas></div>
+  <p class="sub">折线断开 = 当天没有有效样本；心率区间带为当天最小值到最大值。</p>
+</div>
+<div class="grid cols-2">
+  <div class="card">
+    <h3>状态时间占比（近 7 天）</h3>
+    <div class="chart-box" style="height:260px"><canvas id="chart-state-pie"></canvas></div>
+  </div>
+  <div class="card">
+    <h3>各状态日均时长（分钟）</h3>
+    <div class="chart-box" style="height:260px"><canvas id="chart-state-bar"></canvas></div>
+    <p class="sub" id="gap-note"></p>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>window.FAMILY_URLS = { stats: "{% url 'family_portal:api_stats' %}" };</script>
+<script src="{% static 'family/js/stats.js' %}"></script>
+{% endblock %}
