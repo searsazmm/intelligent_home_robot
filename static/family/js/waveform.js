@@ -9,11 +9,15 @@
    绘制方式：滚动窗口（保留最近 N 个采样点，逐帧重绘）——
    canvas 只有几百像素宽，全量重绘开销可忽略，换取实现简单可靠。
    感知上与监护仪的"扫掠"效果等效（新波从右推入、旧波左移）。
+
+   测试友好：纯形状函数与 Waveform 类不碰 DOM 就能实例化（传入
+   假 canvas 即可，见 family_portal/js_tests/waveform.test.cjs）；
+   浏览器装配只挂在 window 上，Node require 拿到的是纯逻辑导出。
    */
-(function () {
+(function (global) {
   "use strict";
 
-  var DPR = window.devicePixelRatio || 1;
+  var DPR = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
 
   /* 简化心电周期形状（0..1 相位 → -0.2..1.0 振幅）：
      P 小丘 → Q 微降 → R 尖峰 → S 回落 → T 圆丘 → 基线。
@@ -37,14 +41,18 @@
     this.rate = null;                      /* 次/分钟；null = 未检出 */
     this.phase = 0;                        /* 0..1 周期相位 */
     this.samples = [];                     /* 滚动窗口内的归一化值 */
-    this._last = performance.now();
+    this._last = (typeof performance !== "undefined") ? performance.now() : 0;
     this._resize();
     var self = this;
-    window.addEventListener("resize", function () { self._resize(); });
-    requestAnimationFrame(function loop(now) {
-      self._tick(now);
-      requestAnimationFrame(loop);
-    });
+    if (typeof window !== "undefined" && window.addEventListener) {
+      window.addEventListener("resize", function () { self._resize(); });
+    }
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(function loop(now) {
+        self._tick(now);
+        requestAnimationFrame(loop);
+      });
+    }
   }
 
   Waveform.prototype.setRate = function (rate) {
@@ -119,5 +127,11 @@
     ctx.stroke();
   };
 
-  window.FamilyWaveform = Waveform;
-})();
+  if (typeof window !== "undefined") {
+    window.FamilyWaveform = Waveform;
+  }
+  /* Node 下（node:test 单测）导出纯逻辑；浏览器里 module 不存在，无副作用 */
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = { gauss: gauss, ecgShape: ecgShape, Waveform: Waveform };
+  }
+})(typeof window !== "undefined" ? window : globalThis);

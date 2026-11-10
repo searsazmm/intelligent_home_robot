@@ -107,13 +107,17 @@ class VitalsLogWriter:
 
     def __init__(self, path: str, sample_interval: float = 15.0,
                  retention_days: float = DEFAULT_RETENTION_DAYS,
-                 cleanup_interval: float = CLEANUP_INTERVAL_SEC) -> None:
+                 cleanup_interval: float = CLEANUP_INTERVAL_SEC,
+                 queue_maxsize: int = QUEUE_MAXSIZE) -> None:
         self._path = path
         self._interval = max(0.0, float(sample_interval))
         # 保留天数：<= 0 = 关闭清理（本地调试想留全量历史时用）
         self._retention_days = float(retention_days)
         self._cleanup_interval = max(0.0, float(cleanup_interval))
-        self._queue: "queue.Queue[object]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
+        # 队列容量默认 32（方案钦定）；测试可调大 —— 并发用例要验证
+        # "多线程写入不丢不乱"，前提是灌入速率不至于触发溢出（那是
+        # 溢出用例的职责），容量不足会让断言依赖机器负载，变成 flaky。
+        self._queue: "queue.Queue[object]" = queue.Queue(maxsize=int(queue_maxsize))
         self._closed = False
         # 只保护判定状态（_closed / _last_* 降采样与防抖记账），
         # 真正的写库在写线程里串行，不需要这把锁。

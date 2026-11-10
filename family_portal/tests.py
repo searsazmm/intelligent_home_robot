@@ -346,6 +346,44 @@ class TestWellnessIndices(TempDbMixin, TestCase):
             "state_distribution": [{"state": "sad", "ratio": 0.4}]})
         self.assertEqual(idx["stress"]["score"], 40)
 
+    def test_vitality_none_when_hr_rr_unmeasured(self):
+        """本周样本存在但心率呼吸全未检出 → 元气"未检出"，压力仍照算。"""
+        idx = report_lib.wellness_indices({
+            "sample_count": 10, "hr_avg": None, "rr_avg": None,
+            "negative_ratio": 0.5,
+            "state_distribution": [{"state": "sad", "ratio": 0.5}]})
+        self.assertIsNone(idx["vitality"]["score"])
+        self.assertEqual(idx["vitality"]["label"], "未检出")
+        # 无疲惫细分 → 退回负向占比整体：0.5 × 100
+        self.assertEqual(idx["stress"]["score"], 50)
+
+    def test_vitality_averages_only_measured_parts(self):
+        """心率有效、呼吸未检出 → 取有效项单独定级，不当作 0 或满分。"""
+        idx = report_lib.wellness_indices({
+            "sample_count": 10, "hr_avg": 72, "rr_avg": None,
+            "negative_ratio": 0.0, "state_distribution": []})
+        self.assertEqual(idx["vitality"]["score"], 92)
+
+    def test_stress_score_clamped_to_0_100(self):
+        """异常输入（占比>1）不得把指数条顶出轨道。"""
+        idx = report_lib.wellness_indices({
+            "sample_count": 10, "hr_avg": 72, "rr_avg": 16.0,
+            "negative_ratio": 1.5,
+            "state_distribution": [{"state": "tired", "ratio": 2.0}]})
+        self.assertTrue(0 <= idx["stress"]["score"] <= 100)
+
+    def test_gauges_empty_without_data_and_rendered_as_hint(self):
+        """无数据 → summary 整体为 None（评分/指数都不给），页面显示
+        诚实提示而非空白卡。"""
+        from family_portal import report as rep
+        wk = rep.weekly_report(self.conn)
+        self.assertIsNone(wk["summary"])
+        self.assertIsNone(wk["indices"])
+        resp = self.client.get("/report/")
+        # 指数区块整体在 if summary 内；无数据时走 else 的诚实提示
+        self.assertContains(resp, "本周无有效体征数据")
+        self.assertNotContains(resp, "健康元气势数")
+
     def test_report_api_carries_indices(self):
         """api_report 输出 indices；报告页渲染指数条与状态词。"""
         now = time.time()

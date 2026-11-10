@@ -278,8 +278,11 @@ class TestConcurrentWriters(VitalsLogTestCase):
 
         每条之间稍作间隔，让消费速度跟上生产 —— 溢出丢弃是**预期策略**
         （专门用例已覆盖），这个用例验证的是"无溢出时一条不丢"。
+        队列容量调大到 256：「无溢出」这个前提必须由容量保证，不能
+        指望时序 —— 全量回归时磁盘忙、commit 变慢，32 容量下会偶发
+        丢弃几条（91/100），把断言变成对机器负载的赌注（flaky）。
         """
-        writer = self.make_writer()
+        writer = self.make_writer(queue_maxsize=256)
         errors: list[Exception] = []
 
         def hammer(seed: int) -> None:
