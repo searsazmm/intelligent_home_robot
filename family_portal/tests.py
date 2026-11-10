@@ -219,6 +219,20 @@ class TestApiLive(ApiContractMixin, TestCase):
         self.assertEqual(body["data"]["latest_sample_ts"], now)
         self.assertEqual(body["data"]["offline_threshold"], 30)
 
+    def test_server_ts_is_authoritative_time_source(self):
+        """二期：server_ts = 响应生成时刻的服务端时间，供前端离线判定，
+        与浏览器时钟解耦（旧版用 Date.now() 对比会因时钟不同步误判）。"""
+        before = time.time()
+        self.insert_vitals(before - 10, hr=72, rr=16.0, sqi=0.8)
+        self.commit()
+        body = self.client.get("/api/live/").json()
+        server_ts = body["data"]["server_ts"]
+        self.assertIsInstance(server_ts, float)
+        self.assertTrue(before <= server_ts <= time.time() + 1)
+        # 判定输入齐了：server_ts - latest_sample_ts = 10s < 30s → 在线
+        self.assertLess(server_ts - body["data"]["latest_sample_ts"],
+                        body["data"]["offline_threshold"])
+
     def test_empty_tables_still_ok_but_null(self):
         """表在但还没写数据：库可用 → status=0，数据字段为 None（诚实表示"暂无"）。"""
         resp = self.client.get("/api/live/")

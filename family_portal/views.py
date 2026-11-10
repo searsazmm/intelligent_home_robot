@@ -195,8 +195,11 @@ def report_page(request):
 def api_live(request):
     """实时数据：最新体征 + 当前状态 + 今日概览 + 最新样本时间戳。
 
-    ``data.latest_sample_ts`` 供前端做**离线判定**（超过 30s 判离线；
-    浏览器时钟差异的局限见方案文档 —— 二期改为服务端时间差）。
+    ``data.server_ts`` 是**本响应生成时刻的服务端时间**（time.time()），
+    前端离线判定改用它做 ``server_ts - latest_sample_ts`` 的差值 ——
+    Django 与 backend_B 同机部署、共读同一个 SQLite，样本 ts 也是这台
+    主机写的，所以这个差值与浏览器时钟**完全无关**（二期修复项：
+    此前用浏览器本地时间对比，时钟不同步会误判离线）。
     """
     def handler(conn):
         data = {
@@ -204,6 +207,7 @@ def api_live(request):
             "state": stats_lib.latest_state(conn),
             "today": stats_lib.today_overview(conn),
             "offline_threshold": db.OFFLINE_AFTER_SECONDS,
+            "server_ts": round(time.time(), 3),
         }
         vitals = data["vitals"]
         data["latest_sample_ts"] = vitals["ts"] if vitals else None

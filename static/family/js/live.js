@@ -1,9 +1,10 @@
 /* 实时监测页：1.5 秒轮询 api/live + api/alerts。
 
-   离线判定（前端实现，方案文档 v3 追加项 2）：
-   最新样本 ts 与**浏览器本地时间**差值超过阈值(30s) → 离线徽标。
-   ⚠️ 已知局限：机器人主机与家属浏览器时钟不一致会误判（提前/延迟
-   判离线）。二期改为 api_live 返回服务端时间，用服务端时间差判断。
+   离线判定（前端实现，方案文档 v3 追加项 2；二期已改服务端时间）：
+   用 api_live 返回的 server_ts（服务端生成响应的时刻）减最新样本 ts，
+   超过阈值(30s) → 离线徽标。Django 与机器人主机同机部署，server_ts
+   与样本 ts 同源 —— 判定与家属浏览器本地时钟无关，时钟不同步不再误判。
+   （旧版用浏览器本地时间对比，见 git 历史；server_ts 缺失时回退旧法。）
    */
 (function () {
   "use strict";
@@ -28,16 +29,17 @@
     $("state-reason").textContent = reason || "";
   }
 
-  function isOffline(latestSampleTs, threshold) {
+  function isOffline(latestSampleTs, threshold, serverTs) {
     if (!latestSampleTs) return true;
-    // 浏览器本地时间与样本 ts 对比（时钟不一致的局限见文件头注释）
-    return (Date.now() / 1000 - latestSampleTs) > threshold;
+    // 优先用服务端时间差（与浏览器时钟无关）；server_ts 缺失才回退浏览器时钟
+    var now = (typeof serverTs === "number") ? serverTs : (Date.now() / 1000);
+    return (now - latestSampleTs) > threshold;
   }
 
   function renderLive(data) {
     var vitals = data.vitals, state = data.state;
     var threshold = data.offline_threshold || 30;
-    var offline = isOffline(data.latest_sample_ts, threshold);
+    var offline = isOffline(data.latest_sample_ts, threshold, data.server_ts);
 
     if (!vitals && !state) {
       if (!everHadData) {
