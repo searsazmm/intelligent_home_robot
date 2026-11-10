@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 from datetime import datetime, timedelta
+from unittest import mock
 
 from django.test import TestCase, override_settings
 
@@ -428,3 +429,98 @@ class TestPages(TestCase, TempDbMixin):
         resp = self.client.get("/report/")
         self.assertEqual(resp.status_code, 200)
         self.assertContains(resp, "家人健康周报")
+
+
+class TestReportPageRendering(TempDbMixin, TestCase):
+    """报告页**模板渲染**断言：数据到页面的最后一公里。
+
+    上游逻辑（评分/指数/建议规则）各有单元测试；这里钉的是模板侧：
+    各区块在"有数据/无数据"两态下渲染出**该出现的**与**不该出现的**，
+    以及 hover 提示（data-tip）确实跟着数据一起到页面 —— 模板变量
+    拼错、字段名对不上这类问题只有走到 HTML 才暴露。
+    """
+
+    def seed_week(self, hr=88.0, rr=14.0):
+        """铺 7 天样本 + 状态 + 预警。hr=88（>85）会触发心率建议。"""
+        now = time.time()
+        for day in range(7):
+            base = now - day * 86400
+            for i in range(4):
+                self.insert_vitals(base - i * 60, hr=hr, rr=rr, sqi=0.9)
+            self.insert_state(base, "normal", "演示")
+        self.insert_alert(now, "emergency", "演示预警")
+        self.commit()
+
+    def test_empty_report_hides_hero_and_tips(self):
+        """空库：评分环/词卡/指数区都不渲染 —— 不给家属看空白假区块。"""
+        resp = self.client.get("/report/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(resp, "健康状态综合分")
+        self.assertNotContains(resp, "data-tip")
+        self.assertNotContains(resp, "基本指标")
+        self.assertContains(resp, "本周无有效体征数据")
+
+    def test_hero_ring_with_score_rule_tip(self):
+        self.seed_week()
+        resp = self.client.get("/report/")
+        self.assertContains(resp, "score-ring")
+        self.assertContains(resp, "健康状态综合分")
+        self.assertContains(resp, "综合评分")
+        # hr=88 → 仅扣 1.5 → 98 分 ≥85 → "整体状态平稳"
+        self.assertContains(resp, "整体状态平稳")
+        # 评分环 hover：扣分规则原文跟着数据上页面
+        self.assertContains(resp, "起点 100 分")
+
+    def test_status_tiles_words_follow_data(self):
+        self.seed_week()
+        resp = self.client.get("/report/")
+        self.assertContains(resp, "基本指标")
+        # hr=88 → 偏快；rr=14 → 平稳；无疲惫低落 → 情绪良好、活力充沛
+        for word in ("偏快", "平稳", "良好", "充沛"):
+            self.assertContains(resp, word)
+        # 四张卡各带自己的 hover 提示（含参考区间）
+        self.assertContains(resp, "成年人静息参考 60~85 次/分")
+
+    def test_gauges_rendered_with_dots(self):
+        self.seed_week()
+        resp = self.client.get("/report/")
+        self.assertContains(resp, "健康元气势数")
+        self.assertContains(resp, "精神压力指数")
+        self.assertContains(resp, "index-dot")
+
+    def test_overview_table_and_state_distribution(self):
+        self.seed_week()
+        resp = self.client.get("/report/")
+        self.assertContains(resp, "平均心率")
+        self.assertContains(resp, "有效样本")
+        self.assertContains(resp, "预警次数")
+        # 状态分布：badge 类名 + 日均时长行 + 覆盖率说明
+        self.assertContains(resp, "badge state-normal")
+        self.assertContains(resp, "日均约")
+        self.assertContains(resp, "状态时间覆盖")
+
+    def test_diet_advice_triggered_by_high_hr(self):
+        """hr=88>85：饮食建议区渲染出心率相关建议 —— 规则到页面的闭环。"""
+        self.seed_week()
+        resp = self.client.get("/report/")
+        self.assertContains(resp, "三、接下来一周的饮食建议")
+        self.assertContains(resp, "心率")
+
+    def test_weather_line_when_fetched(self):
+        """天气拉取成功 → "参考天气"行上页面；视图确实把天气传给了模板。"""
+        self.seed_week()
+        with mock.patch("family_portal.views.report_lib.fetch_weather",
+                        return_value={"temp": 12.3, "code": 1, "wind": 2.0}):
+            resp = self.client.get("/report/")
+        self.assertContains(resp, "参考天气")
+        self.assertContains(resp, "12.3℃")
+
+    def test_hover_tips_counted(self):
+        """1 个评分环 + 4 张词卡 + 2 条指数 = 至少 7 个 data-tip。"""
+        self.seed_week()
+        html = self.client.get("/report/").content.decode("utf-8")
+        self.assertGreaterEqual(html.count("data-tip"), 7)
+
+    def test_generated_at_stamp(self):
+        self.seed_week()
+        self.assertContains(self.client.get("/report/"), "生成于")
