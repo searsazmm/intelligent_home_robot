@@ -166,6 +166,25 @@ td.kind { color: var(--danger); font-weight: 600; }
 
 .section-gap { margin-top: 20px; }
 
+/* ---- 登录页 ---- */
+.login-box { max-width: 420px; margin: 8vh auto 0; text-align: left; }
+.login-input {
+  width: 100%; padding: 12px 16px; margin: 14px 0 12px;
+  border: 1px solid var(--accent-line); border-radius: 12px;
+  font-size: 16px; outline: none; background: #fbfdfb;
+}
+.login-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(58, 157, 110, .12); }
+.login-btn {
+  width: 100%; padding: 12px; border: none; border-radius: 12px;
+  background: var(--grad); color: #fff; font-size: 16px; font-weight: 600;
+  cursor: pointer; transition: filter .15s;
+}
+.login-btn:hover { filter: brightness(1.05); }
+.login-error {
+  background: #fbeeec; color: var(--danger); font-size: 14px;
+  padding: 10px 14px; border-radius: 10px; margin: 12px 0 0;
+}
+
 /* ---- Hover 提示（纯 CSS，data-tip 属性驱动）----
    用于评分环（解释评分逻辑）与状态词卡（解释状态含义）。
    触屏/打印无 hover —— 提示只是增强，核心信息都在页面上。 */

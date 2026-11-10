@@ -1,0 +1,16 @@
+{% extends "family/base.html" %}
+{% block title %}家属登录{% endblock %}
+{% block content %}
+<div class="card login-box">
+  <h2 style="margin:0 0 4px">家人守护 · 家属登录</h2>
+  <p class="sub" style="margin-top:0">请输入家属令牌（由部署者通过 FAMILY_API_TOKEN 配置）。令牌仅在内网可信环境分发。</p>
+  {% if error %}<div class="login-error" role="alert">{{ error }}</div>{% endif %}
+  <form method="post" action="{% url 'family_portal:login' %}">
+    {% csrf_token %}
+    <input type="password" name="token" placeholder="家属令牌" required
+           autocomplete="current-password" class="login-input">
+    <button type="submit" class="login-btn">登 录</button>
+  </form>
+  <p class="sub" style="margin-bottom:0">⚠️ 健康数据仅限授权家属查看，请勿共享令牌。</p>
+</div>
+{% endblock %}

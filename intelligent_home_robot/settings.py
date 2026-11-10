@@ -27,9 +27,16 @@ SECRET_KEY = 'django-insecure-g_d5@w!2@x2$m8g&wz@^3yx#hafb@4hhuo%fd4z%jy$^3vmet6
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-# ⚠️ 家属门户是演示版本，无鉴权（方案文档【范围与说明】）：仅限内网可信
-# 环境使用。部署到别的机器时用环境变量收窄：DJANGO_ALLOWED_HOSTS=192.168.1.10
+# ⚠️ 家属门户面向内网部署：默认无鉴权（内网演示），可用 FAMILY_API_TOKEN
+# 启用鉴权（见下方说明）。部署到别的机器时也建议用环境变量收窄：
+# DJANGO_ALLOWED_HOSTS=192.168.1.10
 ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
+
+# —— 二期鉴权（X-API-Token）——
+# 默认空 = 不启用鉴权（保持内网演示行为，测试环境零配置可用）。
+# 设置后所有页面与 REST 接口需要授权：浏览器经 /login/ 登录（写 session
+# cookie），脚本/程序经请求头 X-API-Token 直传。仅保护 family_portal 视图。
+FAMILY_API_TOKEN = os.environ.get("FAMILY_API_TOKEN", "").strip()
 
 
 # Application definition

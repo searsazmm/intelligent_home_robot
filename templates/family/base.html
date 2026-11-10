@@ -23,6 +23,7 @@
     <a href="{% url 'family_portal:home' %}">实时监测</a>
     <a href="{% url 'family_portal:stats' %}">一周统计</a>
     <a href="{% url 'family_portal:report' %}">健康报告</a>
+    {% if auth_enabled %}<a href="{% url 'family_portal:logout' %}">退出</a>{% endif %}
   </nav>
 </header>
 <main class="container">

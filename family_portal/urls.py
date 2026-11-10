@@ -10,6 +10,9 @@ urlpatterns = [
     path("", views.home, name="home"),
     path("stats/", views.stats_page, name="stats"),
     path("report/", views.report_page, name="report"),
+    # 登录/登出（二期鉴权：FAMILY_API_TOKEN 非空才生效）
+    path("login/", views.login_view, name="login"),
+    path("logout/", views.logout_view, name="logout"),
     path("api/live/", views.api_live, name="api_live"),
     path("api/stats/", views.api_stats, name="api_stats"),
     path("api/alerts/", views.api_alerts, name="api_alerts"),
