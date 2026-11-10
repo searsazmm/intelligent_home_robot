@@ -65,6 +65,7 @@ from core.ui_channel import ChatServer, StatusBroadcaster
 from core.vision_client import OfflineVisionFeeder, VisionClient
 from core.vision_state import VisionState, VisionStateEvaluator
 from core.vitals import VitalsStore
+from core.vitals_log import VitalsLogWriter
 from core.voice import audio as audio_lib
 from core.voice.loop import LoopConfig, Speaker, VoiceLoop
 from core.voice.speech_cache import SpeechCache
@@ -131,6 +132,23 @@ class BackendB:
         # 接住 A 每秒一条的 rppg 报文（此前收下计数后**丢弃**，没有消费者）。
         # 建在 chat_server 之前：下面的 vitals_provider 要惰性取它。
         self.vitals_store = VitalsStore()
+
+        # ---- 家属数据落盘（family_portal 8020 家属 Web 门户的数据源）----
+        # 体征/状态/告警三类事件写 SQLite（WAL），家属 Web 端只读。
+        # 写库在独立线程 + 队列里串行做，公开方法只非阻塞入队 —— 主循环
+        # 绝不因落盘受影响（core/vitals_log.py 的纪律，config §17）。
+        # B_FAMILY_LOG=0 可整体关闭（默认开）。
+        self.family_log: Optional[VitalsLogWriter] = None
+        if config.FAMILY_LOG_ENABLED:
+            try:
+                self.family_log = VitalsLogWriter(
+                    config.FAMILY_DB_PATH,
+                    sample_interval=config.FAMILY_VITALS_INTERVAL,
+                )
+            except Exception:
+                # 连 writer 都建不起来（磁盘只读等）也只降级为"不落盘"
+                self.family_log = None
+                logger.exception("家属数据落盘初始化失败，本会话不落盘")
 
         self.status_server = StatusBroadcaster(
             host=args.status_host, port=args.status_port
@@ -640,6 +658,11 @@ class BackendB:
             thread.join(timeout=2.0)
         self._threads.clear()
 
+        # 家属落盘最后关：把队列里积压的状态/告警写完再退出
+        if self.family_log is not None:
+            self.family_log.close()
+            self.family_log = None
+
         logger.info("后端 B 已停止")
 
     def _wait_for_exit(self) -> None:
@@ -693,6 +716,10 @@ class BackendB:
                 state, mirror_clients=self.chat_server.client_count()):
             return
         self.chat_server.broadcast_state(state, reason)
+        # 家属端状态时间线（core/vitals_log.py）：writer 内部只记**切换**，
+        # publish 的 15 秒心跳（同状态）在这里也会被它挡掉，不会刷库。
+        if self.family_log is not None:
+            self.family_log.write_state_event(state, reason)
 
     def _on_typed_reading(self, kind: str, reading: object) -> None:
         """类型化报文的旁路订阅（视觉读取线程里被调，只做一次字典写入）。
@@ -753,6 +780,19 @@ class BackendB:
         """
         self.chat_server.publish_vitals(self.vitals_store.snapshot())
 
+    def _log_family_data(self) -> None:
+        """把当前体征快照按降采样间隔交给家属落盘（config §17）。
+
+        与 :meth:`_publish_vitals` 同一条只读旁路：只读
+        ``VitalsStore.snapshot()``，不进 ``evaluator``、不参与任何判定。
+        节流（每满 ``config.FAMILY_VITALS_INTERVAL`` 秒取最新快照）在
+        writer 内部，这里每 0.2 秒调一次只是白问，代价可忽略。
+        writer 为 None（B_FAMILY_LOG=0 或初始化失败）时静默跳过。
+        """
+        if self.family_log is None:
+            return
+        self.family_log.maybe_write_vitals(self.vitals_store.snapshot())
+
     def _state_publish_loop(self) -> None:
         """定期取当前状态并推给 C。变化时推，没变化时靠心跳推。
 
@@ -771,6 +811,7 @@ class BackendB:
                 self._publish_state(state, reason)
                 self._publish_vai()
                 self._publish_vitals()
+                self._log_family_data()
                 self._tick_proactive(state)
             except Exception:
                 logger.exception("状态发布出错")
@@ -1098,6 +1139,11 @@ class BackendB:
             self.family_alerter.alert(kind, text)
         except Exception:
             logger.exception("触发家人通知失败（不影响对话与 C 端弹窗）")
+        # 家属 Web 端的预警中心（core/vitals_log.py）：只存 kind/text 两个字段
+        # 映射（与 build_alert_payload 解耦），60 秒同 kind 防抖在 writer 内部。
+        # writer 的所有方法只入队不抛异常 —— 这里不需要再 try。
+        if self.family_log is not None:
+            self.family_log.write_alert(kind, text)
         try:
             self.chat_server.broadcast_emergency(kind, text)
         except Exception:

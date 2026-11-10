@@ -594,3 +594,23 @@ WEATHER_CITY = _env_str("B_WEATHER_CITY", "青城山")
 WEATHER_LAT = _env_float("B_WEATHER_LAT", 30.8997)
 WEATHER_LON = _env_float("B_WEATHER_LON", 103.5639)
 WEATHER_TIMEOUT = _env_float("B_WEATHER_TIMEOUT", 4.0)
+
+# --------------------------------------------------------------------------
+# 17. 家属数据落盘（family_portal 家属 Web 门户的数据源）
+#
+# B 把体征 / 状态 / 告警三类事件写进一个 SQLite（WAL 模式），家属 Web 端
+# （仓库根的 Django family_portal，8020 端口）用只读连接读它。
+#
+# 硬约束（core/vitals_log.py 落实，tests/test_vitals_log.py 守护）：
+#   - 写库在独立线程 + 队列（maxsize=32，put_nowait 满则丢弃 + 告警日志），
+#     绝不阻塞 B 的 TCP / 状态机主循环；
+#   - 写入异常只打日志不外抛；close 之后再写静默跳过；
+#   - 体征按 FAMILY_VITALS_INTERVAL 降采样（每满间隔取最新快照，本版不做窗口均值）；
+#   - 状态仅切换时写一条；告警同 kind 60 秒防抖。
+# --------------------------------------------------------------------------
+
+FAMILY_DB_PATH = _env_str("B_FAMILY_DB", os.path.join(DATA_DIR, "family_data.sqlite3"))
+# 体征降采样间隔（秒）：A 每秒发一条，家属折线图用不到那么密
+FAMILY_VITALS_INTERVAL = _env_float("B_FAMILY_VITALS_INTERVAL", 15.0)
+# 总开关（B_FAMILY_LOG=0/false/no/off 关闭），默认开
+FAMILY_LOG_ENABLED = _env_str("B_FAMILY_LOG", "1").strip().lower() not in ("0", "false", "no", "off")
