@@ -5,21 +5,81 @@
    超过阈值(30s) → 离线徽标。Django 与机器人主机同机部署，server_ts
    与样本 ts 同源 —— 判定与家属浏览器本地时钟无关，时钟不同步不再误判。
    （旧版用浏览器本地时间对比，见 git 历史；server_ts 缺失时回退旧法。）
+
+   测试友好：判定/徽标/文案拼接都是**纯函数**，Node 下直接单测
+   （family_portal/js_tests/live.test.cjs）；DOM 装配只在浏览器执行。
    */
-(function () {
+(function (global) {
   "use strict";
 
-  var POLL_MS = 1500;
-  var seen = { vitals: null, state: null, today: null, alerts: null };
-  var everHadData = false;   // 区分"暂无任何数据"与"离线（有历史）"
+  /* ================= 纯逻辑（node:test 覆盖） ================= */
 
-  function $(id) { return document.getElementById(id); }
+  function isOffline(latestSampleTs, threshold, serverTs) {
+    if (!latestSampleTs) return true;
+    // 优先用服务端时间差（与浏览器时钟无关）；server_ts 缺失才回退浏览器时钟
+    var now = (typeof serverTs === "number") ? serverTs : (Date.now() / 1000);
+    return (now - latestSampleTs) > threshold;
+  }
+
+  /* 徽标语义：绿"波形稳定"= 有测量值且信号质量可用；橙"信号减弱"= 有值
+     但 SQI 低（<0.5）；灰"未检出"= 没有测量值。 */
+  function hrFlag(hr, sqi) {
+    if (hr === null || hr === undefined) return { level: "none", text: "未检出" };
+    if (sqi !== null && sqi !== undefined && sqi < 0.5) {
+      return { level: "mid", text: "信号减弱" };
+    }
+    return { level: "good", text: "波形稳定" };
+  }
+
+  function rrFlag(rr) {
+    if (rr === null || rr === undefined) return { level: "none", text: "未检出" };
+    return { level: "good", text: "节律均匀" };
+  }
 
   function fmtTime(ts) {
     var d = new Date(ts * 1000);
     function p(n) { return (n < 10 ? "0" : "") + n; }
     return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
   }
+
+  function updateLabel(offline, vitals, serverTs) {
+    return offline
+      ? "最后数据：" + (vitals ? fmtTime(vitals.ts) : "—")
+      : "更新于 " + fmtTime(serverTs);   /* 响应生成时刻（服务端时间） */
+  }
+
+  function todayLine(today) {
+    if (!today) return "";
+    var dist = today.state_distribution || [];
+    var parts = dist.map(function (d) {
+      var minutes = Math.round(d.seconds / 60);
+      return d.state + " " + Math.round(d.ratio * 100) + "%（约 " + minutes + " 分钟）";
+    });
+    return "今日样本 " + today.sample_count + " 条 · 平均心率 " +
+      (today.hr_avg !== null && today.hr_avg !== undefined
+        ? today.hr_avg + " 次/分" : "未检出") +
+      " · 平均呼吸 " +
+      (today.rr_avg !== null && today.rr_avg !== undefined
+        ? today.rr_avg + " 次/分" : "未检出") +
+      " · 今日预警 " + today.alert_count + " 次" +
+      (parts.length ? "<br>状态分布：" + parts.join("，") : "<br>今日还没有状态记录");
+  }
+
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+      isOffline: isOffline, hrFlag: hrFlag, rrFlag: rrFlag,
+      fmtTime: fmtTime, updateLabel: updateLabel, todayLine: todayLine,
+    };
+  }
+
+  /* ================= 浏览器装配 ================= */
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+
+  var POLL_MS = 1500;
+  var seen = { alerts: null };
+  var everHadData = false;   // 区分"暂无任何数据"与"离线（有历史）"
+
+  function $(id) { return document.getElementById(id); }
 
   function setStateBadge(state, reason) {
     var badge = $("state-badge");
@@ -29,11 +89,22 @@
     $("state-reason").textContent = reason || "";
   }
 
-  function isOffline(latestSampleTs, threshold, serverTs) {
-    if (!latestSampleTs) return true;
-    // 优先用服务端时间差（与浏览器时钟无关）；server_ts 缺失才回退浏览器时钟
-    var now = (typeof serverTs === "number") ? serverTs : (Date.now() / 1000);
-    return (now - latestSampleTs) > threshold;
+  function metric(id, subId, value, unit, digits) {
+    var el = $(id);
+    if (value === null || value === undefined) {
+      el.className = "metric none";
+      el.textContent = "未检出";
+      $(subId).textContent = "当前窗口未测出，属正常波动";
+    } else {
+      el.className = "metric";
+      el.innerHTML = Number(value).toFixed(digits) + '<span class="unit">' + unit + "</span>";
+    }
+  }
+
+  function setFlag(id, flag) {
+    var el = $(id);
+    el.className = "wave-flag " + flag.level;
+    el.textContent = flag.text;
   }
 
   function renderLive(data) {
@@ -55,45 +126,21 @@
 
     $("online-badge").style.display = offline ? "" : "none";
     $("conn-dot").className = "dot " + (offline ? "off" : "on");
-    $("last-update").textContent = offline
-      ? "最后数据：" + (vitals ? fmtTime(vitals.ts) : "—")
-      : "更新于 " + fmtTime(data.server_ts);   /* 响应生成时刻（服务端时间） */
+    $("last-update").textContent = updateLabel(offline, vitals, data.server_ts);
 
     if (state) setStateBadge(state.state, state.reason);
 
-  function metric(id, subId, value, unit, digits) {
-      var el = $(id);
-      if (value === null || value === undefined) {
-        el.className = "metric none";
-        el.textContent = "未检出";
-        $(subId).textContent = "当前窗口未测出，属正常波动";
-      } else {
-        el.className = "metric";
-        el.innerHTML = Number(value).toFixed(digits) + '<span class="unit">' + unit + "</span>";
-      }
-    }
-
-    function setFlag(id, level, text) {
-      var el = $(id);
-      el.className = "wave-flag " + level;
-      el.textContent = text;
-    }
     metric("hr", "hr-sub", vitals && vitals.hr, "次/分", 0);
     metric("rr", "rr-sub", vitals && vitals.rr, "次/分", 1);
 
     /* 波形（数字与波动同源：脉冲/正弦频率由实时 hr/rr 驱动，见 waveform.js）。
-       徽标语义：绿"波形稳定"= 有测量值且信号质量可用；橙"信号减弱"= 有值
-       但 SQI 低；灰"未检出"= 没有测量值。离线时波形停成灰平线。 */
+       离线时波形停成灰平线（setRate(null)），不假装还在测。 */
     var hr = vitals && vitals.hr, rr = vitals && vitals.rr;
     var sqi = vitals ? vitals.sqi : null;
     hrWave.setRate(offline ? null : hr);
     rrWave.setRate(offline ? null : rr);
-    setFlag("hr-flag", hr === null || hr === undefined ? "none"
-             : (sqi !== null && sqi !== undefined && sqi < 0.5) ? "mid" : "good",
-             hr === null || hr === undefined ? "未检出"
-             : (sqi !== null && sqi !== undefined && sqi < 0.5) ? "信号减弱" : "波形稳定");
-    setFlag("rr-flag", rr === null || rr === undefined ? "none" : "good",
-            rr === null || rr === undefined ? "未检出" : "节律均匀");
+    setFlag("hr-flag", hrFlag(hr, sqi));
+    setFlag("rr-flag", rrFlag(rr));
 
     var sqiEl = $("sqi");
     if (vitals && vitals.sqi !== null && vitals.sqi !== undefined) {
@@ -104,21 +151,8 @@
       sqiEl.textContent = "—";
     }
 
-    var today = data.today;
-    if (today) {
-      var dist = today.state_distribution || [];
-      var parts = dist.map(function (d) {
-        var minutes = Math.round(d.seconds / 60);
-        return d.state + " " + Math.round(d.ratio * 100) + "%（约 " + minutes + " 分钟）";
-      });
-      $("today-body").innerHTML =
-        "今日样本 " + today.sample_count + " 条 · 平均心率 " +
-        (today.hr_avg !== null ? today.hr_avg + " 次/分" : "未检出") +
-        " · 平均呼吸 " +
-        (today.rr_avg !== null ? today.rr_avg + " 次/分" : "未检出") +
-        " · 今日预警 " + today.alert_count + " 次" +
-        (parts.length ? "<br>状态分布：" + parts.join("，") : "<br>今日还没有状态记录");
-    }
+    var line = todayLine(data.today);
+    if (line) $("today-body").innerHTML = line;
   }
 
   function renderAlerts(alerts) {
@@ -159,4 +193,4 @@
 
   poll();
   setInterval(poll, POLL_MS);
-})();
+})(typeof window !== "undefined" ? window : globalThis);
