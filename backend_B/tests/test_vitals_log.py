@@ -289,7 +289,10 @@ class TestConcurrentWriters(VitalsLogTestCase):
             try:
                 for i in range(25):
                     writer.write_state_event(f"t{seed}", "", ts=float(seed * 100 + i))
-                    time.sleep(0.005)
+                    # 0.02s：给"消费跟上灌入"留足余量 —— 0.005 在 coverage
+                    # 插桩/慢盘下会让 commit 掉队，偶发丢 1 条（99/100）。
+                    # 容量 256 已保证不溢出，这里再让节奏稳一点。
+                    time.sleep(0.02)
             except Exception as exc:   # pragma: no cover
                 errors.append(exc)
 

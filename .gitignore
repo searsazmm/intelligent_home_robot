@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# 覆盖率产物（coverage.py 数据文件；HTML 报告生成到 .trae/htmlcov，已被上面忽略）
+.coverage
+htmlcov/
+
 # 虚拟环境
 venv/
 .venv/
