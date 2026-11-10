@@ -62,11 +62,11 @@ class VitalsLogTestCase(unittest.TestCase):
             writer.close()
         self._tmp.cleanup()
 
-    def make_writer(self, interval: float = 0.0) -> VitalsLogWriter:
+    def make_writer(self, interval: float = 0.0, **kwargs) -> VitalsLogWriter:
         # interval 默认 0：单测里立刻放行，节流行为由专门用例验证。
         # 必须等写线程把库建好（schema 在线程里建），否则断言会撞上
         # "no such table" 的竞态。
-        writer = VitalsLogWriter(self.db_path, sample_interval=interval)
+        writer = VitalsLogWriter(self.db_path, sample_interval=interval, **kwargs)
         self.assertTrue(writer._ready.wait(timeout=5.0), "写线程 5s 内未完成建库")
         self._writers.append(writer)
         return writer
@@ -115,10 +115,12 @@ class TestSchemaBootstrap(VitalsLogTestCase):
 # ===========================================================================
 
 class TestVitalsDownsampling(VitalsLogTestCase):
+    """这些用例用**假时钟**（now=100.0，即 1970 年）控制节流边界 ——
+    必须关掉真实时钟的老化清理，否则刚写的行会被首轮清理当成旧数据删掉。"""
 
     def test_respects_interval_taking_latest_snapshot(self):
         """15 秒间隔内只落一条；间隔过了取**当时**的最新快照。"""
-        writer = self.make_writer(interval=15.0)
+        writer = self.make_writer(interval=15.0, retention_days=0.0)
         self.assertTrue(writer.maybe_write_vitals(make_reading(hr=70), now=100.0))
         self.assertFalse(writer.maybe_write_vitals(make_reading(hr=75), now=110.0))
         self.assertTrue(writer.maybe_write_vitals(make_reading(hr=80), now=115.1))
@@ -130,8 +132,8 @@ class TestVitalsDownsampling(VitalsLogTestCase):
 
     def test_missing_fields_become_null_not_zero(self):
         """hr/rr/sqi 缺哪个补 NULL —— "未检出"不是 0（vitals 同一条红线）。"""
-        writer = self.make_writer()
-        # RppgReading 没有 sqi 字段 → getattr 兜底 NULL
+        # 假时钟（now=1.0），见类说明：须关掉真实时钟的老化清理
+        writer = self.make_writer(retention_days=0.0)
         writer.maybe_write_vitals(make_reading(hr=None, rr=None), now=1.0)
         writer.close()
         self.assertEqual(rows(self.db_path, "vitals_samples")[0][2:], (None, None, None))
@@ -296,6 +298,114 @@ class TestConcurrentWriters(VitalsLogTestCase):
         self.assertEqual(errors, [])
         writer.close()
         self.assertEqual(len(rows(self.db_path, "state_events")), 100)
+
+
+# ===========================================================================
+# 数据老化清理（二期）：删 7 天前的 vitals_samples，写线程周期执行
+# ===========================================================================
+
+DAY = 86400.0
+
+
+class TestDeleteExpiredVitalsFunction(VitalsLogTestCase):
+    """清理 SQL 本体：不动线程，直接对函数断言语义。"""
+
+    def _seed(self, sample_ages: list[float], states: int = 0, alerts: int = 0):
+        """直接建库并插入指定"年龄"的数据，返回连接（调用方负责关）。"""
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(vitals_log._SCHEMA)
+        now = time.time()
+        for age in sample_ages:
+            conn.execute("INSERT INTO vitals_samples(ts, hr, rr, sqi) VALUES(?, 70, 15, 0.9)",
+                         (now - age,))
+        for i in range(states):
+            conn.execute("INSERT INTO state_events(ts, state, reason) VALUES(?, 'normal', '')",
+                         (now - 9 * DAY + i,))
+        for i in range(alerts):
+            conn.execute("INSERT INTO alerts(ts, kind, text) VALUES(?, 'emergency', 'x')",
+                         (now - 9 * DAY + i,))
+        conn.commit()
+        return conn
+
+    def test_deletes_only_rows_older_than_cutoff(self):
+        conn = self._seed([8 * DAY, 7.5 * DAY, 3 * DAY, 0.0])
+        try:
+            deleted = vitals_log.delete_expired_vitals(conn, time.time() - 7 * DAY)
+        finally:
+            conn.close()
+        self.assertEqual(deleted, 2)
+        kept = [r[1] for r in rows(self.db_path, "vitals_samples")]
+        self.assertEqual(len(kept), 2)
+
+    def test_state_and_alerts_are_never_touched(self):
+        """只清 vitals_samples（方案约定）—— 状态与预警是"发生过什么"的唯一凭据。"""
+        conn = self._seed([8 * DAY], states=2, alerts=1)
+        try:
+            vitals_log.delete_expired_vitals(conn, time.time() - 7 * DAY)
+        finally:
+            conn.close()
+        self.assertEqual(len(rows(self.db_path, "vitals_samples")), 0)
+        self.assertEqual(len(rows(self.db_path, "state_events")), 2)
+        self.assertEqual(len(rows(self.db_path, "alerts")), 1)
+
+
+class TestWriterRetentionCleanup(VitalsLogTestCase):
+    """写线程里的清理：启动先清一次 + 周期执行 + 可关闭。"""
+
+    def test_startup_cleanup_removes_stale_rows(self):
+        """上次运行留下的过期样本，重启后不等满一个周期就该消失。"""
+        now = time.time()
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(vitals_log._SCHEMA)
+        for age in (8 * DAY, 0.0):
+            conn.execute("INSERT INTO vitals_samples(ts) VALUES(?)", (now - age,))
+        conn.commit()
+        conn.close()
+
+        writer = self.make_writer(retention_days=7.0, cleanup_interval=0.3)
+        time.sleep(1.2)          # > 首轮闹钟（初始 0）+ 一拍唤醒
+        writer.close()
+        kept = [r[1] for r in rows(self.db_path, "vitals_samples")]
+        self.assertEqual(len(kept), 1)          # 8 天前的没了，今天的还在
+
+    def test_periodic_cleanup_runs_while_running(self):
+        """运行中插入的旧数据（模拟时钟回拨/手工导入）也在下个周期被清。"""
+        writer = self.make_writer(retention_days=7.0, cleanup_interval=0.3)
+        time.sleep(0.2)          # 让首轮清理先跑完
+        now = time.time()
+        conn = sqlite3.connect(self.db_path, timeout=5)
+        conn.execute("INSERT INTO vitals_samples(ts) VALUES(?)", (now - 9 * DAY,))
+        conn.commit()
+        conn.close()
+        time.sleep(1.2)          # > cleanup_interval + 唤醒粒度
+        writer.close()
+        self.assertEqual(len(rows(self.db_path, "vitals_samples")), 0)
+
+    def test_retention_disabled_keeps_everything(self):
+        """retention_days <= 0 = 关闭清理：想留全量历史的调试场景。"""
+        now = time.time()
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(vitals_log._SCHEMA)
+        conn.execute("INSERT INTO vitals_samples(ts) VALUES(?)", (now - 30 * DAY,))
+        conn.commit()
+        conn.close()
+
+        writer = self.make_writer(retention_days=0.0, cleanup_interval=0.3)
+        time.sleep(1.2)
+        writer.close()
+        self.assertEqual(len(rows(self.db_path, "vitals_samples")), 1)
+
+    def test_writing_still_works_after_cleanup(self):
+        """清理动的是同一张表 —— 清完之后新写入必须照常落盘。"""
+        writer = self.make_writer(interval=0.0, retention_days=7.0,
+                                  cleanup_interval=0.3)
+        time.sleep(1.0)          # 首轮清理跑过
+        self.assertTrue(writer.maybe_write_vitals(make_reading(hr=75), now=time.time()))
+        time.sleep(0.5)
+        writer.close()
+        data = rows(self.db_path, "vitals_samples")
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0][2], 75)
 
 
 if __name__ == "__main__":

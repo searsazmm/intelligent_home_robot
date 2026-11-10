@@ -614,3 +614,8 @@ FAMILY_DB_PATH = _env_str("B_FAMILY_DB", os.path.join(DATA_DIR, "family_data.sql
 FAMILY_VITALS_INTERVAL = _env_float("B_FAMILY_VITALS_INTERVAL", 15.0)
 # 总开关（B_FAMILY_LOG=0/false/no/off 关闭），默认开
 FAMILY_LOG_ENABLED = _env_str("B_FAMILY_LOG", "1").strip().lower() not in ("0", "false", "no", "off")
+# 数据老化清理（二期）：删除多少天之前的 vitals_samples 旧样本，默认 7 天
+# （方案【范围与说明】：演示版只适合短期保留约 7 天数据）。<= 0 = 关闭清理。
+# 只清 vitals_samples（按 15s 降采样、体积大头）；state_events / alerts 全量保留。
+# 由写线程周期执行（默认 6 小时一次 + 启动先清一次），不阻塞 B 主循环。
+FAMILY_RETENTION_DAYS = _env_float("B_FAMILY_RETENTION_DAYS", 7.0)

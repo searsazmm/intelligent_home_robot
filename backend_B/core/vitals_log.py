@@ -44,6 +44,17 @@ QUEUE_MAXSIZE = 32
 #: 防止持续触发同一风险时 alerts 表被刷屏。
 ALERT_DEDUP_SEC = 60.0
 
+#: 数据保留天数默认值（二期数据老化清理，config §17 可用环境变量覆盖）。
+#: 方案【范围与说明】：演示版只适合短期保留约 7 天数据。
+DEFAULT_RETENTION_DAYS = 7.0
+
+#: 清理动作的执行间隔（秒）：清理本身是轻量 DELETE（有 ts 索引），
+#: 但没必要每次空转都跑 —— 默认 6 小时一次足够。
+CLEANUP_INTERVAL_SEC = 6.0 * 3600.0
+
+#: 写线程空转时的唤醒粒度（秒）：get 超时后顺手看一眼"清理闹钟"。
+CLEANUP_WAKE_SEC = 1.0
+
 #: 建表语句（幂等）。家属 Web 端直接按这些列名读。
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS vitals_samples (
@@ -74,12 +85,34 @@ CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(ts);
 _STOP = object()
 
 
+def delete_expired_vitals(conn: sqlite3.Connection, cutoff_ts: float) -> int:
+    """删除 ``cutoff_ts`` 之前的 vitals_samples 旧样本，返回删除行数。
+
+    模块级函数：写线程周期调用，也让单元测试不必碰线程就能测清理语义。
+    **只清 vitals_samples**（方案约定的大头，15s 一条）；state_events /
+    alerts 全量保留 —— 状态切换与预警本身量小，且是家属端"发生过什么"
+    的唯一凭据，删了统计口径就不完整。
+
+    WAL 下 DELETE 不会立刻缩小文件，但空间会被后续写入复用 —— 对
+    "控制长期体积"的目标而言足够，不做 wal_checkpoint（清大库时那一下
+    反而可能短暂阻塞）。
+    """
+    cur = conn.execute("DELETE FROM vitals_samples WHERE ts < ?", (cutoff_ts,))
+    conn.commit()
+    return cur.rowcount
+
+
 class VitalsLogWriter:
     """家属数据落盘写手。见模块文档的线程模型与纪律。"""
 
-    def __init__(self, path: str, sample_interval: float = 15.0) -> None:
+    def __init__(self, path: str, sample_interval: float = 15.0,
+                 retention_days: float = DEFAULT_RETENTION_DAYS,
+                 cleanup_interval: float = CLEANUP_INTERVAL_SEC) -> None:
         self._path = path
         self._interval = max(0.0, float(sample_interval))
+        # 保留天数：<= 0 = 关闭清理（本地调试想留全量历史时用）
+        self._retention_days = float(retention_days)
+        self._cleanup_interval = max(0.0, float(cleanup_interval))
         self._queue: "queue.Queue[object]" = queue.Queue(maxsize=QUEUE_MAXSIZE)
         self._closed = False
         # 只保护判定状态（_closed / _last_* 降采样与防抖记账），
@@ -232,16 +265,37 @@ class VitalsLogWriter:
         self._conn = conn
         self._ready.set()
 
+        # 清理闹钟：初始为 0 —— **启动先清一次**，上次运行留下的过期数据
+        # 不用等满一个 cleanup_interval 才消失；每跑一次顺延一个周期。
+        next_cleanup = 0.0
         while True:
-            item = self._queue.get()
+            # 空转时每秒醒一次看清理闹钟；有任务则立即消费，两者都不误
+            try:
+                item = self._queue.get(timeout=CLEANUP_WAKE_SEC)
+            except queue.Empty:
+                item = None
             if item is _STOP:
                 break
-            try:
-                self._write(item)
-            except Exception:
-                # 磁盘满 / 只读 / 库损坏……都只打日志。
-                # B 的主循环绝不能因为落盘失败被打断。
-                logger.exception("家属数据落盘失败（不影响 B 主循环）")
+            if item is not None:
+                try:
+                    self._write(item)
+                except Exception:
+                    # 磁盘满 / 只读 / 库损坏……都只打日志。
+                    # B 的主循环绝不能因为落盘失败被打断。
+                    logger.exception("家属数据落盘失败（不影响 B 主循环）")
+            now = time.monotonic()
+            if (self._cleanup_interval > 0 and self._retention_days > 0
+                    and now >= next_cleanup):
+                try:
+                    deleted = delete_expired_vitals(
+                        conn, time.time() - self._retention_days * 86400.0)
+                    if deleted:
+                        logger.info("家属数据老化清理：删除 %.1f 天前旧样本 %d 条",
+                                    self._retention_days, deleted)
+                except Exception:
+                    # 清理失败不影响写入，下个周期再试
+                    logger.exception("家属数据老化清理失败（下个周期重试）")
+                next_cleanup = now + self._cleanup_interval
         try:
             self._conn.close()
         except Exception:
@@ -261,4 +315,5 @@ class VitalsLogWriter:
         self._conn.commit()
 
 
-__all__ = ["ALERT_DEDUP_SEC", "QUEUE_MAXSIZE", "VitalsLogWriter"]
+__all__ = ["ALERT_DEDUP_SEC", "CLEANUP_INTERVAL_SEC", "DEFAULT_RETENTION_DAYS",
+           "QUEUE_MAXSIZE", "VitalsLogWriter", "delete_expired_vitals"]

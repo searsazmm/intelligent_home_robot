@@ -144,6 +144,9 @@ class BackendB:
                 self.family_log = VitalsLogWriter(
                     config.FAMILY_DB_PATH,
                     sample_interval=config.FAMILY_VITALS_INTERVAL,
+                    # 二期数据老化清理：删除 7 天前旧样本（B_FAMILY_RETENTION_DAYS
+                    # 可调，<=0 关闭），写线程周期执行，不占主循环
+                    retention_days=config.FAMILY_RETENTION_DAYS,
                 )
             except Exception:
                 # 连 writer 都建不起来（磁盘只读等）也只降级为"不落盘"
