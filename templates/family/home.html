@@ -23,17 +23,23 @@
     <div class="card">
       <div class="metric-head">
         <span class="pill-ico">♥</span><h3>心率状态</h3>
-        <span class="hint">静息时测量 · 每秒更新</span>
+        <span id="hr-flag" class="wave-flag none">未检出</span>
       </div>
-      <div id="hr" class="metric none">未检出</div>
+      <div class="metric-row">
+        <div id="hr" class="metric none">未检出</div>
+        <canvas id="hr-wave" class="wave-canvas" aria-hidden="true"></canvas>
+      </div>
       <div class="sub" id="hr-sub">成年人静息参考 60 ~ 100 次/分</div>
     </div>
     <div class="card">
       <div class="metric-head">
         <span class="pill-ico">◍</span><h3>呼吸状态</h3>
-        <span class="hint">每分钟次数</span>
+        <span id="rr-flag" class="wave-flag none">未检出</span>
       </div>
-      <div id="rr" class="metric none">未检出</div>
+      <div class="metric-row">
+        <div id="rr" class="metric none">未检出</div>
+        <canvas id="rr-wave" class="wave-canvas" aria-hidden="true"></canvas>
+      </div>
       <div class="sub" id="rr-sub">成年人静息参考 12 ~ 20 次/分</div>
     </div>
     <div class="card">
@@ -70,5 +76,6 @@ window.FAMILY_URLS = {
   alerts: "{% url 'family_portal:api_alerts' %}"
 };
 </script>
+<script src="{% static 'family/js/waveform.js' %}"></script>
 <script src="{% static 'family/js/live.js' %}"></script>
 {% endblock %}

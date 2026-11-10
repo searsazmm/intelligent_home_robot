@@ -57,11 +57,11 @@
     $("conn-dot").className = "dot " + (offline ? "off" : "on");
     $("last-update").textContent = offline
       ? "最后数据：" + (vitals ? fmtTime(vitals.ts) : "—")
-      : "更新于 " + fmtTime(data.timestamp);
+      : "更新于 " + fmtTime(data.server_ts);   /* 响应生成时刻（服务端时间） */
 
     if (state) setStateBadge(state.state, state.reason);
 
-    function metric(id, subId, value, unit, digits) {
+  function metric(id, subId, value, unit, digits) {
       var el = $(id);
       if (value === null || value === undefined) {
         el.className = "metric none";
@@ -72,8 +72,29 @@
         el.innerHTML = Number(value).toFixed(digits) + '<span class="unit">' + unit + "</span>";
       }
     }
+
+    function setFlag(id, level, text) {
+      var el = $(id);
+      el.className = "wave-flag " + level;
+      el.textContent = text;
+    }
     metric("hr", "hr-sub", vitals && vitals.hr, "次/分", 0);
     metric("rr", "rr-sub", vitals && vitals.rr, "次/分", 1);
+
+    /* 波形（数字与波动同源：脉冲/正弦频率由实时 hr/rr 驱动，见 waveform.js）。
+       徽标语义：绿"波形稳定"= 有测量值且信号质量可用；橙"信号减弱"= 有值
+       但 SQI 低；灰"未检出"= 没有测量值。离线时波形停成灰平线。 */
+    var hr = vitals && vitals.hr, rr = vitals && vitals.rr;
+    var sqi = vitals ? vitals.sqi : null;
+    hrWave.setRate(offline ? null : hr);
+    rrWave.setRate(offline ? null : rr);
+    setFlag("hr-flag", hr === null || hr === undefined ? "none"
+             : (sqi !== null && sqi !== undefined && sqi < 0.5) ? "mid" : "good",
+             hr === null || hr === undefined ? "未检出"
+             : (sqi !== null && sqi !== undefined && sqi < 0.5) ? "信号减弱" : "波形稳定");
+    setFlag("rr-flag", rr === null || rr === undefined ? "none" : "good",
+            rr === null || rr === undefined ? "未检出" : "节律均匀");
+
     var sqiEl = $("sqi");
     if (vitals && vitals.sqi !== null && vitals.sqi !== undefined) {
       sqiEl.className = "metric";
@@ -130,6 +151,11 @@
         }
       }).catch(function () { });
   }
+
+  /* 波形实例：先建再轮询 —— 首次 poll() 里 renderLive 就会调 setRate。
+     本脚本在 body 尾部，canvas 元素已存在，clientWidth 可同步取到。 */
+  var hrWave = new FamilyWaveform($("hr-wave"), { type: "ecg", color: "#e2704a" });
+  var rrWave = new FamilyWaveform($("rr-wave"), { type: "resp", color: "#3a9d6e" });
 
   poll();
   setInterval(poll, POLL_MS);

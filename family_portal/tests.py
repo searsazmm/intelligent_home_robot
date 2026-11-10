@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 from django.test import TestCase, override_settings
 
 from family_portal import stats
+from family_portal import report as report_lib
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS vitals_samples (
@@ -300,6 +301,62 @@ class TestApiReport(ApiContractMixin, TestCase):
         self.assertEqual(body["status"], 0)
         self.assertFalse(body["data"]["has_data"])
         self.assertIn("无有效体征数据", "".join(body["data"]["diet_advice"]))
+
+
+class TestWellnessIndices(TempDbMixin, TestCase):
+    """健康指数分析（图3 渐变指数条）：心肺→元气，状态占比→压力。"""
+
+    def test_no_data_returns_none(self):
+        """无数据 → None，页面不渲染指数条 —— 不编造"看起来正常"的数。"""
+        self.assertIsNone(report_lib.wellness_indices({"sample_count": 0}))
+        self.assertIsNone(report_lib.wellness_indices(None))
+
+    def test_vitality_follows_hr_rr_grades(self):
+        """心率呼吸都平稳 → 元气分 92（good）；明显异常 → 45。"""
+        good = report_lib.wellness_indices({
+            "sample_count": 10, "hr_avg": 72, "rr_avg": 16.0,
+            "negative_ratio": 0.0, "state_distribution": []})
+        self.assertEqual(good["vitality"]["score"], 92)
+        self.assertEqual(good["vitality"]["label"], "良好")
+        self.assertEqual(good["stress"]["score"], 0)
+        self.assertEqual(good["stress"]["label"], "从容")
+
+        bad = report_lib.wellness_indices({
+            "sample_count": 10, "hr_avg": 110, "rr_avg": 28.0,
+            "negative_ratio": 0.0, "state_distribution": []})
+        self.assertEqual(bad["vitality"]["score"], 45)
+        self.assertEqual(bad["vitality"]["label"], "需关注")
+
+    def test_stress_blends_sad_and_tired(self):
+        """压力 = 低落×0.6 + 疲惫×0.4 ×100；段位词按分数落档。"""
+        mixed = report_lib.wellness_indices({
+            "sample_count": 10, "hr_avg": 72, "rr_avg": 16.0,
+            "negative_ratio": 0.5,
+            "state_distribution": [{"state": "sad", "ratio": 0.3},
+                                   {"state": "tired", "ratio": 0.2}]})
+        # 0.5*0.6 + 0.2*0.4 = 0.38 → 38 分 → "平稳"
+        self.assertEqual(mixed["stress"]["score"], 38)
+        self.assertEqual(mixed["stress"]["label"], "平稳")
+
+    def test_stress_falls_back_to_negative_only(self):
+        """分布里没有疲惫细分（全 sad）→ 退回负向占比整体。"""
+        idx = report_lib.wellness_indices({
+            "sample_count": 10, "hr_avg": 72, "rr_avg": 16.0,
+            "negative_ratio": 0.4,
+            "state_distribution": [{"state": "sad", "ratio": 0.4}]})
+        self.assertEqual(idx["stress"]["score"], 40)
+
+    def test_report_api_carries_indices(self):
+        """api_report 输出 indices；报告页渲染指数条与状态词。"""
+        now = time.time()
+        for i in range(5):
+            self.insert_vitals(now - i * 600, hr=72, rr=16.0)
+        self.commit()
+        body = self.client.get("/api/report/").json()
+        self.assertEqual(body["data"]["indices"]["vitality"]["score"], 92)
+        resp = self.client.get("/report/")
+        self.assertContains(resp, "健康元气势数")
+        self.assertContains(resp, "精神压力指数")
 
 
 class TestPages(TestCase, TempDbMixin):

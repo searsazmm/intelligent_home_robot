@@ -211,13 +211,23 @@ def health_summary(stats_result: dict | None) -> dict | None:
             {"name": "活力状态", "word": energy_word[0], "level": energy_word[1], "tip": energy_word[2],
              "desc": "由疲惫状态占比评估"},
         ],
-        # 指数条：1 - 占比，0~1（前端模板直显百分数）
-        "gauges": [
-            {"name": "情绪元气指数", "value": round(max(0.0, 1.0 - negative), 3),
-             "note": "低落/疲惫占比越低越充实"},
-            {"name": "精神放松指数", "value": round(max(0.0, 1.0 - tired), 3),
-             "note": "疲惫占比越低越放松"},
-        ],
+        # 健康指数分析（图3 模板样式）：渐变条 + 圆点 + 状态词。
+        # 与评分环同源但维度拆开：心肺 → 元气，状态占比 → 压力。
+        # 每条带 tip —— 指数怎么算的，家属悬停即可见（透明可解释）。
+        "gauges": (lambda idx: ([
+            {"name": "健康元气势数", "note": "心肺综合评估",
+             "score": idx["vitality"]["score"], "label": idx["vitality"]["label"],
+             "level": "good" if idx["vitality"]["score"] >= 85 else
+                      ("mid" if idx["vitality"]["score"] >= 70 else "bad"),
+             "tip": ("由本周平均心率/呼吸的状态等级折算：平稳 92 分、偏离 68 分、"
+                     "明显异常 45 分，取平均。仅供观察参考，不构成医疗意见。")},
+            {"name": "精神压力指数", "note": "压力水平评估",
+             "score": idx["stress"]["score"], "label": idx["stress"]["label"],
+             "level": "good" if idx["stress"]["score"] <= 40 else
+                      ("mid" if idx["stress"]["score"] <= 60 else "bad"),
+             "tip": ("由本周状态占比推算：低落占比 ×0.6 + 疲惫占比 ×0.4 ×100，"
+                     "分数越高压力越大。仅供观察参考，不构成医疗意见。")},
+        ] if idx else []))(wellness_indices(stats_result)),
     }
 
 
@@ -270,6 +280,46 @@ def _energy_word(tired):
     return ("疲乏", "bad", f"本周约 {tired:.0%} 的时间呈疲惫状态。建议调整作息，持续疲乏请就医排查。")
 
 
+def wellness_indices(stats_result: dict | None) -> dict | None:
+    """健康指数分析（报告页两条渐变指数条）。
+
+    两个维度与评分环互补、彼此正交：
+    - 健康元气势数 —— 心肺综合：心率/呼吸状态词等级折算分（良好 92 /
+      偏离 68 / 明显异常 45），有效项平均；
+    - 精神压力指数 —— 状态占比推算：低落×0.6 + 疲惫×0.4（占比越高
+      压力越大），无疲惫细分时退回负向占比整体。
+
+    无数据返回 None —— 页面不渲染指数条，**不编造一个"看起来正常"的数**。
+    """
+    if not stats_result or not stats_result.get("sample_count"):
+        return None
+    by_grade = {"good": 92, "mid": 68, "bad": 45}
+    parts = [by_grade.get(_hr_word(stats_result.get("hr_avg"))[1]),
+             by_grade.get(_rr_word(stats_result.get("rr_avg"))[1])]
+    parts = [p for p in parts if p is not None]
+    if parts:
+        vitality = round(sum(parts) / len(parts))
+        vitality_label = ("良好" if vitality >= 85 else
+                          "一般" if vitality >= 70 else "需关注")
+    else:
+        vitality, vitality_label = None, "未检出"
+
+    negative = stats_result.get("negative_ratio") or 0.0
+    ratios = {d["state"]: d["ratio"] for d in stats_result.get("state_distribution", [])}
+    if "tired" in ratios:
+        stress = round((negative * 0.6 + ratios["tired"] * 0.4) * 100)
+    else:
+        stress = round(negative * 100)
+    stress = max(0, min(100, stress))
+    stress_label = ("从容" if stress <= 20 else
+                    "平稳" if stress <= 40 else
+                    "偏高" if stress <= 60 else "紧张")
+    return {
+        "vitality": {"score": vitality, "label": vitality_label},
+        "stress": {"score": stress, "label": stress_label},
+    }
+
+
 def weekly_report(conn, weather: dict | None = None) -> dict:
     """组装一周报告：统计 + 建议 + 元信息。报告页（HTML）与 api_report 共用。"""
     stats_result = stats.overall_stats(conn, days=7)
@@ -280,6 +330,7 @@ def weekly_report(conn, weather: dict | None = None) -> dict:
         "has_data": has_data,
         "stats": stats_result if has_data else None,
         "summary": health_summary(stats_result if has_data else None),
+        "indices": wellness_indices(stats_result if has_data else None),
         "series": series if has_data else [],
         "weather": weather,
         "diet_advice": diet_advice(stats_result if has_data else None, weather),

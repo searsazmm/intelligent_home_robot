@@ -41,19 +41,23 @@
   {% endfor %}
 </div>
 
-<!-- 健康指数分析条 -->
+<!-- 健康指数分析条（渐变条 + 圆点定位 + 状态词，参考模板样式） -->
 <h3 class="section-gap" style="display:flex; align-items:baseline">
   健康指数分析
   <span class="hint" style="margin-left:auto; font-size:12px; font-weight:500; color:var(--muted)">
-    由本周状态占比推算 · 仅作参考</span>
+    综合评估 · 建议详见报告</span>
 </h3>
 <div class="card">
   {% for g in report.summary.gauges %}
-  <div class="gauge">
-    <div class="gauge-head"><span>{{ g.name }}</span><b>{{ g.value }}分 <small style="color:var(--muted); font-weight:500">· {{ g.note }}</small></b></div>
-    <div class="track"><div class="fill-mask" style="width:{% widthratio g.value 1 100 %}%"></div></div>
-    <div class="labels"><span>低</span><span>高</span></div>
+  <div class="gauge tip" data-tip="{{ g.tip }}">
+    <div class="gauge-head">
+      <span><b>{{ g.name }}</b> <small>· {{ g.note }}</small></span>
+      <b class="gauge-label {{ g.level }}">{{ g.label }}</b>
+    </div>
+    <div class="index-bar"><div class="index-dot" style="left:{{ g.score }}%"></div></div>
   </div>
+  {% empty %}
+  <p class="sub" style="margin:6px 0">暂无可用于指数计算的体征数据。</p>
   {% endfor %}
 </div>
 {% else %}

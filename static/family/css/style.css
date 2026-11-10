@@ -157,14 +157,31 @@ td.kind { color: var(--danger); font-weight: 600; }
 .gauge { margin: 10px 0 16px; }
 .gauge .gauge-head { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
 .gauge .gauge-head b { color: var(--accent-deep); }
-.gauge .track { height: 10px; border-radius: 999px;
-                background: linear-gradient(90deg, #63c191, #f0c464, #e08a7a); position: relative; }
-.gauge .fill-mask { position: absolute; right: 0; top: 0; bottom: 0;
-                    background: #eef2ec; border-radius: 0 999px 999px 0; }
-.gauge .labels { display: flex; justify-content: space-between; font-size: 12px;
-                 color: var(--muted); margin-top: 4px; }
+.gauge .gauge-head small { color: var(--muted); font-weight: 500; }
+/* 指数条：绿→黄→橙渐变轨道 + 白色圆点定位当前分数（模板样式） */
+.gauge .index-bar { height: 10px; border-radius: 999px; position: relative;
+                    background: linear-gradient(90deg, #63c191, #f0c464, #e08a7a); }
+.gauge .index-dot { position: absolute; top: 50%; width: 16px; height: 16px;
+                    border-radius: 50%; background: #fff;
+                    border: 3px solid var(--accent); box-shadow: 0 1px 4px rgba(0,0,0,.18);
+                    transform: translate(-50%, -50%); transition: left .6s ease; }
+.gauge-label { font-size: 15px; }
+.gauge-label.good { color: var(--accent); }
+.gauge-label.mid { color: #d99a26; }
+.gauge-label.bad { color: var(--danger); }
 
 .section-gap { margin-top: 20px; }
+
+/* ---- 实时波形（心率/呼吸卡）---- */
+.metric-row { display: flex; align-items: center; gap: 14px; }
+.metric-row .metric { flex: 0 0 auto; }
+.wave-canvas { flex: 1 1 auto; min-width: 0; height: 64px; display: block; }
+/* 信号徽标（标题行右侧）：绿=稳定/橙=减弱/灰=未检出 */
+.wave-flag { font-size: 12px; font-weight: 600; padding: 3px 10px;
+             border-radius: 999px; margin-left: auto; }
+.wave-flag.good { color: var(--accent); background: rgba(58,157,110,.12); }
+.wave-flag.mid  { color: #d99a26; background: rgba(240,196,100,.18); }
+.wave-flag.none { color: var(--grey); background: rgba(140,150,140,.14); }
 
 /* ---- 登录页 ---- */
 .login-box { max-width: 420px; margin: 8vh auto 0; text-align: left; }
