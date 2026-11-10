@@ -118,3 +118,111 @@ class EnabledAuthTests(TempDbMixin, TestCase):
     def test_nav_shows_logout_after_login(self):
         self.client.post("/login/", {"token": TOKEN})
         self.assertContains(self.client.get("/"), "退出")
+
+
+class TokenMatchingTests(TempDbMixin, TestCase):
+    """令牌比较的边缘输入：判不匹配可以，绝不能 500。"""
+
+    def setUp(self):
+        super().setUp()
+        from django.test import override_settings
+        ctx = override_settings(FAMILY_API_TOKEN=TOKEN)
+        ctx.enable()
+        self.addCleanup(ctx.disable)
+
+    def test_token_is_case_sensitive(self):
+        resp = self.client.get("/api/live/", HTTP_X_API_TOKEN=TOKEN.upper())
+        self.assertEqual(resp.status_code, 401)
+
+    def test_token_with_surrounding_whitespace_rejected(self):
+        # 环境变量侧 settings 已 strip；请求头侧**不做** strip ——
+        # 复制粘贴带空格的令牌就是无效凭证，宽进等于没有边界
+        resp = self.client.get("/api/live/", HTTP_X_API_TOKEN=" " + TOKEN + " ")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_non_ascii_header_rejected_not_500(self):
+        """畸形请求头（非 ASCII）走 TypeError 兜底 → 401，而非 500。
+
+        hmac.compare_digest 的 str 版本只收 ASCII-only，恶意输入
+        不该把鉴权路径炸成服务器错误。
+        """
+        resp = self.client.get("/api/live/", HTTP_X_API_TOKEN="令牌测试")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_non_ascii_form_input_rejected_not_500(self):
+        resp = self.client.post("/login/", {"token": "令牌测试"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "令牌不正确")
+
+
+class ApiCoverageTests(TempDbMixin, TestCase):
+    """四个 REST 端点**全部**受保护 —— 漏掉任何一个都是裸奔的家属数据。"""
+
+    API_PATHS = ("/api/live/", "/api/stats/", "/api/alerts/", "/api/report/")
+
+    def setUp(self):
+        super().setUp()
+        from django.test import override_settings
+        ctx = override_settings(FAMILY_API_TOKEN=TOKEN)
+        ctx.enable()
+        self.addCleanup(ctx.disable)
+
+    def test_every_api_endpoint_rejects_anonymous(self):
+        for path in self.API_PATHS:
+            with self.subTest(path=path):
+                resp = self.client.get(path)
+                self.assertEqual(resp.status_code, 401, path)
+
+    def test_every_api_endpoint_accepts_header_token(self):
+        for path in self.API_PATHS:
+            with self.subTest(path=path):
+                resp = self.client.get(path, HTTP_X_API_TOKEN=TOKEN)
+                self.assertEqual(resp.status_code, 200, path)
+
+    def test_401_payload_fulfills_contract(self):
+        """401 也是契约响应：四个键一个不少，data 为空 dict。"""
+        payload = self.client.get("/api/live/").json()
+        self.assertEqual(set(payload),
+                         {"status", "message", "data", "timestamp"})
+        self.assertEqual(payload["status"], 2)
+        self.assertEqual(payload["data"], {})
+
+
+class LoginEdgeCasesTests(TempDbMixin, TestCase):
+    """登录页与回跳的边缘路径。"""
+
+    def setUp(self):
+        super().setUp()
+        from django.test import override_settings
+        ctx = override_settings(FAMILY_API_TOKEN=TOKEN)
+        ctx.enable()
+        self.addCleanup(ctx.disable)
+
+    def test_next_relative_path_rejected(self):
+        """/stats 没有 / 前缀 —— 不是站内绝对路径，落回首页。"""
+        resp = self.client.post("/login/?next=stats", {"token": TOKEN})
+        self.assertEqual(resp["Location"], "/")
+
+    def test_next_to_login_page_does_not_loop(self):
+        """next=/login/ 会被放行（站内路径）；登录后到登录页再手动进，
+        行为无害 —— 这里钉住它**不产生重定向死循环**（直接 200/302 可终止）。"""
+        resp = self.client.post("/login/?next=/login/", {"token": TOKEN})
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp["Location"], "/login/")
+
+    def test_session_persists_across_requests(self):
+        self.client.post("/login/", {"token": TOKEN})
+        for _ in range(3):
+            self.assertEqual(self.client.get("/stats/").status_code, 200)
+
+    def test_login_success_is_logged(self):
+        with self.assertLogs("family_portal.views", level="INFO") as captured:
+            self.client.post("/login/", {"token": TOKEN})
+        self.assertIn("登录成功", "".join(captured.output))
+
+    def test_csrf_protection_is_enforced(self):
+        """真实浏览器场景：CSRF 中间件必须拦下没有令牌的跨站 POST。"""
+        from django.test import Client
+        strict = Client(enforce_csrf_checks=True)
+        resp = strict.post("/login/", {"token": TOKEN})
+        self.assertEqual(resp.status_code, 403)

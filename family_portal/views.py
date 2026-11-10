@@ -60,6 +60,21 @@ def _render_page(request, template: str, context: dict | None = None):
     })
 
 
+def _token_matches(supplied: str) -> bool:
+    """常数时间令牌比较；非 ASCII 输入直接判不匹配。
+
+    :func:`hmac.compare_digest` 的 str 版本要求两侧都是 ASCII-only，
+    恶意/畸形的请求头（如含中文）会抛 TypeError —— 这里兜成"不匹配"，
+    绝不让鉴权路径变成 500。
+    """
+    if not supplied:
+        return False
+    try:
+        return hmac.compare_digest(supplied, settings.FAMILY_API_TOKEN)
+    except TypeError:
+        return False
+
+
 def require_auth(view):
     """family_portal 的鉴权装饰器（方案二期：X-API-Token）。
 
@@ -72,8 +87,7 @@ def require_auth(view):
         if not _auth_enabled():
             return view(request, *args, **kwargs)
         supplied = request.headers.get("X-API-Token", "")
-        if (supplied and hmac.compare_digest(supplied, settings.FAMILY_API_TOKEN)) \
-                or request.session.get(SESSION_KEY) is True:
+        if _token_matches(supplied) or request.session.get(SESSION_KEY) is True:
             return view(request, *args, **kwargs)
         if request.path.startswith("/api/"):
             return _api(None, "未授权：请携带 X-API-Token 请求头或先登录", status=2,
@@ -97,9 +111,7 @@ def login_view(request):
     """
     error = None
     if request.method == "POST":
-        supplied = request.POST.get("token", "")
-        if _auth_enabled() and supplied and \
-                hmac.compare_digest(supplied, settings.FAMILY_API_TOKEN):
+        if _auth_enabled() and _token_matches(request.POST.get("token", "")):
             request.session[SESSION_KEY] = True
             logger.info("家属门户登录成功（%s）", request.META.get("REMOTE_ADDR", "?"))
             return redirect(_safe_next(request.GET.get("next")) or "family_portal:home")
