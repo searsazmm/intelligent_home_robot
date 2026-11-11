@@ -1,12 +1,18 @@
 {% extends "family/base.html" %}
+{% load static %}
 {% block title %}健康报告{% endblock %}
 {% block content %}
 {% if not report %}
 <div class="card"><h3 style="font-size:16px">暂无任何数据</h3>
   <p class="sub">机器人还没有采集过数据，报告生成后这里会自动出现。</p></div>
 {% else %}
-<div class="card no-print" style="margin-bottom:16px; display:flex; justify-content:space-between">
-  <span class="print-tip">点击浏览器菜单 → 打印 → 另存为 PDF，即可导出/分享本报告。</span>
+<div class="card no-print" style="margin-bottom:16px; display:flex; align-items:center; gap:16px">
+  <!-- 微信扫码查看：二维码指向报告页的局域网地址（views._share_url 生成） -->
+  <div id="share-qr" title="微信扫一扫，手机查看报告"></div>
+  <div>
+    <b style="font-size:15px">微信扫一扫，手机查看报告</b>
+    <p class="sub" style="margin:6px 0 0">{% if share_remote %}扫码即可在手机上打开本页 —— 已接入公网隧道，手机在外网（流量）也能打开。{% else %}扫码即可在手机上打开本页；请确保手机与机器人处于同一局域网。{% endif %}</p>
+  </div>
 </div>
 
 {% if report.summary %}
@@ -34,7 +40,7 @@
 <div class="status-tiles">
   {% for t in report.summary.tiles %}
   <div class="status-tile tip" data-tip="{{ t.tip }}">
-    <div class="name"><span class="pill-ico">{% if forloop.counter0 == 0 %}♥{% elif forloop.counter0 == 1 %}◍{% elif forloop.counter0 == 2 %}☺{% else %}⚡{% endif %}</span>{{ t.name }}</div>
+    <div class="name"><span class="pill-ico">{% if forloop.counter0 == 0 %}<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>{% elif forloop.counter0 == 1 %}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8.5 6.5v11M12 4.5v15M15.5 6.5v11"/></svg>{% elif forloop.counter0 == 2 %}<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><circle cx="9" cy="10" r="1.2" fill="currentColor" stroke="none"/><circle cx="15" cy="10" r="1.2" fill="currentColor" stroke="none"/><path d="M8.2 14.3c1 1.3 2.3 2 3.8 2s2.8-.7 3.8-2"/></svg>{% else %}<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2 4.5 13.5H11L9.5 22 19.5 10H13l1-8z"/></svg>{% endif %}</span>{{ t.name }}</div>
     <div class="word {{ t.level }}">{{ t.word }}</div>
     <div class="desc">{{ t.desc }}</div>
   </div>
@@ -54,7 +60,7 @@
       <span><b>{{ g.name }}</b> <small>· {{ g.note }}</small></span>
       <b class="gauge-label {{ g.level }}">{{ g.label }}</b>
     </div>
-    <div class="index-bar"><div class="index-dot" style="left:{{ g.score }}%"></div></div>
+    <div class="index-bar{% if g.rev %} rev{% endif %}"><div class="index-dot" style="left:{{ g.score }}%"></div></div>
   </div>
   {% empty %}
   <p class="sub" style="margin:6px 0">暂无可用于指数计算的体征数据。</p>
@@ -101,16 +107,35 @@
     <p class="sub">状态时间覆盖 {{ report.stats.state_distribution.0.span_covered|floatformat:2 }}
       （0~1）；覆盖不足 1 的部分为机器人未运行时段（含重启断档），不计入统计。</p>
 
-    <h3 class="section-gap" style="margin-top:22px">三、接下来一周的饮食建议</h3>
-    <ul class="advice">
-      {% for item in report.diet_advice %}<li>{{ item }}</li>{% endfor %}
+    <!-- 饮食建议：单一卡片，规则建议在前（永远在），大模型补充随后 -->
+    <h3 class="section-gap" style="margin-top:22px; display:flex; align-items:baseline">
+      三、AI 营养师饮食建议
+      <span class="hint" style="margin-left:auto; font-size:12px; font-weight:500; color:var(--muted)">
+        {% if report.ai_advice %}规则引擎 + 大模型{% else %}规则引擎{% endif %} · 根据本周统计生成</span>
+    </h3>
+    <ul class="advice ai-advice">
+      {% for item in report.diet_rules %}<li>{{ item }}</li>{% endfor %}
+      {% for item in report.ai_advice %}<li>{{ item }}</li>{% endfor %}
     </ul>
-    {% if report.weather %}
-    <p class="sub">参考天气：{{ report.weather.temp }}℃（风 {{ report.weather.wind }} m/s）—— 天气缓存 30 分钟，拉取失败时建议里不含天气项。</p>
-    {% endif %}
+    <p class="sub">以上建议仅作生活方式参考，不构成医疗意见；如有不适请就医。{% if report.ai_advice %}AI 补充部分由大模型生成，生成失败或未配置时自动省略。{% endif %}</p>
   {% else %}
     <p class="sub" style="margin-top:14px">本周无有效体征数据，无法生成统计与建议。</p>
   {% endif %}
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<!-- 本地 vendor 优先（与 Chart.js 同一约定：随仓库提交，离线可用） -->
+<script src="{% static 'family/vendor/qrcode.min.js' %}"></script>
+<script>
+/* 微信扫码查看：把 share_url 编码成二维码。库加载失败时静默隐藏入口，
+   不影响报告本体。 */
+(function () {
+  var box = document.getElementById("share-qr");
+  if (!box || !window.QRCode) { if (box) box.style.display = "none"; return; }
+  new QRCode(box, { text: "{{ share_url|escapejs }}", width: 96, height: 96,
+                     correctLevel: QRCode.CorrectLevel.M });
+})();
+</script>
 {% endblock %}

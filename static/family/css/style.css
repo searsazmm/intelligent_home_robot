@@ -25,7 +25,7 @@
 /* 背景：奶白渐变 + 两块柔和绿斑 + 淡淡的心电波形（居家健康主题装饰） */
 body {
   margin: 0; color: var(--ink);
-  font: 16px/1.6 "Microsoft YaHei", "PingFang SC", sans-serif;
+  font: 18px/1.65 "Microsoft YaHei", "PingFang SC", sans-serif;
   background:
     radial-gradient(900px 480px at 88% -10%, rgba(111, 191, 152, .18), transparent 60%),
     radial-gradient(760px 420px at -12% 30%, rgba(111, 191, 152, .14), transparent 60%),
@@ -37,22 +37,29 @@ body {
 /* ---- 顶栏 ---- */
 .topbar {
   display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 6px 0;
   background: rgba(255, 255, 255, .85); backdrop-filter: blur(10px);
   padding: 12px 28px; box-shadow: 0 1px 12px rgba(46, 138, 95, .08);
   position: sticky; top: 0; z-index: 10;
 }
-.topbar .brand { font-weight: 700; font-size: 18px; display: flex; align-items: center; gap: 12px; }
+.topbar .brand { font-weight: 700; font-size: 20px; display: flex; align-items: center; gap: 12px; }
 /* 品牌 Logo：渐变绿圆片 + 心跳折线 */
 .topbar .logo {
   width: 34px; height: 34px; border-radius: 12px; background: var(--grad);
   display: inline-flex; align-items: center; justify-content: center; flex: none;
 }
-.topbar .logo svg { width: 20px; height: 20px; }
-.topbar .brand small { display: block; font-weight: 500; font-size: 11px; color: var(--muted); }
+.topbar .logo svg { width: 24px; height: 24px; }
+.topbar .brand small { display: block; font-weight: 500; font-size: 12px; color: var(--muted); }
 .topbar .brand-text { line-height: 1.25; }
+/* 导航项整词换行：放不下时整条链接换到下一排，绝不把"健康报告"这样的
+   词从中间折断（中文没有连字符，默认会在任意字符处断行）。
+   nav 自身 nowrap —— 整条导航要么在品牌右侧、要么整体另起一行，
+   链接之间不再出现"健康报告"孤零零掉到第二行的情况。 */
+.topbar nav { display: flex; flex-wrap: nowrap; align-items: center; }
 .topbar nav a {
-  margin-left: 20px; color: var(--muted); text-decoration: none; font-size: 15px;
+  margin-left: 20px; color: var(--muted); text-decoration: none; font-size: 17px;
   padding: 6px 14px; border-radius: 999px; transition: all .15s;
+  white-space: nowrap;
 }
 .topbar nav a:hover { color: var(--accent-deep); background: var(--accent-soft); }
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--grey); display: inline-block; }
@@ -60,7 +67,7 @@ body {
 .dot.off { background: var(--danger); box-shadow: 0 0 0 4px rgba(198, 95, 84, .15); }
 
 .container { max-width: 1080px; margin: 26px auto; padding: 0 20px; }
-.footer { text-align: center; color: var(--muted); font-size: 13px; padding: 24px 0 32px; }
+.footer { text-align: center; color: var(--muted); font-size: 15px; padding: 24px 0 32px; }
 
 .grid { display: grid; gap: 18px; }
 .grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
@@ -72,27 +79,31 @@ body {
   background: var(--card); border-radius: var(--radius); padding: 20px 24px;
   box-shadow: var(--shadow); border: 1px solid rgba(46, 138, 95, .06);
 }
-.card h3 { margin: 0 0 12px; font-size: 14px; color: var(--muted); font-weight: 600;
+.card h3 { margin: 0 0 12px; font-size: 16px; color: var(--muted); font-weight: 600;
            display: flex; align-items: center; gap: 8px; }
-.card h3 .hint { margin-left: auto; font-weight: 500; font-size: 12px; }
+.card h3 .hint { margin-left: auto; font-weight: 500; font-size: 13px; }
 
 /* ---- 实时指标卡（模板词卡风：图标圆片 + 大数字） ---- */
 .metric { font-size: 42px; font-weight: 700; line-height: 1.15; color: var(--accent-deep); }
-.metric .unit { font-size: 15px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+.metric .unit { font-size: 17px; font-weight: 500; color: var(--muted); margin-left: 4px; }
 .metric.none { color: var(--grey); font-size: 22px; }
 .pill-ico {
-  width: 34px; height: 34px; border-radius: 11px; background: var(--accent-soft);
+  width: 36px; height: 36px; border-radius: 12px; background: var(--accent-soft);
   display: inline-flex; align-items: center; justify-content: center; flex: none;
-  color: var(--accent-deep); font-size: 17px;
+  color: var(--accent-deep); font-size: 27px; line-height: 1;
 }
+/* Unicode 图形字符（♥ ◍ ☺ ⚡）的字形实际只占 em 框的六成左右，
+   按 27px 放进 36px 圆片视觉上刚好撑满；再大会顶到圆角上。 */
+/* 图标已改用内联 SVG：尺寸不依赖系统字体，手机/电脑渲染一致，直接撑满圆片 */
+.pill-ico svg { width: 30px; height: 30px; display: block; }
 .metric-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
 .metric-head h3 { margin: 0; }
 
-.sub { color: var(--muted); font-size: 13px; margin-top: 6px; }
+.sub { color: var(--muted); font-size: 15px; margin-top: 6px; }
 
 /* ---- 徽标 ---- */
 .badge { display: inline-block; padding: 3px 14px; border-radius: 999px;
-         font-size: 13px; font-weight: 600; color: #fff; }
+         font-size: 14px; font-weight: 600; color: #fff; }
 .state-normal { background: var(--ok); }
 .state-tired  { background: var(--warn); }
 .state-sad    { background: var(--info); }
@@ -100,18 +111,33 @@ body {
 .offline-badge { background: var(--danger); }
 .nodata-badge { background: var(--grey); }
 
-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+table { width: 100%; border-collapse: collapse; font-size: 16px; }
 th, td { text-align: left; padding: 9px 6px; border-bottom: 1px solid #eef3ee; }
 th { color: var(--muted); font-weight: 600; }
 td.kind { color: var(--danger); font-weight: 600; }
 
 .chart-box { position: relative; height: 300px; }
 .report-head { display: flex; justify-content: space-between; align-items: baseline; }
-.report-head .meta { color: var(--muted); font-size: 13px; }
+.report-head .meta { color: var(--muted); font-size: 15px; }
 .advice li { margin-bottom: 10px; }
 .advice { padding-left: 20px; margin: 10px 0; }
-.disclaimer { color: var(--muted); font-size: 13px; }
-.print-tip { color: var(--muted); font-size: 13px; }
+/* AI 营养师补充建议：与规则建议视觉区分（淡绿左边线），打印同样生效 */
+.ai-advice {
+  border-left: 3px solid #bfe3cc;
+  background: #f6fbf8;
+  border-radius: 0 8px 8px 0;
+  padding: 10px 14px 10px 20px;
+}
+/* 微信扫码入口：二维码白底更易识别 */
+#share-qr {
+  flex: none;
+  background: #fff;
+  padding: 4px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #e3e8e4);
+}
+.disclaimer { color: var(--muted); font-size: 15px; }
+.print-tip { color: var(--muted); font-size: 15px; }
 
 /* ---- 报告页：整体状态 hero 卡（参考模板第三栏） ---- */
 .hero-card {
@@ -130,10 +156,10 @@ td.kind { color: var(--danger); font-weight: 600; }
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   box-shadow: inset 0 0 0 1px var(--accent-line);
 }
-.score-ring .num { font-size: 40px; font-weight: 700; color: var(--accent-deep); line-height: 1; }
-.score-ring .cap { font-size: 11px; color: var(--muted); margin-top: 4px; }
-.hero-title { font-size: 26px; font-weight: 700; margin: 0 0 6px; }
-.hero-sub { color: var(--muted); font-size: 14px; }
+.score-ring .num { font-size: 42px; font-weight: 700; color: var(--accent-deep); line-height: 1; }
+.score-ring .cap { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.hero-title { font-size: 28px; font-weight: 700; margin: 0 0 6px; }
+.hero-sub { color: var(--muted); font-size: 16px; }
 .score-pill {
   display: inline-block; margin-top: 10px; padding: 4px 16px; border-radius: 999px;
   background: var(--accent-soft); color: var(--accent-deep);
@@ -145,9 +171,9 @@ td.kind { color: var(--danger); font-weight: 600; }
 @media (max-width: 760px) { .status-tiles { grid-template-columns: repeat(2, 1fr); } }
 .status-tile { background: var(--card); border-radius: 16px; padding: 16px 18px;
                box-shadow: var(--shadow); border: 1px solid rgba(46, 138, 95, .06); }
-.status-tile .name { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
-.status-tile .word { font-size: 22px; font-weight: 700; margin-top: 8px; }
-.status-tile .desc { font-size: 12px; color: var(--muted); margin-top: 4px; }
+.status-tile .name { display: flex; align-items: center; gap: 8px; font-size: 15px; color: var(--muted); }
+.status-tile .word { font-size: 24px; font-weight: 700; margin-top: 8px; }
+.status-tile .desc { font-size: 13px; color: var(--muted); margin-top: 4px; }
 .word.good { color: var(--ok); }
 .word.mid  { color: var(--warn); }
 .word.bad  { color: var(--danger); }
@@ -155,12 +181,16 @@ td.kind { color: var(--danger); font-weight: 600; }
 
 /* ---- 健康指数分析条 ---- */
 .gauge { margin: 10px 0 16px; }
-.gauge .gauge-head { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 6px; }
+.gauge .gauge-head { display: flex; justify-content: space-between; font-size: 16px; margin-bottom: 6px; }
 .gauge .gauge-head b { color: var(--accent-deep); }
 .gauge .gauge-head small { color: var(--muted); font-weight: 500; }
-/* 指数条：绿→黄→橙渐变轨道 + 白色圆点定位当前分数（模板样式） */
+/* 指数条：绿→黄→橙渐变轨道 + 白色圆点定位当前分数（模板样式）。
+   仅用于"分数越高越糟"的指标（如精神压力）。"分数越高越好"的指标
+   （元气势数）用 .rev 反转：红→黄→绿，高分落在绿色段 —— 颜色和
+   状态词才说得一致。 */
 .gauge .index-bar { height: 10px; border-radius: 999px; position: relative;
                     background: linear-gradient(90deg, #63c191, #f0c464, #e08a7a); }
+.gauge .index-bar.rev { background: linear-gradient(90deg, #e08a7a, #f0c464, #63c191); }
 .gauge .index-dot { position: absolute; top: 50%; width: 16px; height: 16px;
                     border-radius: 50%; background: #fff;
                     border: 3px solid var(--accent); box-shadow: 0 1px 4px rgba(0,0,0,.18);

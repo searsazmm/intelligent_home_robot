@@ -8,8 +8,9 @@
 - 没有天气 → 跳过天气相关规则，其余照常；
 - 页面固定展示免责声明。
 
-二期可以在这里接 backend_B 的大模型（core/llm.py），把规则输出当
-提示词骨架 —— 接口（输入 stats/weather，输出建议列表）已经留好。
+二期已接入：大模型补充建议在 :mod:`family_portal.llm_advice`（DeepSeek，
+与规则引擎叠加不是替换，失败静默省略），本模块的接口（输入
+stats/weather、输出建议列表）不变。
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import time
 import urllib.request
 from datetime import datetime
 
-from . import stats
+from . import llm_advice, stats
 
 # --------------------------------------------------------------------------
 # 天气：与 backend_B/core/weather.py 同一 open-meteo 端点、同一 {temp,code,wind}
@@ -74,7 +75,8 @@ def fetch_weather(timeout: float = 4.0, lat: float | None = None,
 
 #: 触发阈值与依据。数值取自公开的健康科普常识区间（成年人静息心率
 #: 60~100、静息呼吸 12~20 次/分），**只作生活方式提示，不构成医疗意见**。
-HR_HIGH = 85.0
+#: 心率的"提示线"取 90（区间内偏高段）：85 就报警不符合通用口径，容易吓到家属。
+HR_HIGH = 90.0
 HR_LOW = 55.0
 RR_HIGH = 20.0
 
@@ -95,18 +97,18 @@ def diet_advice(stats_result: dict | None, weather: dict | None) -> list[str]:
     if hr is not None:
         if hr >= HR_HIGH:
             advice.append(
-                f"本周平均心率 {hr} 次/分，偏高。建议饮食清淡少盐、少浓茶咖啡，"
-                "规律三餐，避免饱餐后立即休息。")
+                f"本周平均心率 {hr} 次/分，处在静息常见区间 60~100 的偏高段。"
+                "建议饮食清淡少盐、少浓茶咖啡，规律三餐，避免饱餐后立即休息。")
         elif hr <= HR_LOW:
             advice.append(
-                f"本周平均心率 {hr} 次/分，偏低。建议营养均衡、适量补充优质蛋白"
-                "与含铁食物（瘦肉、菠菜），少量多餐。")
+                f"本周平均心率 {hr} 次/分，低于静息常见区间 60~100 的下限。"
+                "建议营养均衡、适量补充优质蛋白与含铁食物（瘦肉、菠菜），少量多餐。")
 
     rr = stats_result.get("rr_avg")
     if rr is not None and rr >= RR_HIGH:
         advice.append(
-            f"本周平均呼吸 {rr} 次/分，偏快。建议避免过饱、细嚼慢咽，"
-            "晚餐七八分饱，饭后散步片刻再休息。")
+            f"本周平均呼吸 {rr} 次/分，略高于静息常见区间 12~20。"
+            "建议避免过饱、细嚼慢咽，晚餐七八分饱，饭后散步片刻再休息。")
 
     negative = stats_result.get("negative_ratio") or 0.0
     distribution = stats_result.get("state_distribution") or []
@@ -148,7 +150,8 @@ def health_summary(stats_result: dict | None) -> dict | None:
     """由一周统计派生健康摘要。无有效数据返回 None（页面走"暂无"兜底）。
 
     评分规则（0~100，起点 100）：
-    - 平均心率偏离常见区间（60~85）：每偏 2 次/分扣 1 分，上限 15；
+    - 平均心率偏离观察基准（60~90，通用静息区间 60~100 内的偏高段
+      从 90 起提示留意）：每偏 2 次/分扣 1 分，上限 15；
     - 平均呼吸偏离常见区间（12~20）：每偏 1 次/分扣 1 分，上限 15；
     - 疲惫 + 低落合计占比 ×30 直接扣分（状态是比体征更直接的信号）。
     扣完下限 40 —— 观察性评分不应 dramatic 地趋零吓到家属，页面上
@@ -165,8 +168,8 @@ def health_summary(stats_result: dict | None) -> dict | None:
 
     score = 100.0
     if hr is not None:
-        if hr > 85:
-            score -= min((hr - 85) / 2.0, 15.0)
+        if hr > 90:
+            score -= min((hr - 90) / 2.0, 15.0)
         elif hr < 60:
             score -= min((60 - hr) / 2.0, 15.0)
     if rr is not None:
@@ -197,13 +200,13 @@ def health_summary(stats_result: dict | None) -> dict | None:
         # 评分环 hover 提示：把扣分规则原样告诉家属（透明可解释）
         "score_tip": (
             "评分规则：起点 100 分。"
-            "平均心率偏离 60~85 次/分、平均呼吸偏离 12~20 次/分，"
+            "平均心率偏离 60~90 次/分、平均呼吸偏离 12~20 次/分，"
             "按偏离程度扣分（各上限 15 分）；"
             "疲惫与低落合计占比 ×30 扣分；下限 40 分。仅供观察参考。"
         ),
         "tiles": [
             {"name": "心率状态", "word": hr_word[0], "level": hr_word[1], "tip": hr_word[2],
-             "desc": "成年人静息参考 60~85 次/分"},
+             "desc": "成年人静息参考 60~100 次/分"},
             {"name": "呼吸状态", "word": rr_word[0], "level": rr_word[1], "tip": rr_word[2],
              "desc": "成年人静息参考 12~20 次/分"},
             {"name": "情绪状态", "word": mood_word[0], "level": mood_word[1], "tip": mood_word[2],
@@ -214,14 +217,17 @@ def health_summary(stats_result: dict | None) -> dict | None:
         # 健康指数分析（图3 模板样式）：渐变条 + 圆点 + 状态词。
         # 与评分环同源但维度拆开：心肺 → 元气，状态占比 → 压力。
         # 每条带 tip —— 指数怎么算的，家属悬停即可见（透明可解释）。
+        # 指数条渐变方向：压力"分数越高越糟"用绿→红；元气"分数越高越好"
+        # 要反过来（红→绿）—— 否则 80 分的圆点落在右侧橙红段，"一般"
+        # 看起来像"差"（颜色和文字打架）。
         "gauges": (lambda idx: ([
-            {"name": "健康元气势数", "note": "心肺综合评估",
+            {"name": "健康元气势数", "note": "心肺综合评估", "rev": True,
              "score": idx["vitality"]["score"], "label": idx["vitality"]["label"],
              "level": "good" if idx["vitality"]["score"] >= 85 else
                       ("mid" if idx["vitality"]["score"] >= 70 else "bad"),
              "tip": ("由本周平均心率/呼吸的状态等级折算：平稳 92 分、偏离 68 分、"
                      "明显异常 45 分，取平均。仅供观察参考，不构成医疗意见。")},
-            {"name": "精神压力指数", "note": "压力水平评估",
+            {"name": "精神压力指数", "note": "压力水平评估", "rev": False,
              "score": idx["stress"]["score"], "label": idx["stress"]["label"],
              "level": "good" if idx["stress"]["score"] <= 40 else
                       ("mid" if idx["stress"]["score"] <= 60 else "bad"),
@@ -232,18 +238,22 @@ def health_summary(stats_result: dict | None) -> dict | None:
 
 
 def _hr_word(hr):
-    """返回 (状态词, 等级, hover 提示)。提示带本周实际数值，比固定文案更有用。"""
+    """返回 (状态词, 等级, hover 提示)。提示带本周实际数值，比固定文案更有用。
+
+    口径：通用静息参考 60~100 次/分；90 以上是区间内偏高段，提示留意，
+    超过 100 提示就医 —— 不把 85 这种正常值说成"偏快"吓家属。
+    """
     if hr is None:
         return ("未检出", "none", "本周没有可用的心率测量值 —— 机器人运行并在镜头前采集到数据后自动更新。")
     if hr > 100:
         return ("过速", "bad", f"本周平均心率 {hr} 次/分，明显高于静息常见上限。建议留意休息与情绪，持续偏高请就医。")
-    if hr > 85:
-        return ("偏快", "mid", f"本周平均心率 {hr} 次/分，高于静息常见区间 60~85。可能与活动、紧张或咖啡因有关。")
+    if hr > 90:
+        return ("偏快", "mid", f"本周平均心率 {hr} 次/分，处在静息常见区间 60~100 的偏高段。可能与活动、紧张或咖啡因有关，建议留意休息。")
     if hr < 55:
         return ("过缓", "bad", f"本周平均心率 {hr} 次/分，明显低于静息常见下限。如伴头晕乏力请就医。")
     if hr < 60:
-        return ("偏缓", "mid", f"本周平均心率 {hr} 次/分，略低于静息常见区间 60~85。经常锻炼者偏缓也可能正常。")
-    return ("平稳", "good", f"本周平均心率 {hr} 次/分，处于静息常见区间 60~85 内。")
+        return ("偏缓", "mid", f"本周平均心率 {hr} 次/分，略低于静息常见区间 60~100。经常锻炼者偏缓也可能正常。")
+    return ("平稳", "good", f"本周平均心率 {hr} 次/分，处于静息常见区间 60~100 内。")
 
 
 def _rr_word(rr):
@@ -321,10 +331,17 @@ def wellness_indices(stats_result: dict | None) -> dict | None:
 
 
 def weekly_report(conn, weather: dict | None = None) -> dict:
-    """组装一周报告：统计 + 建议 + 元信息。报告页（HTML）与 api_report 共用。"""
+    """组装一周报告：统计 + 建议 + 元信息。报告页（HTML）与 api_report 共用。
+
+    ``diet_advice``（规则引擎）永远在；``ai_advice`` 是大模型补充
+    （llm_advice.ai_diet_advice），失败/未配置时为空列表。页面把两者
+    合并进同一张"AI 营养师饮食建议"卡片（diet_rules = 规则项去声明），
+    api_report 仍分别给出 diet_advice / ai_advice 两个字段。
+    """
     stats_result = stats.overall_stats(conn, days=7)
     has_data = bool(stats_result.get("sample_count"))
     series = stats.day_series(conn, days=7)
+    rules = diet_advice(stats_result if has_data else None, weather)
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "has_data": has_data,
@@ -333,5 +350,13 @@ def weekly_report(conn, weather: dict | None = None) -> dict:
         "indices": wellness_indices(stats_result if has_data else None),
         "series": series if has_data else [],
         "weather": weather,
-        "diet_advice": diet_advice(stats_result if has_data else None, weather),
+        "diet_advice": rules,
+        # 页面把规则建议与大模型建议合并进同一张"AI 营养师"卡片渲染，
+        # 免责声明单独作卡片底注 —— diet_rules 就是去掉声明后的规则项。
+        "diet_rules": [a for a in rules if a != DISCLAIMER],
+        # 大模型补充：把规则结论（去掉免责声明行）喂给它并要求"不重复"，
+        # 见 llm_advice.ai_diet_advice 的提示词 + 精确去重双层。
+        "ai_advice": llm_advice.ai_diet_advice(
+            stats_result if has_data else None, weather,
+            rule_advice=[a for a in rules if a != DISCLAIMER]),
     }

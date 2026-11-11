@@ -39,6 +39,34 @@ ALLOWED_HOSTS = os.environ.get("DJANGO_ALLOWED_HOSTS", "*").split(",")
 FAMILY_API_TOKEN = os.environ.get("FAMILY_API_TOKEN", "").strip()
 
 
+# —— 二期：饮食建议的大模型补充（DeepSeek，family_portal/llm_advice.py）——
+# 与 backend_B 对话引擎共用 B_DEEPSEEK_TOKEN（同机部署只配一次）；
+# 可用 FAMILY_DEEPSEEK_TOKEN 覆盖为报告侧独立凭证。
+# 大模型只是规则引擎之上的叠加层：未配置 / 失败 / 超时全部静默省略
+# "AI 营养师补充建议"区块，规则建议照常展示。
+FAMILY_LLM_ENABLED = os.environ.get("FAMILY_LLM", "1").strip().lower() not in ("0", "false", "off")
+FAMILY_LLM_API_KEY = (os.environ.get("FAMILY_DEEPSEEK_TOKEN")
+                      or os.environ.get("B_DEEPSEEK_TOKEN", "")).strip()
+FAMILY_LLM_BASE_URL = (os.environ.get("FAMILY_DEEPSEEK_BASE_URL")
+                       or os.environ.get("B_DEEPSEEK_BASE_URL", "")
+                       or "https://api.deepseek.com").strip()
+FAMILY_LLM_MODEL = (os.environ.get("FAMILY_DEEPSEEK_MODEL")
+                    or os.environ.get("B_DEEPSEEK_MODEL", "")
+                    or "deepseek-chat").strip()
+#: 报告页是低频打印导向页面，超时给得比对对话宽（对话引擎 4s）。
+FAMILY_LLM_TIMEOUT = float(os.environ.get("FAMILY_LLM_TIMEOUT", "8"))
+FAMILY_LLM_MAX_TOKENS = int(os.environ.get("FAMILY_LLM_MAX_TOKENS", "300"))
+FAMILY_LLM_TEMPERATURE = float(os.environ.get("FAMILY_LLM_TEMPERATURE", "0.7"))
+#: 报告级缓存：同一份周统计 6 小时内不重问大模型（失败记 30 分钟短缓存）。
+FAMILY_LLM_CACHE_TTL = float(os.environ.get("FAMILY_LLM_CACHE_TTL", str(6 * 3600)))
+
+# —— 报告页微信扫码：跨网络访问 ——
+# 内网穿透（Cloudflare Tunnel / cpolar / frp 等）分配的公网地址，
+# 如 "https://xxx.trycloudflare.com"。配置后二维码直接用它（手机在外网
+# 也能扫开）；不配置则二维码用局域网 IP（仅同一 WiFi 可扫）。
+FAMILY_SHARE_BASE_URL = os.environ.get("FAMILY_SHARE_BASE_URL", "").strip().rstrip("/")
+
+
 # Application definition
 
 INSTALLED_APPS = [

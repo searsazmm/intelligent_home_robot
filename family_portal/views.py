@@ -23,7 +23,9 @@ from __future__ import annotations
 import functools
 import hmac
 import logging
+import socket
 import time
+from urllib.parse import urlparse, urlunparse
 
 from django.conf import settings
 from django.http import JsonResponse
@@ -126,6 +128,42 @@ def logout_view(request):
     return redirect("family_portal:login" if _auth_enabled() else "family_portal:home")
 
 
+def _lan_ip() -> str | None:
+    """探测本机局域网 IP（UDP connect 不发包，只查路由表）。失败返回 None。"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("10.255.255.255", 1))   # 不实际发包
+            return sock.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _share_url(request) -> str:
+    """报告页的扫码分享链接。
+
+    优先级：
+    1. ``FAMILY_SHARE_BASE_URL``（内网穿透的公网地址）—— 配了就直接用，
+       手机不在同一 WiFi 也能扫开（跨网络场景）；
+    2. 浏览器访问用的 localhost/127.0.0.1 对手机扫码无意义，替换成探测
+       到的局域网 IP；
+    3. 探测失败或本就是局域网地址则原样返回（家属通常就是通过局域网
+       IP 访问的，此时 request 的 host 已经可用）。
+    """
+    base = getattr(settings, "FAMILY_SHARE_BASE_URL", "").rstrip("/")
+    if base:
+        return base + request.path
+    url = request.build_absolute_uri()
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if host not in ("localhost", "127.0.0.1"):
+        return url
+    lan = _lan_ip()
+    if not lan:
+        return url
+    netloc = "%s:%d" % (lan, parsed.port) if parsed.port else lan
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
 def _with_conn(handler):
     """通用骨架：开只读连接 → 调 handler(conn) → 关连接。
 
@@ -173,12 +211,15 @@ def stats_page(request):
 
 @require_auth
 def report_page(request):
-    """报告页：一周报告 + 饮食建议（浏览器打印即 PDF）。"""
+    """报告页：一周报告 + 饮食建议（微信扫码查看，替代打印导出）。"""
     conn = db.connect_ro()
     try:
         weather = report_lib.fetch_weather()
         if db.ensure_tables_or_none(conn):
-            context = {"report": report_lib.weekly_report(conn, weather)}
+            context = {"report": report_lib.weekly_report(conn, weather),
+                       "share_url": _share_url(request),
+                       "share_remote": bool(getattr(
+                           settings, "FAMILY_SHARE_BASE_URL", ""))}
         else:
             context = {"report": None}
     finally:
