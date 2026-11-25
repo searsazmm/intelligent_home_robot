@@ -15,6 +15,10 @@
     python main.py --stream-url http://127.0.0.1:8010/stream.mjpeg
                                        # 再加上右栏的实时画面（A 要给 --stream）
     python main.py --no-camera         # 只要那张脸（不分栏）
+    python main.py --face=web          # BoopFace 表情（QtWebEngine 内嵌离线页）
+    python main.py --face=text         # 强制用回颜文字（原界面）
+                                       # 默认 --face=auto：优先 BoopFace，
+                                       # WebEngine 缺失/加载失败自动回落颜文字
     python main.py --fullscreen        # 全屏无边框（答辩用）
     python main.py --demo              # 不连 B，四态循环（B 起不来时的兜底）
     python main.py --dump-glyphs       # 字形自检：看不到方块即为正常
@@ -53,6 +57,7 @@ logger = logging.getLogger("frontend_C")
 
 EXIT_OK = 0
 EXIT_QT_MISSING = 2
+EXIT_FACE_WEB_FAILED = 3   # --face=web 强制 BoopFace 但加载失败（不回落）
 
 #: 四态循环的间隔（`--demo` 用），秒
 DEMO_INTERVAL = 6.0
@@ -132,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-camera", action="store_true",
                         help="退回单脸窗口（不分栏）。分栏是默认；这个开关是兜底："
                              "投影仪分辨率奇葩、或临时只想给观众看那张脸时用")
+
+    parser.add_argument("--face", choices=("auto", "web", "text"), default="auto",
+                        help="表情渲染：web=BoopFace（QtWebEngine 内嵌离线页，黑底白脸），"
+                             "text=颜文字（原界面），auto=优先 web、WebEngine 缺失或页面"
+                             "加载失败时自动回落 text（默认 auto，零回归）")
 
     mode = parser.add_argument_group("一次性任务（做完就退出）")
     mode.add_argument("--dump-glyphs", action="store_true",
@@ -250,6 +260,31 @@ def main(argv: list[str] | None = None) -> int:
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
+    # ---- BoopFace 表情（--face=auto|web|text）----
+    # QtWebEngine 的两条硬约束都必须赶在 QApplication 构造**之前**办：
+    #   1. AA_ShareOpenGLContexts 要在 app 构造前设置；
+    #   2. QtWebEngineWidgets 要在 app 构造前 import。
+    # 所以「能不能用 web 表情」的判定就是这里的 ``import ui.face_web``：
+    # 缺 PyQtWebEngine 时 ImportError —— auto 静默回落颜文字，web 强制
+    # 模式则明确报错退出（带着错误码，让启动脚本看得见失败原因）。
+    face_web = None
+    if args.face != "text":
+        try:
+            from ui import face_web as _face_web
+        except ImportError as exc:
+            if args.face == "web":
+                print(
+                    f"\n--face=web 需要 PyQtWebEngine，但导入失败：{exc}\n"
+                    "请先安装：pip install PyQtWebEngine\n",
+                    file=sys.stderr,
+                )
+                return EXIT_FACE_WEB_FAILED
+            logger.warning("QtWebEngine 不可用（%s），--face=auto 回落颜文字表情", exc)
+        else:
+            QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
+            _face_web.register_face_scheme()
+            face_web = _face_web
+
     app = QApplication(sys.argv[:1])
 
     # Ctrl+C 能杀掉这个程序。Qt 的事件循环会挡住 Python 的信号处理，
@@ -298,8 +333,28 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 主窗口：默认左右分栏，--no-camera 退回单脸 ----
     camera = None
     stream_link = None
-    face = FaceWindow(family, font_size=args.font_size,
-                      debug_hud=args.debug_hud)
+    # ---- 左栏的脸：BoopFace 优先（探活通过才用），失败按模式回落 ----
+    # wait_ready 同步探针：等 window.__face.ready 为真（boopface 完成
+    # custom element 注册）。超时即视为不可用 —— auto 回落颜文字，
+    # web 报错退出。颜文字与 BoopFace 的对外接口一致（鸭子类型），
+    # 下面 bridge 信号连接、--demo 循环、SplitWindow 转发全部不用改。
+    face = None
+    if face_web is not None:
+        candidate = face_web.BoopFaceWindow()
+        if candidate.wait_ready(face_web.FACE_READY_TIMEOUT_MS):
+            face = candidate
+            logger.info("表情引擎：BoopFace（QtWebEngine 离线页，--face=%s）", args.face)
+        else:
+            candidate.close()
+            candidate.deleteLater()
+            if args.face == "web":
+                logger.error("BoopFace 页面加载失败（--face=web 强制 Web 表情，不回落）。"
+                             "检查 ui/face_web.html 与 static/family/js/boopface/ 是否在位")
+                return EXIT_FACE_WEB_FAILED
+            logger.warning("BoopFace 页面加载失败，--face=auto 回落颜文字表情")
+    if face is None:
+        face = FaceWindow(family, font_size=args.font_size,
+                          debug_hud=args.debug_hud)
     if args.no_camera:
         window = face
         logger.info("单脸模式（--no-camera）：只显示表情，不显示画面栏")
@@ -499,6 +554,10 @@ def _install_demo_cycle(window, states, app):
     def tick():
         state = states[position["i"] % len(states)]
         position["i"] += 1
+        # 连发两次 = 模拟真实 B 端 5Hz 报文把确认窗口（STATE_CONFIRM_NEED=2）
+        # 攒满。单发一次会被确认窗口当毛刺拦下 —— 演示模式就永远停在
+        # normal 不动了。仍走 set_state()：与真实路径共用同一套日志与确认逻辑。
+        window.set_state(state)
         window.set_state(state)
         logger.info("演示模式：切到 %s（%s）", state, state_label(state))
 

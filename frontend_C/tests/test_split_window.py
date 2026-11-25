@@ -882,18 +882,24 @@ class TestDemoCycle(unittest.TestCase):
         main = load_frontend_c_main()
         # 不抛异常就是这条用例的全部意义（NameError 会在这里冒出来）
         self.timer = main._install_demo_cycle(self.window, VALID_STATES, _app)
-        self.assertEqual(len(self.window.states), 1,
-                         "tick() 应当在安装时立刻切一次，不用等第一个间隔")
+        # 每个 tick 连发两次同一状态：模拟真实 B 端 5Hz 报文把确认窗口
+        # （STATE_CONFIRM_NEED=2）攒满 —— 单发一次会被 set_state 当毛刺拦下，
+        # 演示模式就永远停在 normal 不动了（BoopFace 与颜文字同一套确认逻辑）。
+        self.assertEqual(len(self.window.states), 2,
+                         "tick() 应当在安装时立刻连发两次切一次状态，不用等第一个间隔")
+        self.assertEqual(self.window.states[0], self.window.states[1],
+                         "两次发送必须是同一状态，才凑得满确认窗口")
         self.assertIn(self.window.states[0], VALID_STATES)
 
     def test_it_cycles_and_wraps_around(self):
         """连续 tick 要把四态走一遍再回到第一个 —— 循环的下标算错的话，
-        演示到一半会停在一个状态上不动。"""
+        演示到一半会停在一个状态上不动。每个状态出现两次（确认窗口要两票）。"""
         main = load_frontend_c_main()
         self.timer = main._install_demo_cycle(self.window, VALID_STATES, _app)
         for _ in range(len(VALID_STATES) - 1):
             self.timer.timeout.emit()
-        self.assertEqual(self.window.states, list(VALID_STATES))
+        expected = [state for state in VALID_STATES for _ in range(2)]
+        self.assertEqual(self.window.states, expected)
 
     def test_it_logs_a_chinese_label_for_every_state(self):
         """``state_label`` 查不到某个状态会 KeyError —— 四态必须都有中文名。"""

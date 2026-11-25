@@ -1,0 +1,261 @@
+# Changelog
+
+All notable user-facing changes to BoopFace (called Agent Robot Avatar before 0.8) are documented here.
+
+The project follows Semantic Versioning for public releases. Internal development build numbers are not part of the public version history.
+
+## [0.8.0] - 2026-11-05
+
+### Changed
+
+- Agent Robot Avatar is now **BoopFace**. The npm package is `boopface`, the tag is `<boop-face>` and the class is `BoopFace`. Nothing else changes: every expression, gesture, skin and option works the same.
+- The files are now `boopface.js` and `boopface-lite.js`; `boopface/lite` is the lite build.
+- The repository moved to `github.com/CX-ArtLab/boopface` and the demo to `cx-artlab.github.io/boopface`. Old links forward to the new ones.
+
+### Added
+
+- BoopFace Embedded 0.1.0 (experimental), with 28 firmware configurations, a 32-screen simulator at `/hardware/`, and a standalone Arduino ZIP. The simulator and exported settings support 10 languages.
+
+### Deprecated
+
+- `<agent-robot-avatar>`, the `AgentRobotAvatar` export and the `AgentRobotAvatar*` TypeScript types still work and stop working in 1.0. The old tag logs a one-time rename notice.
+- The `agent-robot-avatar` npm package gets no more releases. To upgrade, replace it with `boopface`.
+
+## [0.7.2] - 2026-11-02
+
+### Changed
+
+- Skins 705 (Candy), 1401 (Denim) and 1503 (Watermelon) have new colors and textures. Their numbers stay the same.
+- The Skin Gallery has a background color picker next to the floor shadow switch.
+
+### Fixed
+
+- Pulling the antenna far to one side no longer pushes the eyes out past the edge of the head.
+- A diagonal look keeps both eyes inside the head's rounded corners.
+- A skin set with `setSkin()` is no longer replaced by the `skin` attribute when the avatar moves in the page.
+- A sleeping avatar no longer wakes its drawing loop on every mouse move.
+
+## [0.7.1] - 2026-10-30
+
+### Changed
+
+- Falling asleep now ends with the eyelids closing into a slit, instead of the eyes squashing flat.
+- The demo's Sleep button turns into Wake while the avatar sleeps.
+
+## [0.7.0] - 2026-10-29
+
+### Added
+
+- 188 skins in 17 series. Pick one by number with `skin="301"` or `setSkin(301)`; `setSkin(null)` goes back to the flat color.
+- Skin numbers are permanent: the series number plus two digits, so 305 is the fifth skin of series 3. New skins take the next free number, and numbers are never reused.
+- Every skin works with every expression and gesture, and its light follows the pointer.
+- `SKINS`, `SKIN_SERIES` and `SKIN_NAMES` list the skins, for building a skin picker.
+- Skin code loads only when a page uses a skin. `loadSkins()` loads it in advance.
+- `agent-robot-avatar/lite`: the same avatar without any skin code.
+- The demo has a Skin Gallery and a page with every skin.
+
+## [0.6.0] - 2026-10-23
+
+### Upgrading from 0.5.x
+
+Several actions are renamed after what the avatar does on screen, instead of the situation they were first written for. The old names keep working in 0.6 and print a one-time notice in the browser console; they stop working in 1.0. To upgrade, replace the old names in `play()` calls and in `action-state` or `face-state` listeners:
+
+| Old name | New name | What it looks like |
+| --- | --- | --- |
+| `send` | `affirm` | A nod |
+| `warning` | `wary` | Head turned, one eye close, a guarded up-and-down look |
+| `error`, `system-error`, `connection-error` | `refuse` | A head shake |
+| `blocked`, `policy-blocked` | `angry` | Lowered, glaring eyes |
+| `wait` | `waiting-spin` (or `waiting`) | The default waiting spin |
+| `failed`, `fail` | `failure` | |
+| `verify`, `review` | `inspect` | |
+| `slot` | `random` | |
+
+`action-state` now reports `affirm`, `wary`, `angry` and `refuse`, and `face-state` reports `wary` and `refuse`. A shake reads as "no", so use `refuse` when the Agent cannot or will not do something, and `failure` when a task or connection fails. Antenna blinking is removed: `setAntennaFlash()` now does nothing and prints a one-time notice, and it is deleted in 1.0. Packages that depend on `^0.5.x` do not pick up 0.6 automatically.
+
+### Added
+
+- Added the `waiting-wave` action: both eyes bob in staggered waves. `startWaiting({ variant: 'wave' })` loops it continuously.
+- Added `waiting-spin` as the explicit name of the default waiting motion, and `startWaiting({ variant: 'spin' })`.
+- Added brand-inspired color palettes to the demo. Colors apply to a stage card around the avatar; hovering a swatch previews it, a dice button picks a random palette, a swap button exchanges the background and head colors, and a reset button appears on the stage while the colors differ from the default. The page opens by rolling the stage through the palettes in step with the eyes' reel spin, ending with a faint rainbow ripple.
+
+### Changed
+
+- Renamed actions as listed above.
+- Demo labels now describe the expression: Waiting · Spin, Waiting · Scroll, Affirm, Wary, Angry and Refuse. The toolbar row is one card as wide as the actions, with Head shape and a random-colors button.
+- Refined the wary expression with independently tilted eyes, adjusted eye proportions and eyelids.
+
+### Also in this release
+
+- The embedded eyes engine for robot and dev-board screens is still in development. It will get its own version number and release; progress is tracked in [embedded/CHANGELOG.md](embedded/CHANGELOG.md).
+
+### Removed
+
+- Removed antenna blinking (`setAntennaFlash()`), which added little and is no longer shown in the demo.
+
+### Fixed
+
+- The demo no longer shows intermediate layouts while loading, keeps its action rows even and stable on phones and under browser page translators, and keeps an open panel on screen.
+
+## [0.5.2] - 2026-10-06
+
+### Added
+
+- Added the `love` action: the eyes lean together into a heart, beat three times, then return.
+- Added the `random` action (alias `slot`): the eyes roll like slot-machine reels, then settle with a bounce.
+
+### Fixed
+
+- `love` now shows the full heart under reduced motion, and `love` and `random` follow motion preference changes while they play.
+
+## [0.4.3] - 2026-09-22
+
+### Fixed
+
+- Restored the existing head-drag, waiting, sleep-wake, and touch-cancel behavior alongside press-and-hold squeezing by deferring squeeze activation until the hold is confirmed.
+- Refined the wrap waiting animation with shared rotational projection, optical height compensation, and edge contact so the eyes turn around the head without overlapping, clipping, or using transparency.
+
+## [0.4.2] - 2026-09-21
+
+### Added
+
+- Added a second waiting choice, `startWaiting({ variant: 'wrap' })`, with the approved 2.4-second left-out/right-in eye turn and custom easing. `play('waiting-wrap')` plays one cycle; the original waiting remains available and is the default.
+- Added center press-and-hold squeezing, sustained compression tremor, and spring/jelly release. Moving more than 4 CSS pixels transfers the gesture to the existing head drag.
+- Added antenna dragging with the head drag's 25-unit pull cap, a localized head deformation, a firmer spring return, and the existing angry reaction after recovery.
+- Added `setPressSqueeze()` and `setAntennaDrag()` opt-outs, interaction state events, and reduced-motion behavior.
+- Added localized “Try” tags below the Demo status for double-clicking, head dragging, center press-and-hold squeezing, and antenna dragging.
+
+### Changed
+
+- Renamed and repositioned the Demo action as “Waiting · Wrap” directly after the original waiting action.
+
+### Fixed
+
+- Kept both eyes looking at the live pointer position throughout antenna dragging instead of returning them to center when the drag begins.
+
+## [0.3.2] - 2026-09-10
+
+### Fixed
+
+- Unified synchronous `size` attribute parsing so numeric and `px` values use the same validation immediately, without a transient fallback before runtime observers run.
+- Added the existing public `sleep()`, `wake()`, and `input()` convenience methods to the TypeScript declaration surface and type checks.
+- Stabilized request-replacement race tests by ordering competing clicks in the same browser task instead of depending on an 80 ms wall-clock window.
+- Expanded package integrity coverage to require the runtime and geometry modules explicitly.
+
+- Prevented the accessible request lifecycle example's delayed replacement step from starting after cancellation, a newer user request, or a newer replacement flow has invalidated it.
+- Made the example's business status the only automatic live region; the visible request debug log remains available for deliberate reading without `role="log"` live semantics or whole-log text rewrites.
+
+## [0.3.1] - 2026-09-10
+
+### Fixed
+
+- Prevented disconnect cleanup from recreating per-instance media-query listeners and observers; reattaching now initializes connected runtime resources once without emitting cleanup-only lifecycle events.
+- Decoupled automatic sleep timing from frame rendering so `motion="reduce"` can pause continuous drawing without disabling `auto-sleep`, while active waiting/input continue to take priority.
+- Ensured reduced-motion state changes commit their final static SVG before rendering pauses, including the fully closed sleep pose.
+- Made `stopWaiting()` terminate the action it actually resets: waiting ends normally, other active program actions are cancelled once, and idle calls emit no false terminal event.
+- Separated explicit `noteActivity()` calls from ambient DOM activity so host calls inside real event handlers keep API semantics while automatic wakeups continue to obey `wake-on`.
+- Restricted action alias lookup to declared keys so prototype-like names such as `constructor` and `__proto__` fail before changing waiting/action state.
+
+## [0.3.0] - 2026-09-10
+
+### Added
+
+- Added `wake-on="activity|interaction|manual"` to control automatic wake behavior while preserving `activity` as the default.
+- Added `motion="auto|reduce|full"`; `auto` follows `prefers-reduced-motion` and updates when the system preference changes.
+- Added the semantic `action-state` event with `{ action, phase, source }` lifecycle data for host integrations and accessible status messaging.
+- Added explicit `px` support for `size`, alongside existing numeric pixel values.
+- Added Chromium, Firefox, and WebKit browser validation, including trusted Chromium touch-cancellation coverage.
+
+### Changed
+
+- Unified program-action and drag cancellation so reset, replacement actions, disconnect, and pointer cancellation cannot leave delayed drag reactions behind.
+- Program-controlled actions such as waiting and input now keep ownership of their expression while drag deformation remains available; suppressed drag reactions are discarded rather than replayed.
+- Invalid/no-op actions are validated before destructive extension cleanup, so an invalid `wake` or unknown action cannot tear down a running action.
+- Touch interaction uses `touch-action: pinch-zoom` on the avatar interaction region so single-pointer dragging remains available while page scrolling outside the avatar is unaffected and two-finger zoom remains possible.
+- Reduced-motion mode removes continuous decorative motion while preserving distinct static states and semantic action lifecycles.
+- Avatars pause sustained frame rendering when hidden, without layout, or outside the viewport, then resume the current state when visible again.
+- High-frequency pointer updates are coalesced to the latest update per animation frame.
+- Shared the head-flattening geometry used by the antenna and roundness modules.
+
+### Fixed
+
+- Preserved valid `window.AgentRobotAvatarInspectConfig` values supplied before module loading and normalized missing, invalid, and out-of-range values deterministically.
+- Distinguished `pointercancel` from a normal release so cancelled touch gestures recover without success/angry feedback.
+- Tightened `size` parsing so unsupported units, malformed values, zero, negative, and non-finite input use the default size instead of being partially parsed as pixels.
+
+## [0.2.1] - 2026-09-05
+
+### Fixed
+
+- Fixed dynamic custom-element creation failing because the constructor added a host style attribute; preserved default and explicit sizing.
+- Prevented interrupted expression continuations and animation callbacks from overriding resets or newer actions.
+- Fixed automatic sleep repeatedly restarting its own preparation instead of reaching sleep.
+- Synchronized dynamic head colors with the eye masks and antenna, including while sleep rendering is paused.
+- Cancelled pending timers, animations, waiting, and drag feedback on disconnect; reattached avatars start idle with their settings preserved.
+
+## [0.2.0] - 2026-09-04
+
+First stable release of the backward-compatible 0.2 series.
+
+### Added
+
+- Added Traditional Chinese, Japanese, Korean, Spanish, Portuguese, German, and French documentation.
+- Added package, installation, server-import, and real-browser smoke tests.
+- Added `setAntennaFlash(enabled)` for per-avatar antenna flashing.
+- Added built-in TypeScript declarations for actions, events, and public methods.
+
+### Changed
+
+- Added a lightweight animated GIF preview for the README documentation.
+- Moved localized README files into the `docs/` directory and added a unified language selector.
+- Moved the interactive Demo and Windows launcher into the `demo/` directory.
+- Removed runtime Demo badge logic and cache-busting query strings from internal module imports.
+- Made the package safe to import in server-side JavaScript without browser globals.
+- Corrected package side-effect metadata so bundlers preserve custom-element registration.
+- Added typed package exports and automated declaration checks for npm consumers.
+- Added an npm release rehearsal command and forced publishing to the official npm registry.
+- Replaced four layers of runtime method wrapping with a shared extension registry.
+- Routed built-in actions and antenna drawing through the same registry, leaving one lifecycle entry point.
+- Shared global input listeners across avatar instances and paused frame rendering after sleep animations settle.
+
+## [0.1.0] - 2026-09-02
+
+First public release.
+
+### Added
+
+- Reusable `<agent-robot-avatar>` Web Component built with SVG and vanilla JavaScript
+- Public `play(name)` and `reset()` APIs
+- Idle gaze, automatic blinking, pointer following, and inertial head movement
+- Jelly-style local drag deformation with elastic recovery
+- `idle`, `bored`, `waiting`, `input`, `send`, `success`, `failure`, `warning`, `inspect`, `angry`, `error`, `surprise`, `sleep`, and `wake` states
+- Dedicated `startWaiting()` and `stopWaiting()` lifecycle for pending Agent requests
+- Distinct semantics for task failure, system error, blocked content, warning confirmation, and result inspection
+- Semantic aliases for failure, review / verification, blocked-content, and system / connection-error states
+- `face-state` event for host application synchronization
+- `setPointerFollow(enabled)` API
+- Adjustable head shape with `setHeadRoundness(value)` and `getHeadRoundness()`
+- `head-roundness-change` event
+- Optional `size`, `color`, and `auto-sleep` attributes
+- Floating antenna with optional status flashing, disabled by default
+- Full interactive Demo and a minimal integration example
+- English and Simplified Chinese documentation
+- npm-compatible package metadata for later package publication
+- Contribution guide, issue templates, pull request template, MIT License, and Ko-fi funding metadata
+
+[0.8.0]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.8.0
+[0.7.2]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.7.2
+[0.7.1]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.7.1
+[0.7.0]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.7.0
+[0.6.0]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.6.0
+[0.5.2]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.5.2
+[0.4.3]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.4.3
+[0.4.2]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.4.2
+[0.3.2]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.3.2
+[0.3.1]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.3.1
+[0.3.0]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.3.0
+[0.2.1]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.2.1
+[0.2.0]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.2.0
+[0.1.0]: https://github.com/CX-ArtLab/boopface/releases/tag/v0.1.0
+
+

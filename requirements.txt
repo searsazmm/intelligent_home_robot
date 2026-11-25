@@ -57,6 +57,11 @@ onnxruntime==1.23.2
 #     python -c "from PyQt5.QtWidgets import QApplication; print('OK')"
 PyQt5==5.15.11
 
+# BoopFace 表情（frontend_C/ui/face_web.py，QtWebEngine 内嵌本地离线页）。
+# **可选**：缺失或页面加载失败时 --face=auto 自动回落颜文字界面，不影响启动。
+# 本机实测 5.15.6 可用（与 PyQt5 5.15.x 同代）。
+PyQtWebEngine==5.15.6
+
 # ---------------------------------------------------------------------------
 # 测试
 # ---------------------------------------------------------------------------

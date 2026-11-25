@@ -1,0 +1,86 @@
+{
+  "name": "boopface",
+  "version": "0.8.0",
+  "description": "BoopFace (formerly Agent Robot Avatar): a lightweight, expressive robot avatar Web Component for AI bots, agents and interactive apps.",
+  "type": "module",
+  "main": "./boopface.js",
+  "module": "./boopface.js",
+  "types": "./index.d.ts",
+  "browser": "./boopface.js",
+  "unpkg": "./boopface.js",
+  "jsdelivr": "./boopface.js",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./boopface.js",
+      "default": "./boopface.js"
+    },
+    "./lite": {
+      "types": "./lite.d.ts",
+      "import": "./boopface-lite.js",
+      "default": "./boopface-lite.js"
+    }
+  },
+  "sideEffects": true,
+  "scripts": {
+    "dev": "node scripts/serve.mjs",
+    "build:pages": "node scripts/build-pages.mjs",
+    "check": "node scripts/check-source.mjs",
+    "test": "npm run check && npm run test:types && npm run test:release && npm run test:package && npm run test:waiting && npm run test:browser && npm run test:pages",
+    "release:check": "npm test && npm publish --dry-run --ignore-scripts --tag latest",
+    "prepublishOnly": "npm test && node scripts/check-publish-tag.mjs",
+    "test:types": "tsc -p tsconfig.types.json",
+    "test:release": "node --test tests/release.test.mjs",
+    "test:package": "node --test tests/package.test.mjs",
+    "test:waiting": "node --test tests/waiting-wave.test.mjs",
+    "test:browser": "playwright test",
+    "test:pages": "node --test tests/pages-public.test.mjs"
+  },
+  "files": [
+    "boopface.js",
+    "boopface-lite.js",
+    "index.d.ts",
+    "lite.d.ts",
+    "src/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "boopface",
+    "agent-robot-avatar",
+    "ai",
+    "agent",
+    "robot",
+    "avatar",
+    "web-component",
+    "svg",
+    "svg-animation",
+    "animation",
+    "interactive",
+    "vanilla-javascript",
+    "ui"
+  ],
+  "author": "CX ArtLab",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CX-ArtLab/boopface.git"
+  },
+  "homepage": "https://github.com/CX-ArtLab/boopface#readme",
+  "bugs": {
+    "url": "https://github.com/CX-ArtLab/boopface/issues"
+  },
+  "funding": {
+    "type": "individual",
+    "url": "https://ko-fi.com/P0E625WIOI"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.1",
+    "typescript": "7.0.2"
+  }
+}

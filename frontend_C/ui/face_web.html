@@ -1,0 +1,128 @@
+<!doctype html>
+<!--
+  BoopFace 表情宿主页（完全离线）。
+
+  加载方式：经自定义协议 boopface://local/face.html（Python 侧
+  ui/face_web.py 的资源处理器回源本地文件），下面的 ES module 相对引用
+  也落在同一协议下 —— 全链路不触网，不存在 CDN。
+
+  页面约定（与 face_web.py 的契约）：
+  - 黑背景（body CSS）+ 白脸（boop-face 的 color="#ffffff"）；
+  - auto-sleep="0"：关闭自动睡觉（睡不睡由 Python 的 tired 状态说了算）；
+  - wake-on="manual"：睡眠只能由页面脚本叫醒，鼠标动一动不会把脸吵醒；
+  - setPointerFollow(false)：关闭鼠标指针跟随（用户点名要求）；
+  - idle 的自动眨眼与眼神游移是 boopface 的默认行为，原样保留；
+  - window.__face.ready：Python 侧 wait_ready() 的探针标志；
+  - window.__face.setState(action)：Python 经 runJavaScript 调它切表情，
+    action 只认 idle / failure / sleep / bored 四个（白名单在 Python 侧）。
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>boopface</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: #000;          /* 用户要求：背景纯黑 */
+    overflow: hidden;
+  }
+  body {
+    display: flex;             /* 脸永远居中，窗口怎么拉都居中 */
+    align-items: center;
+    justify-content: center;
+  }
+  boop-face { display: block; }
+</style>
+</head>
+<body>
+<boop-face id="avatar"
+           size="240"
+           color="#ffffff"
+           auto-sleep="0"
+           wake-on="manual"
+           motion="auto"></boop-face>
+
+<!--
+  Qt 5.15 内嵌的 Chromium（≈87）没有 Object.hasOwn（ES2022），而 boopface
+  的动作别名解析（src/boopface-runtime.js）用到它 —— 不补的话 play() 直接
+  TypeError。经典 <script> 立即执行，module 脚本是 deferred 的，必然晚于此，
+  所以 polyfill 一定先于库运行。
+-->
+<script>
+  if (typeof Object.hasOwn !== "function") {
+    Object.defineProperty(Object, "hasOwn", {
+      value: function (target, key) {
+        return Object.prototype.hasOwnProperty.call(target, key);
+      },
+      configurable: true,
+      writable: true,
+    });
+  }
+</script>
+
+<script type="module">
+  // 副作用 import：boopface-lite.js 会注册 <boop-face> 自定义元素
+  // （src/boopface-core.js 里的 customElements.define）。相对路径落在
+  // boopface:// 协议下，由 Python 侧从 static/family/js/boopface/ 回源。
+  import './static/family/js/boopface/boopface-lite.js';
+
+  const avatar = document.getElementById('avatar');
+
+  // ---- 眼球反色（白脸的必要修复）-------------------------------------------------
+  // boopface 的设计假设是「深色头 + 白眼睛」：眼球椭圆写死 fill="#fff"，
+  // color 属性只给头/天线/眼睑上色（boopface-core.js 的 _applyColor）。
+  // 我们要白头黑底，白眼球贴白脸会直接隐形（验收截图已复现：一张全白脸）。
+  // 修法：眼球 = 背景黑（视觉上镂空），眼睑保持 color 给的白 —— 眨眼/闭眼
+  // 时白眼睑扫过黑眼球，效果正确。库没有官方眼色 API，只能进 shadow DOM 改。
+  {
+    const shadow = avatar.shadowRoot;
+    if (shadow) {
+      for (const id of ['leftBase', 'rightBase']) {
+        const eye = shadow.getElementById(id);
+        if (eye) eye.setAttribute('fill', '#000000');
+      }
+    }
+  }
+
+  // 关闭鼠标指针跟随。lite 构建理论上没有 skins 的指针光效，但
+  // setPointerFollow 是公开运行时接口 —— 防御式调用，有就关。
+  if (typeof avatar.setPointerFollow === 'function') {
+    try { avatar.setPointerFollow(false); } catch (e) { /* 老版本没有就算了 */ }
+  }
+
+  // 尺寸自适应：窗口短边的 70%，居中显示。机器人屏幕上这张脸要够大。
+  function fit() {
+    const s = Math.max(120, Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.7));
+    avatar.setAttribute('size', String(s));
+  }
+  window.addEventListener('resize', fit);
+  fit();
+
+  // Python 侧只会推这四个动作（见 face_web.py 的 STATE_ACTIONS）。
+  // 白名单再挡一道：推来别的名字一律回 idle，不让页面行为失控。
+  const ALLOWED = new Set(['idle', 'failure', 'sleep', 'bored']);
+  let previous = 'idle';
+
+  window.__face = {
+    ready: true,
+    setState(action) {
+      if (!ALLOWED.has(action)) action = 'idle';
+      try {
+        // 从 sleep 回其它表情：先 wake() 睁眼再播，避免停在闭眼帧上
+        // （boopface 没有公开的"是否在睡"查询，用上一次动作自己记）。
+        if (previous === 'sleep' && action !== 'sleep'
+            && typeof avatar.wake === 'function') {
+          avatar.wake();
+        }
+        avatar.play(action);
+        previous = action;
+      } catch (e) {
+        console.error('boopface play 失败：', e);
+      }
+    },
+  };
+</script>
+</body>
+</html>
